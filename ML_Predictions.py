@@ -19,6 +19,7 @@ import lightgbm as lgb
 import xgboost as xgb
 import catboost as cb
 import optuna
+from scipy.optimize import minimize as scipy_minimize
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import log_loss, accuracy_score, brier_score_loss
 from sklearn.linear_model import LogisticRegression
@@ -67,7 +68,43 @@ WEIGHT_CLASS_ORDINAL = {
     "Catch Weight": 13, "Open Weight": 14,
 }
 
-ACTIVE_ENSEMBLE_MODELS = {"ExtraTrees", "MLP", "TabNet", "LogReg"}
+ACTIVE_ENSEMBLE_MODELS = {
+    "LightGBM", "XGBoost", "CatBoost",
+    "HistGBM", "RandForest", "ExtraTrees",
+    "MLP", "SVM", "LogReg", "AdaBoost",
+}
+
+FIXED_MODEL_PARAMS = {
+    "LightGBM": {
+        "n_estimators": 300, "lr": 0.04, "max_depth": 6, "num_leaves": 31,
+        "min_child_samples": 25, "subsample": 0.8, "colsample_bytree": 0.8,
+        "reg_alpha": 0.1, "reg_lambda": 1.0,
+    },
+    "XGBoost": {
+        "n_estimators": 300, "lr": 0.04, "max_depth": 5, "min_child_weight": 5,
+        "subsample": 0.8, "colsample_bytree": 0.8, "reg_alpha": 0.1, "reg_lambda": 1.0,
+    },
+    "CatBoost": {
+        "iterations": 350, "lr": 0.05, "depth": 6, "l2_leaf_reg": 3.0,
+        "random_strength": 1.0, "bagging_temperature": 0.5,
+        "border_count": 128, "bootstrap_type": "Bayesian",
+    },
+    "ExtraTrees": {
+        "n_estimators": 500, "max_depth": 12, "min_samples_leaf": 5,
+        "min_samples_split": 2, "max_features": 0.7,
+    },
+    "HistGBM": {
+        "max_iter": 500, "lr": 0.05, "max_depth": 6,
+        "max_leaf_nodes": 31, "min_samples_leaf": 20, "l2_reg": 1.0,
+    },
+    "RandForest": {
+        "n_estimators": 400, "max_depth": 12, "min_samples_leaf": 5,
+        "min_samples_split": 2, "max_features": 0.7,
+    },
+    "AdaBoost": {
+        "n_estimators": 200, "learning_rate": 0.1,
+    },
+}
 
 
 def _weight_class_feature_name(weight_class):
@@ -420,6 +457,21 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
             "is_orthodox": 1.0 if stance == "Orthodox" else 0.0,
             "is_southpaw": 1.0 if stance == "Southpaw" else 0.0,
             "is_switch": 1.0 if stance == "Switch" else 0.0,
+            "age_squared": 900.0,
+            "prime_age": 1.0,
+            "age_decline": 0.0,
+            "experience_log": 0.0,
+            "momentum": 0.5,
+            "first_round_finish_rate": 0.15,
+            "durability": 0.8,
+            "output_rate": 0.0,
+            "damage_efficiency": 1.0,
+            "late_round_pct": 0.5,
+            "avg_finish_round": 2.5,
+            "sig_str_diff_pm": 0.0,
+            "grappling_dominance": 0.0,
+            "consistency": 0.5,
+            "ewm_opp_quality": MU_0,
         })
         return feats
 
@@ -835,6 +887,70 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
     feats["style_clinch_ground"] = feats.get("clinch_pct", 0.14) + feats.get("ground_pct", 0.18)
     feats["style_finishing"] = feats.get("finish_rate", 0.5)
 
+    # ── New high-impact features ──
+    age_val = feats.get("age", 30.0)
+    if _isnan(age_val):
+        age_val = 30.0
+    feats["age_squared"] = age_val ** 2
+    feats["prime_age"] = 1.0 if 26.0 <= age_val <= 32.0 else 0.0
+    feats["age_decline"] = max(0.0, age_val - 32.0)
+    feats["experience_log"] = math.log1p(n)
+
+    # Momentum: steeper EWM (alpha=0.5) for recent bias
+    alpha_m = 0.5
+    m_sum, m_tot = 0.0, 0.0
+    for i, h in enumerate(history):
+        w = (1 - alpha_m) ** (n - 1 - i)
+        m_sum += w * (1.0 if h["result"] == "W" else 0.0)
+        m_tot += w
+    feats["momentum"] = m_sum / m_tot if m_tot > 0 else 0.5
+
+    # First-round finish rate
+    r1_finishes = sum(1 for h in history if h["result"] == "W" and h.get("finish_round") == 1
+                      and ("KO" in str(h.get("method", "")) or "Sub" in str(h.get("method", ""))))
+    feats["first_round_finish_rate"] = _bayes_shrink(_safe_div(r1_finishes, n, 0.15), n, prior=0.15, strength=10)
+
+    # Durability (inverse of KO loss susceptibility)
+    feats["durability"] = 1.0 - feats.get("ko_loss_pct", 0.2)
+
+    # Output rate: total offensive actions per minute
+    total_actions = total_sig_land + _safe_sum(h["td"] for h in history) + _safe_sum(h["sub_att"] for h in history)
+    feats["output_rate"] = total_actions / total_time_min
+
+    # Damage efficiency: sig str landed / opponent sig str landed
+    opp_total_sig = _safe_sum(h["opp_sig_str"] for h in history)
+    feats["damage_efficiency"] = _safe_div(total_sig_land, max(opp_total_sig, 1), 1.0)
+
+    # Late-round endurance: pct of fights that went past round 2
+    went_late = sum(1 for h in history if _num_or(h.get("finish_round"), 3) >= 3)
+    feats["late_round_pct"] = _bayes_shrink(_safe_div(went_late, n, 0.5), n, prior=0.5, strength=8)
+
+    # Average finish round (lower = more dangerous finisher)
+    finish_rounds = [h["finish_round"] for h in history
+                     if h["result"] == "W" and not _isnan(h.get("finish_round")) and h["finish_round"] > 0]
+    feats["avg_finish_round"] = _safe_mean(finish_rounds) if finish_rounds else 2.5
+
+    # Sig str differential per minute (combines offense and defense into one number)
+    feats["sig_str_diff_pm"] = feats["sig_str_pm"] - feats["def_sig_str_pm"]
+
+    # Grappling dominance: (td_landed + ctrl_pct) vs (opp_td_landed + opp_ctrl_pct)
+    feats["grappling_dominance"] = feats["td_p15"] + feats["ctrl_pct"] - feats["def_td_p15"] - feats["def_ctrl_pct"]
+
+    # Consistency: coefficient of variation of sig_str_pm (lower = more consistent)
+    if n >= 2 and feats["sig_str_pm"] > 0:
+        feats["consistency"] = 1.0 - min(feats["std_sig_str_pm"] / (feats["sig_str_pm"] + 0.01), 2.0) / 2.0
+    else:
+        feats["consistency"] = 0.5
+
+    # EWM opponent quality: recent opponent strength
+    alpha_oq = 0.4
+    oq_sum, oq_tot = 0.0, 0.0
+    for i, h in enumerate(history):
+        w = (1 - alpha_oq) ** (n - 1 - i)
+        oq_sum += w * _num_or(h.get("opp_glicko"), MU_0)
+        oq_tot += w
+    feats["ewm_opp_quality"] = oq_sum / oq_tot if oq_tot > 0 else MU_0
+
     if _FIGHTER_FEAT_KEYS is None:
         _set_fighter_keys(list(feats.keys()))
 
@@ -929,6 +1045,54 @@ def compute_matchup_features(a_feats, b_feats, is_title=0, total_rounds=3, weigh
     features["style_distance"] = math.sqrt(
         (a_stk - b_stk)**2 + (a_wrs - b_wrs)**2 + (a_sub - b_sub)**2 + (a_cg - b_cg)**2
     )
+
+    # ── New high-impact matchup features ──
+    # Confidence gap: rating gap normalised by combined uncertainty
+    combined_phi = math.sqrt(a_phi**2 + b_phi**2) if (a_phi**2 + b_phi**2) > 0 else 1.0
+    features["confidence_gap"] = (a_mu - b_mu) / combined_phi
+
+    # Reach advantage amplified by striking differential
+    a_sig_pm = _num_or(a_feats.get("sig_str_pm"), 0.0)
+    b_sig_pm = _num_or(b_feats.get("sig_str_pm"), 0.0)
+    reach_diff = _num_or(a_reach, 72.0) - _num_or(b_reach, 72.0)
+    features["d_reach_x_striking"] = reach_diff * (a_sig_pm - b_sig_pm)
+
+    # Chin vs power: A's durability vs B's KO rate (and reverse)
+    a_dur = _num_or(a_feats.get("durability"), 0.8)
+    b_dur = _num_or(b_feats.get("durability"), 0.8)
+    a_kd_pm = _num_or(a_feats.get("kd_pm"), 0.0)
+    b_kd_pm = _num_or(b_feats.get("kd_pm"), 0.0)
+    features["d_chin_vs_power"] = (a_dur * a_kd_pm) - (b_dur * b_kd_pm)
+
+    # TD attack vs defense: A's offensive wrestling vs B's TDD (directional)
+    a_td_p15 = _num_or(a_feats.get("td_p15"), 0.0)
+    b_td_p15 = _num_or(b_feats.get("td_p15"), 0.0)
+    a_tdd = _num_or(a_feats.get("td_defense_rate"), 0.65)
+    b_tdd = _num_or(b_feats.get("td_defense_rate"), 0.65)
+    features["d_td_attack_vs_defense"] = (a_td_p15 * (1.0 - b_tdd)) - (b_td_p15 * (1.0 - a_tdd))
+
+    # Combined finish rate (proxy for fight unlikely to go to decision)
+    a_fin = _num_or(a_feats.get("finish_rate"), 0.5)
+    b_fin = _num_or(b_feats.get("finish_rate"), 0.5)
+    features["combined_finish_rate"] = a_fin + b_fin
+
+    # Output rate differential
+    features["d_output_rate"] = _num_or(a_feats.get("output_rate"), 0.0) - _num_or(b_feats.get("output_rate"), 0.0)
+
+    # Momentum differential
+    features["d_momentum"] = _num_or(a_feats.get("momentum"), 0.5) - _num_or(b_feats.get("momentum"), 0.5)
+
+    # Durability gap
+    features["d_durability"] = a_dur - b_dur
+
+    # Grappling dominance differential
+    features["d_grappling_dominance"] = (_num_or(a_feats.get("grappling_dominance"), 0.0)
+                                         - _num_or(b_feats.get("grappling_dominance"), 0.0))
+
+    # EWM opponent quality gap (who has faced tougher competition recently)
+    features["d_ewm_opp_quality"] = (_num_or(a_feats.get("ewm_opp_quality"), MU_0)
+                                     - _num_or(b_feats.get("ewm_opp_quality"), MU_0))
+
     return features
 
 
@@ -1021,7 +1185,7 @@ def build_training_data(csv_path, progress_cb=None):
 
 # ─── Optuna tuning + ensemble ─────────────────────────────────────────────────
 
-NEEDS_SCALE = {"LogReg", "MLP"}
+NEEDS_SCALE = {"LogReg", "MLP", "SVM"}
 
 
 def _clip_probs(probs, eps=1e-6):
@@ -1090,15 +1254,14 @@ def _swap_features(X):
 
 
 class EnsembleModel:
-    def __init__(self, models, imputer, scaler, feat_cols, meta_model,
-                 model_order, decision_threshold=0.5, missing_cols=None,
-                 calibrator=None):
+    def __init__(self, models, imputer, scaler, feat_cols, combiner,
+                 decision_threshold=0.5, missing_cols=None, calibrator=None):
         self.models = models
         self.imputer = imputer
         self.scaler = scaler
         self.feat_cols = feat_cols
-        self.meta_model = meta_model
-        self.model_order = list(model_order)
+        self.combiner = combiner
+        self.model_order = list(combiner.get("model_order", list(models)))
         self.decision_threshold = float(decision_threshold)
         self.missing_cols = missing_cols or []
         self.calibrator = calibrator
@@ -1120,7 +1283,7 @@ class EnsembleModel:
         return probas
 
     def predict_proba_single(self, features_dict):
-        """Symmetric prediction through the stacked meta-model."""
+        """Symmetric prediction through the selected ensemble combiner."""
         X = pd.DataFrame([features_dict])
         X_imp, X_sc = self._prepare_input(X)
         p_orig = self._predict_all(X_imp, X_sc)
@@ -1129,13 +1292,13 @@ class EnsembleModel:
         X_sw_imp, X_sw_sc = self._prepare_input(X_sw)
         p_swap = self._predict_all(X_sw_imp, X_sw_sc)
 
-        meta_row = []
+        symmetric_probas = {}
         for name in self.model_order:
             p_fwd = p_orig[name][0]
             p_rev = p_swap[name][0]
-            meta_row.append((p_fwd + (1.0 - p_rev)) / 2.0)
+            symmetric_probas[name] = np.asarray([(p_fwd + (1.0 - p_rev)) / 2.0], dtype=float)
 
-        p_raw = float(self.meta_model.predict_proba(np.asarray([meta_row], dtype=float))[:, 1][0])
+        p_raw = float(_combine_base_probas(symmetric_probas, self.combiner)[0])
 
         if self.calibrator is not None:
             p_raw = float(self.calibrator.predict_proba(np.array([[p_raw]]))[:, 1][0])
@@ -1149,8 +1312,32 @@ def _symmetric_probabilities(name, model, X_forward, X_swapped):
     return _clip_probs((p_fwd + (1.0 - p_rev)) / 2.0)
 
 
+def _combine_base_probas(base_inputs, combiner):
+    def _get_array(name):
+        values = base_inputs[name]
+        if isinstance(values, pd.Series):
+            values = values.to_numpy()
+        return np.atleast_1d(np.asarray(values, dtype=float))
+
+    kind = combiner["kind"]
+    if kind == "stacker":
+        meta = np.column_stack([_get_array(name) for name in combiner["model_order"]])
+        return _clip_probs(combiner["model"].predict_proba(meta)[:, 1])
+    if kind == "weighted":
+        blend = np.zeros_like(_get_array(combiner["model_order"][0]), dtype=float)
+        for name in combiner["model_order"]:
+            blend += float(combiner["weights"].get(name, 0.0)) * _get_array(name)
+        return _clip_probs(blend)
+    if kind == "average":
+        meta = np.column_stack([_get_array(name) for name in combiner["model_order"]])
+        return _clip_probs(meta.mean(axis=1))
+    if kind == "single":
+        return _clip_probs(_get_array(combiner["name"]))
+    raise ValueError(f"Unknown combiner kind: {kind}")
+
+
 def _fit_regularized_stacker(X_train_meta, y_train_meta, X_val_meta=None, y_val_meta=None):
-    c_grid = [0.03, 0.1, 0.3, 1.0, 3.0, 10.0]
+    c_grid = [0.005, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0]
     y_train_np = np.asarray(y_train_meta).astype(int)
     if X_val_meta is None or y_val_meta is None or len(X_val_meta) == 0:
         model = LogisticRegression(max_iter=2000, C=1.0, random_state=RANDOM_SEED)
@@ -1197,16 +1384,131 @@ def _tune_pick_threshold(probs, y_true):
     return best_threshold, best_acc
 
 
-def _extract_stacker_shares(meta_model, model_order):
-    coefs = getattr(meta_model, "coef_", np.zeros((1, len(model_order))))[0]
-    total = float(np.abs(coefs).sum())
-    if total <= 0:
-        share = 1.0 / max(len(model_order), 1)
-        return {name: share for name in model_order}, {name: 0.0 for name in model_order}
-    return (
-        {name: abs(float(coefs[i])) / total for i, name in enumerate(model_order)},
-        {name: float(coefs[i]) for i, name in enumerate(model_order)},
+def _optimize_blend_weights(X_meta, y_true, min_weight=0.0):
+    model_order = list(X_meta.columns)
+    preds = np.column_stack([_clip_probs(X_meta[name]) for name in model_order])
+    y_true = np.asarray(y_true).astype(int)
+    n_models = preds.shape[1]
+    if n_models == 1:
+        return {model_order[0]: 1.0}
+
+    def objective(weights):
+        blend = _clip_probs(preds @ weights)
+        return log_loss(y_true, blend)
+
+    w0 = np.full(n_models, 1.0 / n_models)
+    result = scipy_minimize(
+        objective,
+        w0,
+        method="SLSQP",
+        bounds=[(min_weight, 1.0)] * n_models,
+        constraints=[{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}],
     )
+    weights = np.asarray(result.x if result.success else w0, dtype=float)
+    weights = np.clip(weights, min_weight, None)
+    if weights.sum() <= 0:
+        weights = w0
+    else:
+        weights /= weights.sum()
+    return {name: float(weights[i]) for i, name in enumerate(model_order)}
+
+
+def _evaluate_pick_candidate(label, combiner, X_meta_val, y_meta_val):
+    probs = _combine_base_probas(X_meta_val, combiner)
+    threshold, acc = _tune_pick_threshold(probs, y_meta_val)
+    ll = log_loss(y_meta_val, probs)
+    return {
+        "label": label,
+        "combiner": combiner,
+        "probs": probs,
+        "threshold": threshold,
+        "accuracy": acc,
+        "log_loss": ll,
+    }
+
+
+def _describe_combiner(combiner):
+    kind = combiner["kind"]
+    if kind == "single":
+        return combiner["name"]
+    if kind == "average":
+        return "Avg[" + ", ".join(combiner["model_order"]) + "]"
+    if kind == "weighted":
+        return "Convex blend"
+    if kind == "stacker":
+        return "Logistic stacker"
+    return kind
+
+
+def _extract_combiner_shares(combiner, model_order):
+    if combiner["kind"] == "stacker":
+        coefs = getattr(combiner["model"], "coef_", np.zeros((1, len(model_order))))[0]
+        total = float(np.abs(coefs).sum())
+        if total <= 0:
+            share = 1.0 / max(len(model_order), 1)
+            return {name: share for name in model_order}
+        return {name: abs(float(coefs[i])) / total for i, name in enumerate(model_order)}
+    if combiner["kind"] == "weighted":
+        return {name: float(combiner["weights"].get(name, 0.0)) for name in model_order}
+    if combiner["kind"] == "average":
+        selected = set(combiner["model_order"])
+        share = 1.0 / max(len(selected), 1)
+        return {name: (share if name in selected else 0.0) for name in model_order}
+    if combiner["kind"] == "single":
+        return {name: float(name == combiner["name"]) for name in model_order}
+    return {name: 0.0 for name in model_order}
+
+
+def _select_best_pick_combiner(X_meta_train, y_meta_train, X_meta_val, y_meta_val, model_order):
+    """Select the best combiner that uses ALL models.
+
+    Only evaluates full-ensemble combiners (stacker, blend with min weight,
+    simple average) to ensure every model contributes.  Picks by log-loss
+    (smoother than accuracy on small val sets).
+    """
+    candidates = []
+
+    # 1. Logistic stacker (all models, regularized)
+    stacker, stacker_c, _ = _fit_regularized_stacker(
+        X_meta_train, y_meta_train, X_meta_val, y_meta_val
+    )
+    candidates.append(_evaluate_pick_candidate(
+        "Logistic stacker",
+        {"kind": "stacker", "model": stacker, "model_order": list(model_order), "stacker_c": stacker_c},
+        X_meta_val,
+        y_meta_val,
+    ))
+
+    # 2. Convex blend with minimum weight floor (every model >= 2%)
+    min_w = max(0.02, 0.5 / len(model_order))
+    blend_weights = _optimize_blend_weights(X_meta_train[model_order], y_meta_train, min_weight=min_w)
+    candidates.append(_evaluate_pick_candidate(
+        "Convex blend (floor)",
+        {"kind": "weighted", "weights": blend_weights, "model_order": list(model_order)},
+        X_meta_val,
+        y_meta_val,
+    ))
+
+    # 3. Convex blend without floor (allow zeroing out bad models)
+    blend_weights_free = _optimize_blend_weights(X_meta_train[model_order], y_meta_train, min_weight=0.0)
+    candidates.append(_evaluate_pick_candidate(
+        "Convex blend (free)",
+        {"kind": "weighted", "weights": blend_weights_free, "model_order": list(model_order)},
+        X_meta_val,
+        y_meta_val,
+    ))
+
+    # 4. Simple average of all models
+    candidates.append(_evaluate_pick_candidate(
+        "Full average",
+        {"kind": "average", "model_order": list(model_order)},
+        X_meta_val,
+        y_meta_val,
+    ))
+
+    # Pick by log-loss (smoother than accuracy on small val sets)
+    best = min(candidates, key=lambda row: row["log_loss"])
+    return best, candidates
 
 
 def _build_oof_base_probas(X_raw, y_raw, specs, progress_cb=None, stage_name="OOF"):
@@ -1335,7 +1637,7 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
 
     if progress_cb:
         progress_cb("")
-        progress_cb(f"  Train: {train_size} | Val: {val_size} (stack/threshold tuning) | Test: {test_size} (final eval)")
+        progress_cb(f"  Train: {train_size} | Val: {val_size} (ensemble/threshold selection) | Test: {test_size} (final eval)")
         progress_cb("")
 
     missing_cols = _pick_missing_cols(X_train_raw)
@@ -1363,309 +1665,229 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
     X_full_raw = X_full_raw[selected_cols]
     feature_cols = selected_cols
 
-    tscv = TimeSeriesSplit(n_splits=5)
-
-    def _median_best_rounds(study, param_name):
-        rounds = study.best_trial.user_attrs.get("best_iterations", [])
-        if not rounds:
-            return int(study.best_params[param_name])
-        return max(25, int(round(float(np.median(rounds)))))
-
-    def _symmetric_fold_logloss(name, model, X_fold_val, y_fold_val):
-        X_fold_swap = _swap_features(X_fold_val)
-        probs = _symmetric_probabilities(name, model, X_fold_val, X_fold_swap)
-        return log_loss(y_fold_val, probs)
+    # Feature importance pruning: drop features with zero importance across quick LGB
+    if progress_cb:
+        progress_cb("  Running feature importance pruning...")
+    X_quick_aug, y_quick_aug = _augment_swap(X_train_orig, y_train_raw)
+    quick_lgb = lgb.LGBMClassifier(
+        n_estimators=200, learning_rate=0.05, max_depth=6,
+        random_state=RANDOM_SEED, n_jobs=-1, verbose=-1,
+    )
+    quick_lgb.fit(X_quick_aug, y_quick_aug)
+    importances = quick_lgb.feature_importances_
+    keep_mask = importances > 0
+    kept_features = [c for c, k in zip(feature_cols, keep_mask) if k]
+    imp_dropped = len(feature_cols) - len(kept_features)
+    if imp_dropped > 0:
+        if progress_cb:
+            progress_cb(f"  Feature importance pruning: dropped {imp_dropped} zero-importance features ({len(kept_features)} kept)")
+        feature_cols = kept_features
+        X_train_orig = X_train_orig[feature_cols]
+        X_val = X_val[feature_cols]
+        X_test = X_test[feature_cols]
+        X_full_raw = X_full_raw[feature_cols]
 
     active_models = set(ACTIVE_ENSEMBLE_MODELS)
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  Optuna tuning — active models only
+    #  Optuna hyperparameter tuning for LightGBM, XGBoost, CatBoost
     # ═══════════════════════════════════════════════════════════════════════
+    if progress_cb:
+        progress_cb("  Tuning hyperparameters with Optuna...")
+        progress_cb("  Active models: " + ", ".join(sorted(active_models)))
+        progress_cb("")
 
-    # ── LightGBM ──
+    # Single temporal held-out split for Optuna (stable, no tiny-fold problems)
+    _optuna_split = int(len(X_train_orig) * 0.75)
+    _X_opt_tr = X_train_orig.iloc[:_optuna_split]
+    _y_opt_tr = y_train_raw.iloc[:_optuna_split]
+    _X_opt_va = X_train_orig.iloc[_optuna_split:]
+    _y_opt_va = y_train_raw.iloc[_optuna_split:]
+    _X_opt_tr_aug, _y_opt_tr_aug = _augment_swap(_X_opt_tr, _y_opt_tr)
+    _X_opt_va_swap = _swap_features(_X_opt_va)
+
+    def _optuna_eval(name, model_factory):
+        """Train on augmented Optuna-train, evaluate symmetrically on Optuna-val."""
+        model = model_factory()
+        model.fit(_X_opt_tr_aug, _y_opt_tr_aug)
+        probs = _symmetric_probabilities(name, model, _X_opt_va, _X_opt_va_swap)
+        return float(log_loss(_y_opt_va, probs))
+
+    def _optuna_baseline(name, model_factory):
+        """Get fixed-param baseline score for comparison."""
+        return _optuna_eval(name, model_factory)
+
+    # ── LightGBM tuning ──
+    lp = FIXED_MODEL_PARAMS["LightGBM"].copy()
     if "LightGBM" in active_models:
-        if progress_cb:
-            progress_cb(f"  --- Tuning LightGBM ({n_trials} trials) ---")
+        fixed_lgb_score = _optuna_baseline("LightGBM", lambda: lgb.LGBMClassifier(
+            n_estimators=lp["n_estimators"], learning_rate=lp["lr"],
+            max_depth=lp["max_depth"], num_leaves=lp["num_leaves"],
+            min_child_samples=lp["min_child_samples"],
+            subsample=lp["subsample"], colsample_bytree=lp["colsample_bytree"],
+            reg_alpha=lp["reg_alpha"], reg_lambda=lp["reg_lambda"],
+            random_state=RANDOM_SEED, n_jobs=-1, verbose=-1,
+        ))
 
-        def lgb_obj(trial):
+        def _lgb_objective(trial):
             p = {
-                "n_estimators": trial.suggest_int("n_estimators", 100, 800),
-                "learning_rate": trial.suggest_float("lr", 0.01, 0.3, log=True),
-                "max_depth": trial.suggest_int("max_depth", 3, 8),
-                "num_leaves": trial.suggest_int("num_leaves", 15, 127),
-                "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
-                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
-                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 1.0),
-                "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-                "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-                "random_state": RANDOM_SEED,
-                "n_jobs": -1,
-                "verbose": -1,
+                "n_estimators": trial.suggest_int("n_estimators", 150, 600),
+                "lr": trial.suggest_float("lr", 0.02, 0.10, log=True),
+                "max_depth": trial.suggest_int("max_depth", 4, 7),
+                "num_leaves": trial.suggest_int("num_leaves", 20, 50),
+                "min_child_samples": trial.suggest_int("min_child_samples", 15, 50),
+                "subsample": trial.suggest_float("subsample", 0.65, 0.95),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.9),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.01, 5.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 5.0, log=True),
             }
-            scores = []
-            best_iterations = []
-            for tr, val in tscv.split(X_train_orig):
-                X_fold_train = X_train_orig.iloc[tr]
-                y_fold_train = y_train_raw.iloc[tr]
-                X_fold_val = X_train_orig.iloc[val]
-                y_fold_val = y_train_raw.iloc[val]
-                X_fold, y_fold = _augment_swap(X_fold_train, y_fold_train)
-                X_eval_aug, y_eval_aug = _augment_swap(X_fold_val, y_fold_val)
-                m = lgb.LGBMClassifier(**p)
-                m.fit(
-                    X_fold, y_fold,
-                    eval_set=[(X_eval_aug, y_eval_aug)],
-                    eval_metric="logloss",
-                    callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)],
-                )
-                best_iterations.append(getattr(m, "best_iteration_", p["n_estimators"]) or p["n_estimators"])
-                scores.append(_symmetric_fold_logloss("LightGBM", m, X_fold_val, y_fold_val))
-            trial.set_user_attr("best_iterations", best_iterations)
-            return np.mean(scores)
+            return _optuna_eval("LightGBM", lambda: lgb.LGBMClassifier(
+                n_estimators=p["n_estimators"], learning_rate=p["lr"],
+                max_depth=p["max_depth"], num_leaves=p["num_leaves"],
+                min_child_samples=p["min_child_samples"],
+                subsample=p["subsample"], colsample_bytree=p["colsample_bytree"],
+                reg_alpha=p["reg_alpha"], reg_lambda=p["reg_lambda"],
+                random_state=RANDOM_SEED, n_jobs=-1, verbose=-1,
+            ))
 
-        lgb_study = _make_study()
-        lgb_study.optimize(lgb_obj, n_trials=n_trials, show_progress_bar=False,
+        study_lgb = _make_study()
+        study_lgb.optimize(_lgb_objective, n_trials=n_trials,
                            callbacks=[_trial_bar("LightGBM", n_trials, status_var)])
-        lp = lgb_study.best_params
-        lp["n_estimators"] = min(lp["n_estimators"], _median_best_rounds(lgb_study, "n_estimators"))
-        if progress_cb:
-            progress_cb(f"  Best CV log-loss: {lgb_study.best_value:.4f}")
-            progress_cb("")
-    else:
-        lp = None
+        if study_lgb.best_value < fixed_lgb_score:
+            lp = study_lgb.best_params.copy()
+            if progress_cb:
+                progress_cb(f"  LightGBM tuned: {study_lgb.best_value:.4f} (fixed: {fixed_lgb_score:.4f})")
+        else:
+            if progress_cb:
+                progress_cb(f"  LightGBM: fixed params better ({fixed_lgb_score:.4f} vs tuned {study_lgb.best_value:.4f}), keeping fixed")
 
-    # ── XGBoost ──
+    # ── XGBoost tuning ──
+    xp = FIXED_MODEL_PARAMS["XGBoost"].copy()
     if "XGBoost" in active_models:
-        if progress_cb:
-            progress_cb(f"  --- Tuning XGBoost ({n_trials} trials) ---")
+        fixed_xgb_score = _optuna_baseline("XGBoost", lambda: xgb.XGBClassifier(
+            n_estimators=xp["n_estimators"], learning_rate=xp["lr"],
+            max_depth=xp["max_depth"], min_child_weight=xp["min_child_weight"],
+            subsample=xp["subsample"], colsample_bytree=xp["colsample_bytree"],
+            reg_alpha=xp["reg_alpha"], reg_lambda=xp["reg_lambda"],
+            eval_metric="logloss", random_state=RANDOM_SEED, n_jobs=-1, verbosity=0,
+        ))
 
-        def xgb_obj(trial):
+        def _xgb_objective(trial):
             p = {
-                "n_estimators": trial.suggest_int("n_estimators", 100, 800),
-                "learning_rate": trial.suggest_float("lr", 0.01, 0.3, log=True),
-                "max_depth": trial.suggest_int("max_depth", 3, 8),
-                "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
-                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
-                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 1.0),
-                "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-                "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-                "eval_metric": "logloss",
-                "random_state": RANDOM_SEED,
-                "n_jobs": -1,
-                "verbosity": 0,
-                "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+                "n_estimators": trial.suggest_int("n_estimators", 150, 600),
+                "lr": trial.suggest_float("lr", 0.02, 0.10, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 7),
+                "min_child_weight": trial.suggest_int("min_child_weight", 3, 15),
+                "subsample": trial.suggest_float("subsample", 0.65, 0.95),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.9),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.01, 5.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 5.0, log=True),
+                "gamma": trial.suggest_float("gamma", 0.01, 3.0, log=True),
             }
-            scores = []
-            best_iterations = []
-            for tr, val in tscv.split(X_train_orig):
-                X_fold_train = X_train_orig.iloc[tr]
-                y_fold_train = y_train_raw.iloc[tr]
-                X_fold_val = X_train_orig.iloc[val]
-                y_fold_val = y_train_raw.iloc[val]
-                X_fold, y_fold = _augment_swap(X_fold_train, y_fold_train)
-                X_eval_aug, y_eval_aug = _augment_swap(X_fold_val, y_fold_val)
-                m = xgb.XGBClassifier(**p)
-                m.fit(X_fold, y_fold, eval_set=[(X_eval_aug, y_eval_aug)], verbose=False)
-                best_iter = getattr(m, "best_iteration", None)
-                best_iterations.append((best_iter + 1) if best_iter is not None else p["n_estimators"])
-                scores.append(_symmetric_fold_logloss("XGBoost", m, X_fold_val, y_fold_val))
-            trial.set_user_attr("best_iterations", best_iterations)
-            return np.mean(scores)
+            return _optuna_eval("XGBoost", lambda: xgb.XGBClassifier(
+                n_estimators=p["n_estimators"], learning_rate=p["lr"],
+                max_depth=p["max_depth"], min_child_weight=p["min_child_weight"],
+                subsample=p["subsample"], colsample_bytree=p["colsample_bytree"],
+                reg_alpha=p["reg_alpha"], reg_lambda=p["reg_lambda"],
+                gamma=p["gamma"],
+                eval_metric="logloss", random_state=RANDOM_SEED,
+                n_jobs=-1, verbosity=0,
+            ))
 
-        xgb_study = _make_study()
-        xgb_study.optimize(xgb_obj, n_trials=n_trials, show_progress_bar=False,
-                           callbacks=[_trial_bar("XGBoost ", n_trials, status_var)])
-        xp = xgb_study.best_params
-        xp["n_estimators"] = min(xp["n_estimators"], _median_best_rounds(xgb_study, "n_estimators"))
-        if progress_cb:
-            progress_cb(f"  Best CV log-loss: {xgb_study.best_value:.4f}")
-            progress_cb("")
-    else:
-        xp = None
+        study_xgb = _make_study()
+        study_xgb.optimize(_xgb_objective, n_trials=n_trials,
+                           callbacks=[_trial_bar("XGBoost", n_trials, status_var)])
+        if study_xgb.best_value < fixed_xgb_score:
+            xp = study_xgb.best_params.copy()
+            if progress_cb:
+                progress_cb(f"  XGBoost tuned: {study_xgb.best_value:.4f} (fixed: {fixed_xgb_score:.4f})")
+        else:
+            if progress_cb:
+                progress_cb(f"  XGBoost: fixed params better ({fixed_xgb_score:.4f} vs tuned {study_xgb.best_value:.4f}), keeping fixed")
 
-    # ── CatBoost ──
+    # ── CatBoost tuning ──
+    cp = FIXED_MODEL_PARAMS["CatBoost"].copy()
     if "CatBoost" in active_models:
-        if progress_cb:
-            progress_cb(f"  --- Tuning CatBoost ({n_trials} trials) ---")
+        fixed_cb_score = _optuna_baseline("CatBoost", lambda: cb.CatBoostClassifier(
+            **_build_catboost_params(cp),
+        ))
 
-        def cb_obj(trial):
+        def _cb_objective(trial):
+            bootstrap_type = trial.suggest_categorical("bootstrap_type", ["Bayesian", "Bernoulli"])
             p = {
-                "iterations": trial.suggest_int("iterations", 100, 800),
-                "lr": trial.suggest_float("lr", 0.01, 0.3, log=True),
-                "depth": trial.suggest_int("depth", 3, 8),
-                "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-3, 10.0, log=True),
-                "random_strength": trial.suggest_float("random_strength", 0.01, 3.0, log=True),
-                "border_count": trial.suggest_int("border_count", 32, 255),
-                "bootstrap_type": trial.suggest_categorical("bootstrap_type", ["Bayesian", "Bernoulli"]),
+                "iterations": trial.suggest_int("iterations", 200, 600),
+                "lr": trial.suggest_float("lr", 0.02, 0.10, log=True),
+                "depth": trial.suggest_int("depth", 4, 7),
+                "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 10.0, log=True),
+                "random_strength": trial.suggest_float("random_strength", 0.5, 3.0),
+                "border_count": trial.suggest_int("border_count", 64, 200),
+                "bootstrap_type": bootstrap_type,
             }
-            if p["bootstrap_type"] == "Bayesian":
-                p["bagging_temperature"] = trial.suggest_float("bagging_temperature", 0.0, 2.0)
+            if bootstrap_type == "Bayesian":
+                p["bagging_temperature"] = trial.suggest_float("bagging_temperature", 0.1, 1.5)
             else:
-                p["subsample"] = trial.suggest_float("subsample", 0.6, 1.0)
-            scores = []
-            best_iterations = []
-            for tr, val in tscv.split(X_train_orig):
-                X_fold_train = X_train_orig.iloc[tr]
-                y_fold_train = y_train_raw.iloc[tr]
-                X_fold_val = X_train_orig.iloc[val]
-                y_fold_val = y_train_raw.iloc[val]
-                X_fold, y_fold = _augment_swap(X_fold_train, y_fold_train)
-                X_eval_aug, y_eval_aug = _augment_swap(X_fold_val, y_fold_val)
-                m = cb.CatBoostClassifier(**_build_catboost_params(p))
-                m.fit(
-                    X_fold, y_fold,
-                    eval_set=(X_eval_aug, y_eval_aug),
-                    verbose=0, use_best_model=True,
-                    early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-                )
-                best_iter = m.get_best_iteration()
-                best_iterations.append((best_iter + 1) if best_iter is not None and best_iter >= 0 else p["iterations"])
-                scores.append(_symmetric_fold_logloss("CatBoost", m, X_fold_val, y_fold_val))
-            trial.set_user_attr("best_iterations", best_iterations)
-            return np.mean(scores)
+                p["subsample"] = trial.suggest_float("subsample", 0.65, 0.95)
+            return _optuna_eval("CatBoost", lambda: cb.CatBoostClassifier(
+                **_build_catboost_params(p),
+            ))
 
-        cb_study = _make_study()
-        cb_study.optimize(cb_obj, n_trials=n_trials, show_progress_bar=False,
+        study_cb = _make_study()
+        study_cb.optimize(_cb_objective, n_trials=n_trials,
                           callbacks=[_trial_bar("CatBoost", n_trials, status_var)])
-        if cb_study.best_value < 0.693:
-            cp = cb_study.best_params
-            cp["iterations"] = min(cp["iterations"], _median_best_rounds(cb_study, "iterations"))
+        if study_cb.best_value < fixed_cb_score:
+            cp = study_cb.best_params.copy()
+            if progress_cb:
+                progress_cb(f"  CatBoost tuned: {study_cb.best_value:.4f} (fixed: {fixed_cb_score:.4f})")
         else:
-            cp = {"iterations": 500, "lr": 0.05, "depth": 6, "l2_leaf_reg": 3.0,
-                  "random_strength": 1.0, "bagging_temperature": 0.5,
-                  "border_count": 128, "bootstrap_type": "Bayesian"}
-        if progress_cb:
-            progress_cb(f"  Best CV log-loss: {cb_study.best_value:.4f}"
-                        + (" (using defaults)" if cb_study.best_value >= 0.693 else ""))
-            progress_cb("")
-    else:
-        cp = None
+            if progress_cb:
+                progress_cb(f"  CatBoost: fixed params better ({fixed_cb_score:.4f} vs tuned {study_cb.best_value:.4f}), keeping fixed")
 
-    n_sec = max(n_trials * 2 // 3, 20)
-
-    # ── ExtraTrees ──
-    if "ExtraTrees" in active_models:
-        if progress_cb:
-            progress_cb(f"  --- Tuning ExtraTrees ({n_sec} trials) ---")
-
-        def et_obj(trial):
-            p = {
-                "n_estimators": trial.suggest_int("n_estimators", 200, 1000),
-                "max_depth": trial.suggest_int("max_depth", 6, 20),
-                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 2, 30),
-                "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
-                "max_features": trial.suggest_float("max_features", 0.3, 1.0),
-                "random_state": RANDOM_SEED, "n_jobs": -1,
-            }
-            scores = []
-            for tr, val in tscv.split(X_train_orig):
-                X_fold_train = X_train_orig.iloc[tr]
-                y_fold_train = y_train_raw.iloc[tr]
-                X_fold_val = X_train_orig.iloc[val]
-                y_fold_val = y_train_raw.iloc[val]
-                X_fold, y_fold = _augment_swap(X_fold_train, y_fold_train)
-                m = ExtraTreesClassifier(**p)
-                m.fit(X_fold, y_fold)
-                scores.append(_symmetric_fold_logloss("ExtraTrees", m, X_fold_val, y_fold_val))
-            return np.mean(scores)
-
-        et_study = _make_study()
-        et_study.optimize(et_obj, n_trials=n_sec, show_progress_bar=False,
-                          callbacks=[_trial_bar("ExtraTrees", n_sec, status_var)])
-        if et_study.best_value < 0.693:
-            ep = et_study.best_params
-        else:
-            ep = {"n_estimators": 500, "max_depth": 12, "min_samples_leaf": 5,
-                  "min_samples_split": 2, "max_features": 0.7}
-        if progress_cb:
-            progress_cb(f"  Best CV log-loss: {et_study.best_value:.4f}"
-                        + (" (using defaults)" if et_study.best_value >= 0.693 else ""))
-            progress_cb("")
-    else:
-        ep = None
-
-    # ── HistGBM ──
+    # ── HistGBM tuning ──
+    hgp = FIXED_MODEL_PARAMS["HistGBM"].copy()
     if "HistGBM" in active_models:
-        if progress_cb:
-            progress_cb(f"  --- Tuning HistGBM ({n_sec} trials) ---")
+        fixed_hgb_score = _optuna_baseline("HistGBM", lambda: HistGradientBoostingClassifier(
+            max_iter=hgp["max_iter"], learning_rate=hgp["lr"],
+            max_depth=hgp["max_depth"], max_leaf_nodes=hgp["max_leaf_nodes"],
+            min_samples_leaf=hgp["min_samples_leaf"],
+            l2_regularization=hgp["l2_reg"],
+            random_state=RANDOM_SEED,
+        ))
 
-        def hgbm_obj(trial):
+        def _hgb_objective(trial):
             p = {
                 "max_iter": trial.suggest_int("max_iter", 200, 800),
-                "learning_rate": trial.suggest_float("lr", 0.01, 0.3, log=True),
-                "max_depth": trial.suggest_int("max_depth", 3, 10),
-                "max_leaf_nodes": trial.suggest_int("max_leaf_nodes", 15, 127),
-                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 5, 50),
-                "l2_regularization": trial.suggest_float("l2_reg", 1e-8, 10.0, log=True),
-                "random_state": RANDOM_SEED,
+                "lr": trial.suggest_float("lr", 0.02, 0.10, log=True),
+                "max_depth": trial.suggest_int("max_depth", 4, 8),
+                "max_leaf_nodes": trial.suggest_int("max_leaf_nodes", 15, 50),
+                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 10, 40),
+                "l2_reg": trial.suggest_float("l2_reg", 0.1, 10.0, log=True),
             }
-            scores = []
-            for tr, val in tscv.split(X_train_orig):
-                X_fold_train = X_train_orig.iloc[tr]
-                y_fold_train = y_train_raw.iloc[tr]
-                X_fold_val = X_train_orig.iloc[val]
-                y_fold_val = y_train_raw.iloc[val]
-                X_fold, y_fold = _augment_swap(X_fold_train, y_fold_train)
-                m = HistGradientBoostingClassifier(**p)
-                m.fit(X_fold, y_fold)
-                scores.append(_symmetric_fold_logloss("HistGBM", m, X_fold_val, y_fold_val))
-            return np.mean(scores)
+            return _optuna_eval("HistGBM", lambda: HistGradientBoostingClassifier(
+                max_iter=p["max_iter"], learning_rate=p["lr"],
+                max_depth=p["max_depth"], max_leaf_nodes=p["max_leaf_nodes"],
+                min_samples_leaf=p["min_samples_leaf"],
+                l2_regularization=p["l2_reg"],
+                random_state=RANDOM_SEED,
+            ))
 
-        hgbm_study = _make_study()
-        hgbm_study.optimize(hgbm_obj, n_trials=n_sec, show_progress_bar=False,
-                            callbacks=[_trial_bar("HistGBM ", n_sec, status_var)])
-        if hgbm_study.best_value < 0.693:
-            hgp = hgbm_study.best_params
+        study_hgb = _make_study()
+        study_hgb.optimize(_hgb_objective, n_trials=n_trials,
+                           callbacks=[_trial_bar("HistGBM", n_trials, status_var)])
+        if study_hgb.best_value < fixed_hgb_score:
+            hgp = study_hgb.best_params.copy()
+            if progress_cb:
+                progress_cb(f"  HistGBM tuned: {study_hgb.best_value:.4f} (fixed: {fixed_hgb_score:.4f})")
         else:
-            hgp = {"max_iter": 500, "lr": 0.05, "max_depth": 6,
-                   "max_leaf_nodes": 31, "min_samples_leaf": 20, "l2_reg": 1.0}
-        if progress_cb:
-            progress_cb(f"  Best CV log-loss: {hgbm_study.best_value:.4f}"
-                        + (" (using defaults)" if hgbm_study.best_value >= 0.693 else ""))
-            progress_cb("")
-    else:
-        hgp = None
+            if progress_cb:
+                progress_cb(f"  HistGBM: fixed params better ({fixed_hgb_score:.4f} vs tuned {study_hgb.best_value:.4f}), keeping fixed")
 
-    # ── RandomForest ──
-    if "RandForest" in active_models:
-        if progress_cb:
-            progress_cb(f"  --- Tuning RandomForest ({n_sec} trials) ---")
+    if progress_cb:
+        progress_cb("")
 
-        def rf_obj(trial):
-            p = {
-                "n_estimators": trial.suggest_int("n_estimators", 200, 1000),
-                "max_depth": trial.suggest_int("max_depth", 6, 20),
-                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 2, 30),
-                "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
-                "max_features": trial.suggest_float("max_features", 0.3, 1.0),
-                "random_state": RANDOM_SEED, "n_jobs": -1,
-            }
-            scores = []
-            for tr, val in tscv.split(X_train_orig):
-                X_fold_train = X_train_orig.iloc[tr]
-                y_fold_train = y_train_raw.iloc[tr]
-                X_fold_val = X_train_orig.iloc[val]
-                y_fold_val = y_train_raw.iloc[val]
-                X_fold, y_fold = _augment_swap(X_fold_train, y_fold_train)
-                m = RandomForestClassifier(**p)
-                m.fit(X_fold, y_fold)
-                scores.append(_symmetric_fold_logloss("RandForest", m, X_fold_val, y_fold_val))
-            return np.mean(scores)
-
-        rf_study = _make_study()
-        rf_study.optimize(rf_obj, n_trials=n_sec, show_progress_bar=False,
-                          callbacks=[_trial_bar("RandForst", n_sec, status_var)])
-        if rf_study.best_value < 0.693:
-            rp = rf_study.best_params
-        else:
-            rp = {"n_estimators": 500, "max_depth": 12, "min_samples_leaf": 5,
-                  "min_samples_split": 2, "max_features": 0.7}
-        if progress_cb:
-            progress_cb(f"  Best CV log-loss: {rf_study.best_value:.4f}"
-                        + (" (using defaults)" if rf_study.best_value >= 0.693 else ""))
-            progress_cb("")
-    else:
-        rp = None
+    # Fixed params for remaining models
+    ep = FIXED_MODEL_PARAMS["ExtraTrees"].copy() if "ExtraTrees" in active_models else None
+    rp = FIXED_MODEL_PARAMS["RandForest"].copy() if "RandForest" in active_models else None
+    abp = FIXED_MODEL_PARAMS["AdaBoost"].copy() if "AdaBoost" in active_models else None
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Build model specs and time-aware OOF stack features
@@ -1687,6 +1909,7 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
                 max_depth=xp["max_depth"], min_child_weight=xp["min_child_weight"],
                 subsample=xp["subsample"], colsample_bytree=xp["colsample_bytree"],
                 reg_alpha=xp["reg_alpha"], reg_lambda=xp["reg_lambda"],
+                gamma=xp.get("gamma", 0.0),
                 eval_metric="logloss", random_state=RANDOM_SEED,
                 n_jobs=-1, verbosity=0)))
         if "CatBoost" in active_models and cp is not None:
@@ -1714,16 +1937,18 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
                 random_state=RANDOM_SEED, n_jobs=-1)))
         if "MLP" in active_models:
             specs.append(("MLP", lambda: MLPClassifier(
-                hidden_layer_sizes=(128, 64, 32), max_iter=500,
-                early_stopping=True, random_state=RANDOM_SEED, learning_rate="adaptive")))
+                hidden_layer_sizes=(64, 32), max_iter=600, alpha=0.01,
+                early_stopping=True, validation_fraction=0.15,
+                random_state=RANDOM_SEED, learning_rate="adaptive")))
         if "TabNet" in active_models:
             specs.append(("TabNet", lambda: TabNetClassifier(verbose=0, seed=RANDOM_SEED)))
         if "SVM" in active_models:
             specs.append(("SVM", lambda: SVC(
                 kernel="rbf", probability=True, C=1.0, random_state=RANDOM_SEED)))
-        if "AdaBoost" in active_models:
+        if "AdaBoost" in active_models and abp is not None:
             specs.append(("AdaBoost", lambda: AdaBoostClassifier(
-                n_estimators=200, learning_rate=0.1, random_state=RANDOM_SEED)))
+                n_estimators=abp["n_estimators"], learning_rate=abp["learning_rate"],
+                random_state=RANDOM_SEED)))
         if "LogReg" in active_models:
             specs.append(("LogReg", lambda: LogisticRegression(max_iter=2000, C=1.0, random_state=RANDOM_SEED)))
         return specs
@@ -1753,14 +1978,25 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
     X_meta_val = dev_oof.loc[meta_val_mask, model_order]
     y_meta_val = y_dev.loc[meta_val_mask]
 
-    stacker, stacker_c, val_ll = _fit_regularized_stacker(
-        X_meta_train, y_meta_train, X_meta_val, y_meta_val
+    best_pick, pick_candidates = _select_best_pick_combiner(
+        X_meta_train, y_meta_train, X_meta_val, y_meta_val, model_order
     )
-    val_stack = _clip_probs(stacker.predict_proba(X_meta_val)[:, 1])
-    decision_threshold, val_acc = _tune_pick_threshold(val_stack, y_meta_val)
+    eval_combiner = best_pick["combiner"]
+    decision_threshold = best_pick["threshold"]
+    val_acc = best_pick["accuracy"]
+    val_ll = best_pick["log_loss"]
 
     if progress_cb:
-        progress_cb(f"  Stacker ready. | Val acc: {val_acc:.1%} | Val log-loss: {val_ll:.4f} | Threshold: {decision_threshold:.3f}")
+        progress_cb(f"  Pick combiner: {_describe_combiner(eval_combiner)} | Val acc: {val_acc:.1%} | Val log-loss: {val_ll:.4f} | Threshold: {decision_threshold:.3f}")
+        top_candidates = sorted(
+            pick_candidates,
+            key=lambda row: (row["accuracy"], -row["log_loss"], -abs(row["threshold"] - 0.5)),
+            reverse=True,
+        )[:3]
+        for row in top_candidates:
+            progress_cb(
+                f"    {row['label']:<18} acc={row['accuracy']:.1%}  ll={row['log_loss']:.4f}  thr={row['threshold']:.3f}"
+            )
         progress_cb("")
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1788,24 +2024,25 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
         test_probas[name] = _symmetric_probabilities(name, model, X_eval, X_eval_swap)
 
     test_meta = pd.DataFrame(test_probas)[model_order]
-    ensemble_probs = _clip_probs(stacker.predict_proba(test_meta)[:, 1])
+    ensemble_probs = _combine_base_probas(test_meta, eval_combiner)
     ensemble_ll = log_loss(y_test_raw, ensemble_probs)
     ensemble_acc = accuracy_score(y_test_raw, (ensemble_probs >= decision_threshold).astype(int))
     test_brier = brier_score_loss(y_test_raw, ensemble_probs)
     test_ece = _expected_calibration_error(y_test_raw, ensemble_probs)
-    stack_shares, _ = _extract_stacker_shares(stacker, model_order)
+    combiner_shares = _extract_combiner_shares(eval_combiner, model_order)
 
     if progress_cb:
         progress_cb("")
         progress_cb(f"  --- Test Set Results ({test_size} fights, never seen during tuning/stacking) ---")
-        progress_cb(f"  {'Model':<14} {'Accuracy':>10} {'Log-Loss':>10} {'Stack':>8}")
+        progress_cb(f"  {'Model':<14} {'Accuracy':>10} {'Log-Loss':>10} {'Share':>8}")
         progress_cb(f"  {'-'*46}")
         for name in model_order:
             acc = accuracy_score(y_test_raw, (test_probas[name] >= 0.5).astype(int))
             ll = log_loss(y_test_raw, test_probas[name])
-            progress_cb(f"  {name:<14} {acc:>9.1%} {ll:>10.4f} {stack_shares[name]:>7.0%}")
+            progress_cb(f"  {name:<14} {acc:>9.1%} {ll:>10.4f} {combiner_shares[name]:>7.0%}")
         progress_cb(f"  {'-'*46}")
-        progress_cb(f"  {'Stacked':<14} {ensemble_acc:>9.1%} {ensemble_ll:>10.4f}  thr={decision_threshold:.3f}")
+        progress_cb(f"  {'Ensemble':<14} {ensemble_acc:>9.1%} {ensemble_ll:>10.4f}  thr={decision_threshold:.3f}")
+        progress_cb(f"  Combiner: {_describe_combiner(eval_combiner)}")
         progress_cb(f"  Val log-loss: {val_ll:.4f} | Test Brier: {test_brier:.4f} | Test ECE: {test_ece:.4f}")
         progress_cb("")
 
@@ -1831,17 +2068,52 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
         _fit_model(name, model, X_fit, y_all)
         final_models[name] = model
 
-    final_stacker = LogisticRegression(max_iter=2000, C=stacker_c or 1.0, random_state=RANDOM_SEED)
-    final_stacker.fit(dev_oof.loc[valid_meta_mask, model_order], y_dev.loc[valid_meta_mask].astype(int))
+    final_meta = dev_oof.loc[valid_meta_mask, model_order]
+    final_y_meta = y_dev.loc[valid_meta_mask].astype(int)
+    if eval_combiner["kind"] == "stacker":
+        final_model = LogisticRegression(
+            max_iter=2000,
+            C=eval_combiner.get("stacker_c") or 1.0,
+            random_state=RANDOM_SEED,
+        )
+        final_model.fit(final_meta, final_y_meta)
+        final_combiner = {
+            "kind": "stacker",
+            "model": final_model,
+            "model_order": list(model_order),
+            "stacker_c": eval_combiner.get("stacker_c"),
+        }
+    elif eval_combiner["kind"] == "weighted":
+        final_combiner = {
+            "kind": "weighted",
+            "weights": _optimize_blend_weights(final_meta, final_y_meta),
+            "model_order": list(model_order),
+        }
+    elif eval_combiner["kind"] == "average":
+        final_combiner = {
+            "kind": "average",
+            "model_order": list(eval_combiner["model_order"]),
+        }
+    else:
+        final_combiner = {
+            "kind": "single",
+            "name": eval_combiner["name"],
+            "model_order": [eval_combiner["name"]],
+        }
+
+    final_dev_probs = _combine_base_probas(final_meta, final_combiner)
+    final_decision_threshold, _ = _tune_pick_threshold(final_dev_probs, final_y_meta)
 
     if progress_cb:
         progress_cb("")
-        progress_cb(f"  Model ready. | Test accuracy: {ensemble_acc:.1%} | Test log-loss: {ensemble_ll:.4f}")
+        progress_cb(
+            f"  Model ready. | Combiner: {_describe_combiner(final_combiner)} | Test accuracy: {ensemble_acc:.1%} | Test log-loss: {ensemble_ll:.4f}"
+        )
         progress_cb("")
 
     return EnsembleModel(
-        final_models, imputer_full, scaler_full, feature_cols, final_stacker,
-        model_order, decision_threshold=decision_threshold,
+        final_models, imputer_full, scaler_full, feature_cols, final_combiner,
+        decision_threshold=final_decision_threshold,
         missing_cols=missing_cols, calibrator=None,
     )
 
