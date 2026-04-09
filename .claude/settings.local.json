@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import catboost; print\\('catboost', catboost.__version__\\)\")",
+      "Bash(python -c \"from sklearn.ensemble import HistGradientBoostingClassifier; print\\('HistGBM OK'\\)\")",
+      "Bash(python -c \"from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, AdaBoostClassifier; print\\('RF/ET/Ada OK'\\)\")",
+      "Bash(python -c \"from sklearn.neural_network import MLPClassifier; print\\('MLP OK'\\)\")",
+      "Bash(python -c \"from sklearn.svm import SVC; print\\('SVC OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('c:/Users/gdsak/OneDrive/Desktop/Glicko-2, Etc/ML_Predictions.py', doraise=True\\); print\\('OK'\\)\")"
+    ]
+  }
+}
