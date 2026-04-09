@@ -538,6 +538,33 @@ Find URLs at: http://ufcstats.com/statistics/events/completed"""
                 round_stats[f'b_{p}_ground'] = b_l
                 round_stats[f'b_{p}_ground_att'] = b_a
 
+            # Fill in empty values for rounds that weren't fought (up to 5)
+            for n in range(actual_rounds + 1, 6):
+                p = f'rd{n}'
+                for prefix in ('r_', 'b_'):
+                    round_stats[f'{prefix}{p}_kd'] = ''
+                    round_stats[f'{prefix}{p}_sig_str'] = ''
+                    round_stats[f'{prefix}{p}_sig_str_att'] = ''
+                    round_stats[f'{prefix}{p}_str'] = ''
+                    round_stats[f'{prefix}{p}_str_att'] = ''
+                    round_stats[f'{prefix}{p}_td'] = ''
+                    round_stats[f'{prefix}{p}_td_att'] = ''
+                    round_stats[f'{prefix}{p}_sub_att'] = ''
+                    round_stats[f'{prefix}{p}_rev'] = ''
+                    round_stats[f'{prefix}{p}_ctrl_sec'] = ''
+                    round_stats[f'{prefix}{p}_head'] = ''
+                    round_stats[f'{prefix}{p}_head_att'] = ''
+                    round_stats[f'{prefix}{p}_body'] = ''
+                    round_stats[f'{prefix}{p}_body_att'] = ''
+                    round_stats[f'{prefix}{p}_leg'] = ''
+                    round_stats[f'{prefix}{p}_leg_att'] = ''
+                    round_stats[f'{prefix}{p}_distance'] = ''
+                    round_stats[f'{prefix}{p}_distance_att'] = ''
+                    round_stats[f'{prefix}{p}_clinch'] = ''
+                    round_stats[f'{prefix}{p}_clinch_att'] = ''
+                    round_stats[f'{prefix}{p}_ground'] = ''
+                    round_stats[f'{prefix}{p}_ground_att'] = ''
+
             fight_data = {
                 'event_name': event_data['event_name'],
                 'event_url': event_data['event_url'],
@@ -731,8 +758,27 @@ Find URLs at: http://ufcstats.com/statistics/events/completed"""
             'r_pro_td_acc', 'b_pro_td_acc', 'pro_td_acc_diff',
             'r_pro_td_def', 'b_pro_td_def', 'pro_td_def_diff',
             'r_pro_sub_avg', 'b_pro_sub_avg', 'pro_sub_avg_diff',
-            'r_name', 'b_name'
+            'r_name', 'b_name',
         ]
+
+        # Add per-round columns for rounds 1-5
+        for n in range(1, 6):
+            p = f'rd{n}'
+            column_order.extend([
+                f'r_{p}_kd', f'b_{p}_kd',
+                f'r_{p}_sig_str', f'r_{p}_sig_str_att', f'b_{p}_sig_str', f'b_{p}_sig_str_att',
+                f'r_{p}_str', f'r_{p}_str_att', f'b_{p}_str', f'b_{p}_str_att',
+                f'r_{p}_td', f'r_{p}_td_att', f'b_{p}_td', f'b_{p}_td_att',
+                f'r_{p}_sub_att', f'b_{p}_sub_att',
+                f'r_{p}_rev', f'b_{p}_rev',
+                f'r_{p}_ctrl_sec', f'b_{p}_ctrl_sec',
+                f'r_{p}_head', f'r_{p}_head_att', f'b_{p}_head', f'b_{p}_head_att',
+                f'r_{p}_body', f'r_{p}_body_att', f'b_{p}_body', f'b_{p}_body_att',
+                f'r_{p}_leg', f'r_{p}_leg_att', f'b_{p}_leg', f'b_{p}_leg_att',
+                f'r_{p}_distance', f'r_{p}_distance_att', f'b_{p}_distance', f'b_{p}_distance_att',
+                f'r_{p}_clinch', f'r_{p}_clinch_att', f'b_{p}_clinch', f'b_{p}_clinch_att',
+                f'r_{p}_ground', f'r_{p}_ground_att', f'b_{p}_ground', f'b_{p}_ground_att',
+            ])
         
         # Keep only columns that exist in the dataframe, in the specified order
         existing_columns = [col for col in column_order if col in df.columns]

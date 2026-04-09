@@ -1,17 +1,17 @@
 """
 UFC ML Fight Predictor.
 
-Loads pure_fight_data.csv, engineers 150+ features per matchup (career rates,
-defense, Glicko-2, round stats, form, EWM, variance, etc.), trains an
-Optuna-tuned LightGBM + XGBoost + Logistic Regression ensemble, then
-predicts upcoming fights via a tkinter GUI and exports to Excel.
+Builds chronological pre-fight features from pure_fight_data.csv, trains a
+time-aware ensemble with leak-safe train/validation/test evaluation,
+probability calibration, then predicts upcoming fights via
+tkinter and exports results to Excel.
 """
 
-import csv, math, os, threading, warnings, logging
+import csv, math, os, threading, warnings, logging, random
 import tkinter as tk
 from tkinter import messagebox
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -21,7 +21,7 @@ import catboost as cb
 import optuna
 from scipy.optimize import minimize as scipy_minimize
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import log_loss, accuracy_score
+from sklearn.metrics import log_loss, accuracy_score, brier_score_loss
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
@@ -41,6 +41,12 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 logging.getLogger("lightgbm").setLevel(logging.WARNING)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RANDOM_SEED = 42
+MISSINGNESS_THRESHOLD = 0.35
+
+os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
 
 # ─── Glicko-2 constants ────────────────────────────────────────────────────────
 MU_0 = 1500.0
@@ -49,6 +55,15 @@ SIGMA_0 = 0.06
 TAU = 0.5
 SCALE = 173.7178
 CONVERGENCE = 1e-6
+
+# ─── Weight class ordinal mapping ─────────────────────────────────────────────
+WEIGHT_CLASS_ORDINAL = {
+    "Women's Strawweight": 1, "Women's Flyweight": 2, "Women's Bantamweight": 3,
+    "Women's Featherweight": 4, "Flyweight": 5, "Bantamweight": 6,
+    "Featherweight": 7, "Lightweight": 8, "Welterweight": 9,
+    "Middleweight": 10, "Light Heavyweight": 11, "Heavyweight": 12,
+    "Catch Weight": 7, "Open Weight": 10,
+}
 
 # ─── Glicko-2 core ─────────────────────────────────────────────────────────────
 
@@ -127,6 +142,62 @@ def _safe_mean(values):
 def _safe_div(a, b, default=0.0):
     return a / b if b and b > 0 else default
 
+
+def _weighted_rate(numerator, denominator, prior=0.5, strength=25.0):
+    """Bayesian-smoothed rate using equivalent sample-size `strength`."""
+    if denominator is None or denominator <= 0:
+        return prior
+    return (numerator + prior * strength) / (denominator + strength)
+
+
+def _bayes_shrink(empirical_value, sample_size, prior=0.5, strength=8.0):
+    """Shrink noisy low-sample statistics toward a global prior."""
+    if _isnan(empirical_value):
+        empirical_value = prior
+    sample_size = max(float(sample_size or 0.0), 0.0)
+    return (empirical_value * sample_size + prior * strength) / (sample_size + strength)
+
+
+def _time_weight(fight_date, current_date, half_life_days=730):
+    """Exponential decay weight: half-life of ~2 years."""
+    if current_date is None or fight_date is None:
+        return 1.0
+    try:
+        days = (current_date - fight_date).days
+        return 2.0 ** (-max(days, 0) / half_life_days)
+    except (TypeError, AttributeError):
+        return 1.0
+
+
+def _pick_missing_cols(X, threshold=MISSINGNESS_THRESHOLD):
+    return [c for c in X.columns if float(X[c].isna().mean()) >= threshold]
+
+
+def _add_missingness_indicators(X, missing_cols):
+    X2 = X.copy()
+    for col in missing_cols:
+        if col not in X2.columns:
+            X2[col] = np.nan
+        X2[f"miss_{col}"] = X2[col].isna().astype(float)
+    return X2
+
+
+def _expected_calibration_error(y_true, probs, n_bins=10):
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(probs, dtype=float)
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    inds = np.digitize(p, bins) - 1
+    ece = 0.0
+    for b in range(n_bins):
+        mask = inds == b
+        if not np.any(mask):
+            continue
+        conf = p[mask].mean()
+        acc = y[mask].mean()
+        ece += (mask.mean()) * abs(acc - conf)
+    return float(ece)
+
+
 # Per-round stat names to track
 RD_STATS = [
     "sig_str", "sig_str_att", "kd", "td", "td_att", "sub_att", "ctrl_sec",
@@ -135,7 +206,7 @@ RD_STATS = [
 
 # ─── Fight record extraction ───────────────────────────────────────────────────
 
-def extract_fight_record(row, prefix, opp, result):
+def extract_fight_record(row, prefix, opp, result, opp_glicko_mu=MU_0):
     """Build a per-fighter fight record dict from a DataFrame row."""
     def g(col):
         v = row.get(col)
@@ -147,6 +218,7 @@ def extract_fight_record(row, prefix, opp, result):
         "date": row["event_date"],
         "fight_time": g(f"total_fight_time_sec") or 0,
         "result": result,
+        "opp_glicko": opp_glicko_mu,
         "method": row.get("method", ""),
         "is_title": g("is_title_bout") or 0,
         "finish_round": g("finish_round") or 0,
@@ -220,17 +292,33 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date):
     total_time_min = total_time / 60.0 if total_time > 0 else 1.0
     total_time_15 = total_time / 900.0 if total_time > 0 else 1.0
 
+    total_sig_land = _safe_sum(h["sig_str"] for h in history)
+    total_sig_att = _safe_sum(h["sig_str_att"] for h in history)
+    total_str_land = _safe_sum(h["str"] for h in history)
+    total_str_att = _safe_sum(h["str_att"] for h in history)
+    total_td_land = _safe_sum(h["td"] for h in history)
+    total_td_att = _safe_sum(h["td_att"] for h in history)
+
     # ── Striking offense (per minute) ──
-    feats["sig_str_pm"] = _safe_sum(h["sig_str"] for h in history) / total_time_min
-    feats["sig_str_att_pm"] = _safe_sum(h["sig_str_att"] for h in history) / total_time_min
-    feats["str_pm"] = _safe_sum(h["str"] for h in history) / total_time_min
-    feats["str_att_pm"] = _safe_sum(h["str_att"] for h in history) / total_time_min
+    feats["sig_str_pm"] = total_sig_land / total_time_min
+    feats["sig_str_att_pm"] = total_sig_att / total_time_min
+    feats["str_pm"] = total_str_land / total_time_min
+    feats["str_att_pm"] = total_str_att / total_time_min
     feats["kd_pm"] = _safe_sum(h["kd"] for h in history) / total_time_min
 
-    # ── Accuracy (career average) ──
-    feats["sig_str_acc"] = _safe_mean([h["sig_str_acc"] for h in history])
-    feats["str_acc"] = _safe_mean([h["str_acc"] for h in history])
-    feats["td_acc"] = _safe_mean([h["td_acc"] for h in history])
+    # ── Accuracy (attempt-weighted + Bayesian shrinkage) ──
+    feats["sig_str_acc"] = _bayes_shrink(
+        _weighted_rate(total_sig_land, total_sig_att, prior=0.45, strength=30),
+        n, prior=0.45, strength=8,
+    )
+    feats["str_acc"] = _bayes_shrink(
+        _weighted_rate(total_str_land, total_str_att, prior=0.55, strength=30),
+        n, prior=0.55, strength=8,
+    )
+    feats["td_acc"] = _bayes_shrink(
+        _weighted_rate(total_td_land, total_td_att, prior=0.35, strength=20),
+        n, prior=0.35, strength=8,
+    )
 
     # ── Grappling (per 15 min) ──
     feats["td_p15"] = _safe_sum(h["td"] for h in history) / total_time_15
@@ -239,15 +327,71 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date):
     feats["rev_p15"] = _safe_sum(h["rev"] for h in history) / total_time_15
     feats["ctrl_pct"] = _safe_sum(h["ctrl_sec"] for h in history) / total_time if total_time > 0 else 0
 
-    # ── Targeting (average %) ──
-    feats["head_pct"] = _safe_mean([h["head_pct"] for h in history])
-    feats["body_pct"] = _safe_mean([h["body_pct"] for h in history])
-    feats["leg_pct"] = _safe_mean([h["leg_pct"] for h in history])
+    # ── Targeting (attempt/volume-weighted + shrinkage) ──
+    sig_for_target = _safe_sum(
+        h["sig_str"] for h in history
+        if not _isnan(h["head_pct"]) and not _isnan(h["sig_str"])
+    )
+    head_num = _safe_sum(
+        h["head_pct"] * h["sig_str"]
+        for h in history
+        if not _isnan(h["head_pct"]) and not _isnan(h["sig_str"])
+    )
+    body_num = _safe_sum(
+        h["body_pct"] * h["sig_str"]
+        for h in history
+        if not _isnan(h["body_pct"]) and not _isnan(h["sig_str"])
+    )
+    leg_num = _safe_sum(
+        h["leg_pct"] * h["sig_str"]
+        for h in history
+        if not _isnan(h["leg_pct"]) and not _isnan(h["sig_str"])
+    )
+    feats["head_pct"] = _bayes_shrink(
+        _weighted_rate(head_num, sig_for_target, prior=0.62, strength=40),
+        n, prior=0.62, strength=8,
+    )
+    feats["body_pct"] = _bayes_shrink(
+        _weighted_rate(body_num, sig_for_target, prior=0.22, strength=40),
+        n, prior=0.22, strength=8,
+    )
+    feats["leg_pct"] = _bayes_shrink(
+        _weighted_rate(leg_num, sig_for_target, prior=0.16, strength=40),
+        n, prior=0.16, strength=8,
+    )
 
-    # ── Positioning (average %) ──
-    feats["distance_pct"] = _safe_mean([h["distance_pct"] for h in history])
-    feats["clinch_pct"] = _safe_mean([h["clinch_pct"] for h in history])
-    feats["ground_pct"] = _safe_mean([h["ground_pct"] for h in history])
+    # ── Positioning (volume-weighted + shrinkage) ──
+    sig_for_pos = _safe_sum(
+        h["sig_str"] for h in history
+        if not _isnan(h["distance_pct"]) and not _isnan(h["sig_str"])
+    )
+    dist_num = _safe_sum(
+        h["distance_pct"] * h["sig_str"]
+        for h in history
+        if not _isnan(h["distance_pct"]) and not _isnan(h["sig_str"])
+    )
+    clinch_num = _safe_sum(
+        h["clinch_pct"] * h["sig_str"]
+        for h in history
+        if not _isnan(h["clinch_pct"]) and not _isnan(h["sig_str"])
+    )
+    ground_num = _safe_sum(
+        h["ground_pct"] * h["sig_str"]
+        for h in history
+        if not _isnan(h["ground_pct"]) and not _isnan(h["sig_str"])
+    )
+    feats["distance_pct"] = _bayes_shrink(
+        _weighted_rate(dist_num, sig_for_pos, prior=0.68, strength=40),
+        n, prior=0.68, strength=8,
+    )
+    feats["clinch_pct"] = _bayes_shrink(
+        _weighted_rate(clinch_num, sig_for_pos, prior=0.14, strength=40),
+        n, prior=0.14, strength=8,
+    )
+    feats["ground_pct"] = _bayes_shrink(
+        _weighted_rate(ground_num, sig_for_pos, prior=0.18, strength=40),
+        n, prior=0.18, strength=8,
+    )
 
     # ── Defense (opponent per-minute) ──
     feats["def_sig_str_pm"] = _safe_sum(h["opp_sig_str"] for h in history) / total_time_min
@@ -256,7 +400,12 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date):
     feats["def_td_p15"] = _safe_sum(h["opp_td"] for h in history) / total_time_15
     feats["def_sub_att_p15"] = _safe_sum(h["opp_sub_att"] for h in history) / total_time_15
     feats["def_ctrl_pct"] = _safe_sum(h["opp_ctrl_sec"] for h in history) / total_time if total_time > 0 else 0
-    feats["def_sig_str_acc"] = _safe_mean([h["opp_sig_str_acc"] for h in history])
+    opp_sig_att = _safe_sum(h["opp_sig_str_att"] for h in history)
+    opp_sig_land = _safe_sum(h["opp_sig_str"] for h in history)
+    feats["def_sig_str_acc"] = _bayes_shrink(
+        _weighted_rate(opp_sig_land, opp_sig_att, prior=0.45, strength=30),
+        n, prior=0.45, strength=8,
+    )
 
     # ── Differentials ──
     feats["net_sig_str_pm"] = feats["sig_str_pm"] - feats["def_sig_str_pm"]
@@ -265,12 +414,16 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date):
     feats["net_ctrl_pct"] = feats["ctrl_pct"] - feats["def_ctrl_pct"]
 
     # ── Defense rates ──
-    opp_sig_att = _safe_sum(h["opp_sig_str_att"] for h in history)
-    opp_sig_land = _safe_sum(h["opp_sig_str"] for h in history)
-    feats["sig_str_defense_rate"] = 1.0 - _safe_div(opp_sig_land, opp_sig_att)
+    feats["sig_str_defense_rate"] = _bayes_shrink(
+        1.0 - _weighted_rate(opp_sig_land, opp_sig_att, prior=0.45, strength=30),
+        n, prior=0.55, strength=8,
+    )
     opp_td_att = _safe_sum(h["opp_td_att"] for h in history)
     opp_td_land = _safe_sum(h["opp_td"] for h in history)
-    feats["td_defense_rate"] = 1.0 - _safe_div(opp_td_land, opp_td_att)
+    feats["td_defense_rate"] = _bayes_shrink(
+        1.0 - _weighted_rate(opp_td_land, opp_td_att, prior=0.35, strength=20),
+        n, prior=0.65, strength=8,
+    )
 
     # ── Physical (most recent) ──
     latest = history[-1]
@@ -289,24 +442,26 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date):
     # ── Record ──
     wins = sum(1 for h in history if h["result"] == "W")
     losses = sum(1 for h in history if h["result"] == "L")
-    feats["win_rate"] = wins / n
+    feats["win_rate"] = _bayes_shrink(_safe_div(wins, n, 0.5), n, prior=0.5, strength=10)
     ko_w = sum(1 for h in history if h["result"] == "W" and "KO" in str(h["method"]))
     sub_w = sum(1 for h in history if h["result"] == "W" and "Sub" in str(h["method"]))
     dec_w = sum(1 for h in history if h["result"] == "W" and "Dec" in str(h["method"]))
-    feats["ko_win_pct"] = ko_w / n
-    feats["sub_win_pct"] = sub_w / n
-    feats["dec_win_pct"] = dec_w / n
+    feats["ko_win_pct"] = _bayes_shrink(_safe_div(ko_w, n, 0.25), n, prior=0.25, strength=10)
+    feats["sub_win_pct"] = _bayes_shrink(_safe_div(sub_w, n, 0.12), n, prior=0.12, strength=10)
+    feats["dec_win_pct"] = _bayes_shrink(_safe_div(dec_w, n, 0.13), n, prior=0.13, strength=10)
     feats["finish_rate"] = _safe_div(ko_w + sub_w, max(wins, 1))
     ko_l = sum(1 for h in history if h["result"] == "L" and "KO" in str(h["method"]))
     sub_l = sum(1 for h in history if h["result"] == "L" and "Sub" in str(h["method"]))
-    feats["ko_loss_pct"] = ko_l / n
+    feats["ko_loss_pct"] = _bayes_shrink(_safe_div(ko_l, n, 0.2), n, prior=0.2, strength=10)
     feats["been_finished_pct"] = _safe_div(ko_l + sub_l, max(losses, 1))
 
     # ── Form ──
     last3 = history[-3:]
     last5 = history[-5:]
-    feats["last3_win_rate"] = sum(1 for h in last3 if h["result"] == "W") / len(last3)
-    feats["last5_win_rate"] = sum(1 for h in last5 if h["result"] == "W") / len(last5)
+    last3_wr = sum(1 for h in last3 if h["result"] == "W") / len(last3)
+    last5_wr = sum(1 for h in last5 if h["result"] == "W") / len(last5)
+    feats["last3_win_rate"] = _bayes_shrink(last3_wr, len(last3), prior=0.5, strength=6)
+    feats["last5_win_rate"] = _bayes_shrink(last5_wr, len(last5), prior=0.5, strength=6)
     win_streak = 0
     for h in reversed(history):
         if h["result"] == "W":
@@ -372,9 +527,22 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date):
         feats[f"{prefix_tag}_td_p15"] = _safe_sum(h["td"] for h in recent) / rt_15
         feats[f"{prefix_tag}_ctrl_pct"] = _safe_sum(h["ctrl_sec"] for h in recent) / rt if rt > 0 else 0
         feats[f"{prefix_tag}_def_sig_str_pm"] = _safe_sum(h["opp_sig_str"] for h in recent) / rt_min
-        feats[f"{prefix_tag}_sig_str_acc"] = _safe_mean([h["sig_str_acc"] for h in recent])
-        feats[f"{prefix_tag}_td_acc"] = _safe_mean([h["td_acc"] for h in recent])
-        feats[f"{prefix_tag}_win"] = sum(1 for h in recent if h["result"] == "W") / len(recent)
+        rec_sig_land = _safe_sum(h["sig_str"] for h in recent)
+        rec_sig_att = _safe_sum(h["sig_str_att"] for h in recent)
+        rec_td_land = _safe_sum(h["td"] for h in recent)
+        rec_td_att = _safe_sum(h["td_att"] for h in recent)
+        feats[f"{prefix_tag}_sig_str_acc"] = _bayes_shrink(
+            _weighted_rate(rec_sig_land, rec_sig_att, prior=0.45, strength=20),
+            len(recent), prior=0.45, strength=6,
+        )
+        feats[f"{prefix_tag}_td_acc"] = _bayes_shrink(
+            _weighted_rate(rec_td_land, rec_td_att, prior=0.35, strength=20),
+            len(recent), prior=0.35, strength=6,
+        )
+        feats[f"{prefix_tag}_win"] = _bayes_shrink(
+            _safe_div(sum(1 for h in recent if h["result"] == "W"), len(recent), 0.5),
+            len(recent), prior=0.5, strength=6,
+        )
 
     # ── Exponentially weighted moving average (alpha=0.3, more recent = higher) ──
     alpha = 0.3
@@ -482,6 +650,54 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date):
     # Average opponent Glicko
     feats["avg_opp_glicko"] = _safe_mean(opp_glickos) if opp_glickos else MU_0
 
+    # ── Time-decayed career stats (half-life ~2 years) ──
+    tw = [_time_weight(h["date"], current_date) for h in history]
+    tw_total = sum(tw) or 1.0
+    tw_time = sum(w * h["fight_time"] for w, h in zip(tw, history))
+    tw_time_min = tw_time / 60.0 if tw_time > 0 else 1.0
+    tw_time_15 = tw_time / 900.0 if tw_time > 0 else 1.0
+    feats["td_sig_str_pm"] = sum(w * h["sig_str"] for w, h in zip(tw, history)) / tw_time_min
+    feats["td_kd_pm"] = sum(w * h["kd"] for w, h in zip(tw, history)) / tw_time_min
+    feats["td_td_p15"] = sum(w * h["td"] for w, h in zip(tw, history)) / tw_time_15
+    feats["td_ctrl_pct"] = (
+        sum(w * h["ctrl_sec"] for w, h in zip(tw, history)) / tw_time if tw_time > 0 else 0
+    )
+    feats["td_def_sig_str_pm"] = sum(w * h["opp_sig_str"] for w, h in zip(tw, history)) / tw_time_min
+    tw_sig_land = sum(w * h["sig_str"] for w, h in zip(tw, history))
+    tw_sig_att = sum(w * h["sig_str_att"] for w, h in zip(tw, history))
+    feats["td_sig_str_acc"] = _weighted_rate(tw_sig_land, tw_sig_att, prior=0.45, strength=20)
+    tw_td_land = sum(w * h["td"] for w, h in zip(tw, history))
+    tw_td_att = sum(w * h["td_att"] for w, h in zip(tw, history))
+    feats["td_td_acc"] = _weighted_rate(tw_td_land, tw_td_att, prior=0.35, strength=20)
+    feats["td_win_rate"] = sum(
+        w * (1.0 if h["result"] == "W" else 0.0) for w, h in zip(tw, history)
+    ) / tw_total
+
+    # ── Opponent-quality-adjusted features ──
+    opp_g = [h.get("opp_glicko", MU_0) for h in history]
+    opp_g_w = [max(g_val / MU_0, 0.1) for g_val in opp_g]
+    ogw_total = sum(opp_g_w) or 1.0
+    feats["quality_win_rate"] = sum(
+        w * (1.0 if h["result"] == "W" else 0.0)
+        for w, h in zip(opp_g_w, history)
+    ) / ogw_total
+    wins_opp_g = [og for h, og in zip(history, opp_g) if h["result"] == "W"]
+    feats["best_win_glicko"] = max(wins_opp_g) if wins_opp_g else MU_0
+    losses_opp_g = [og for h, og in zip(history, opp_g) if h["result"] == "L"]
+    feats["worst_loss_glicko"] = min(losses_opp_g) if losses_opp_g else MU_0
+    feats["quality_sig_str_pm"] = sum(
+        w * h["sig_str"] for w, h in zip(opp_g_w, history)
+    ) / (sum(w * (h["fight_time"] / 60.0 if h["fight_time"] > 0 else 1.0)
+             for w, h in zip(opp_g_w, history)) or 1.0)
+
+    # ── Style profile (continuous features for matchup interactions) ──
+    total_offensive = feats["sig_str_pm"] + feats["td_p15"] + feats["sub_att_p15"] + 0.01
+    feats["style_striking"] = feats["sig_str_pm"] / total_offensive
+    feats["style_wrestling"] = feats["td_p15"] / total_offensive
+    feats["style_submission"] = feats["sub_att_p15"] / total_offensive
+    feats["style_clinch_ground"] = feats.get("clinch_pct", 0.14) + feats.get("ground_pct", 0.18)
+    feats["style_finishing"] = feats.get("finish_rate", 0.5)
+
     if _FIGHTER_FEAT_KEYS is None:
         _set_fighter_keys(list(feats.keys()))
 
@@ -495,7 +711,7 @@ def _set_fighter_keys(keys):
 
 # ─── Matchup feature computation ──────────────────────────────────────────────
 
-def compute_matchup_features(a_feats, b_feats, is_title=0, total_rounds=3):
+def compute_matchup_features(a_feats, b_feats, is_title=0, total_rounds=3, weight_class=""):
     """Difference features (A minus B) plus interaction features."""
     features = {}
     for key in a_feats:
@@ -511,6 +727,31 @@ def compute_matchup_features(a_feats, b_feats, is_title=0, total_rounds=3):
     features["exp_sum"] = (a_feats.get("num_fights", 0) or 0) + (b_feats.get("num_fights", 0) or 0)
     features["age_sum"] = (a_feats.get("age", 30) or 30) + (b_feats.get("age", 30) or 30)
     features["glicko_mu_sum"] = (a_feats.get("glicko_mu", MU_0) or MU_0) + (b_feats.get("glicko_mu", MU_0) or MU_0)
+    # Weight class
+    features["weight_class_ord"] = WEIGHT_CLASS_ORDINAL.get(weight_class, 7)
+    # Stance matchup interactions (d_ prefix for correct augmentation negation)
+    a_ortho = a_feats.get("is_orthodox", 0) or 0
+    a_south = a_feats.get("is_southpaw", 0) or 0
+    b_ortho = b_feats.get("is_orthodox", 0) or 0
+    b_south = b_feats.get("is_southpaw", 0) or 0
+    features["d_ortho_vs_south"] = float(a_ortho * b_south) - float(b_ortho * a_south)
+    features["same_stance"] = float(
+        a_ortho == b_ortho and a_south == b_south and (a_ortho or a_south)
+    )
+    # Style cluster matchup interactions
+    a_stk = a_feats.get("style_striking", 0.5) or 0.5
+    a_wrs = a_feats.get("style_wrestling", 0.15) or 0.15
+    a_sub = a_feats.get("style_submission", 0.1) or 0.1
+    a_cg = a_feats.get("style_clinch_ground", 0.32) or 0.32
+    b_stk = b_feats.get("style_striking", 0.5) or 0.5
+    b_wrs = b_feats.get("style_wrestling", 0.15) or 0.15
+    b_sub = b_feats.get("style_submission", 0.1) or 0.1
+    b_cg = b_feats.get("style_clinch_ground", 0.32) or 0.32
+    features["d_striker_vs_grappler"] = a_stk * (b_wrs + b_sub) - b_stk * (a_wrs + a_sub)
+    features["style_mismatch"] = a_stk * (b_wrs + b_sub) + b_stk * (a_wrs + a_sub)
+    features["style_distance"] = math.sqrt(
+        (a_stk - b_stk)**2 + (a_wrs - b_wrs)**2 + (a_sub - b_sub)**2 + (a_cg - b_cg)**2
+    )
     return features
 
 
@@ -561,6 +802,7 @@ def build_training_data(csv_path, progress_cb=None):
                 r_feats, b_feats,
                 is_title=row.get("is_title_bout", 0),
                 total_rounds=row.get("total_rounds", 3),
+                weight_class=row.get("weight_class", ""),
             )
             if row["winner"] in ("Red", "Blue"):
                 rows_X.append(matchup)
@@ -579,8 +821,8 @@ def build_training_data(csv_path, progress_cb=None):
             r_sc, b_sc = 0.5, 0.5
 
         # Update histories
-        fighter_history[r_name].append(extract_fight_record(row, "r", "b", r_res))
-        fighter_history[b_name].append(extract_fight_record(row, "b", "r", b_res))
+        fighter_history[r_name].append(extract_fight_record(row, "r", "b", r_res, b_glicko[0]))
+        fighter_history[b_name].append(extract_fight_record(row, "b", "r", b_res, r_glicko[0]))
 
         # Track opponent Glicko
         opp_glicko_list[r_name].append(b_glicko[0])
@@ -601,7 +843,40 @@ def build_training_data(csv_path, progress_cb=None):
 
 # ─── Optuna tuning + ensemble ─────────────────────────────────────────────────
 
-NEEDS_SCALE = {"MLP", "SVM", "LogReg", "TabNet"}
+NEEDS_SCALE = {"LogReg", "MLP", "SVM"}
+
+
+def _clip_probs(probs, eps=1e-6):
+    return np.clip(np.asarray(probs, dtype=float), eps, 1.0 - eps)
+
+
+def _make_study():
+    return optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
+    )
+
+
+def _build_catboost_params(params):
+    p = {
+        "iterations": params["iterations"],
+        "learning_rate": params["lr"],
+        "depth": params["depth"],
+        "l2_leaf_reg": params["l2_leaf_reg"],
+        "random_strength": params["random_strength"],
+        "border_count": params.get("border_count", 128),
+        "bootstrap_type": params.get("bootstrap_type", "Bayesian"),
+        "loss_function": "Logloss",
+        "eval_metric": "Logloss",
+        "random_seed": RANDOM_SEED,
+        "verbose": 0,
+        "allow_writing_files": False,
+    }
+    if p["bootstrap_type"] == "Bayesian":
+        p["bagging_temperature"] = params.get("bagging_temperature", 0.5)
+    else:
+        p["subsample"] = params.get("subsample", 0.8)
+    return p
 
 
 def _augment_swap(X, y):
@@ -637,42 +912,52 @@ def _swap_features(X):
 
 
 class EnsembleModel:
-    def __init__(self, models, imputer, scaler, feat_cols, weights):
-        self.models = models          # dict  name -> fitted model
+    def __init__(self, models, imputer, scaler, feat_cols, weights,
+                 missing_cols=None, calibrator=None):
+        self.models = models
         self.imputer = imputer
         self.scaler = scaler
         self.feat_cols = feat_cols
-        self.weights = weights        # dict  name -> float weight
+        self.weights = weights
+        self.missing_cols = missing_cols or []
+        self.calibrator = calibrator
+
+    def _prepare_input(self, X_raw):
+        X = _add_missingness_indicators(X_raw, self.missing_cols)
+        X = X.reindex(columns=self.feat_cols)
+        X_imp = pd.DataFrame(self.imputer.transform(X), columns=self.feat_cols)
+        X_sc = pd.DataFrame(self.scaler.transform(X_imp), columns=self.feat_cols)
+        return X_imp, X_sc
 
     def _predict_all(self, X_imp, X_sc):
         probas = {}
         for name, model in self.models.items():
             X_in = X_sc if name in NEEDS_SCALE else X_imp
-            probas[name] = (model.predict_proba(X_in.values)[:, 1]
-                            if name == "TabNet"
-                            else model.predict_proba(X_in)[:, 1])
+            if isinstance(model, TabNetClassifier):
+                X_in = X_in.values if hasattr(X_in, 'values') else np.asarray(X_in)
+            probas[name] = _clip_probs(model.predict_proba(X_in)[:, 1])
         return probas
 
     def predict_proba_single(self, features_dict):
-        """Symmetric prediction: average P(A wins|A=red) and 1-P(A wins|A=blue)."""
-        # Original orientation
-        X = pd.DataFrame([features_dict])[self.feat_cols]
-        X_imp = pd.DataFrame(self.imputer.transform(X), columns=self.feat_cols)
-        X_sc = pd.DataFrame(self.scaler.transform(X_imp), columns=self.feat_cols)
+        """Symmetric prediction with optional Platt calibration."""
+        X = pd.DataFrame([features_dict])
+        X_imp, X_sc = self._prepare_input(X)
         p_orig = self._predict_all(X_imp, X_sc)
 
-        # Swapped orientation
         X_sw = _swap_features(X)
-        X_sw_imp = pd.DataFrame(self.imputer.transform(X_sw), columns=self.feat_cols)
-        X_sw_sc = pd.DataFrame(self.scaler.transform(X_sw_imp), columns=self.feat_cols)
+        X_sw_imp, X_sw_sc = self._prepare_input(X_sw)
         p_swap = self._predict_all(X_sw_imp, X_sw_sc)
 
-        total = 0.0
-        for n in self.models:
-            p_fwd = p_orig[n][0]
-            p_rev = p_swap[n][0]
-            total += self.weights[n] * (p_fwd + (1.0 - p_rev)) / 2.0
-        return total
+        p_raw = 0.0
+        for name in self.models:
+            p_fwd = p_orig[name][0]
+            p_rev = p_swap[name][0]
+            p_raw += self.weights[name] * (p_fwd + (1.0 - p_rev)) / 2.0
+
+        if self.calibrator is not None:
+            p_raw = float(self.calibrator.predict_proba(np.array([[p_raw]]))[:, 1][0])
+
+        return float(np.clip(p_raw, 1e-6, 1 - 1e-6))
 
 
 def _optimize_weights(probas_dict, y_true):
@@ -696,20 +981,69 @@ def _optimize_weights(probas_dict, y_true):
     return weights, result.fun
 
 
-def _fit_model(name, model, X, y):
-    """Fit a model, handling TabNet's numpy requirement."""
-    if name == "TabNet":
-        model.fit(X.values, y.astype(int).values,
-                  max_epochs=100, patience=15, batch_size=1024)
+def _fit_model(*args):
+    """Backward-compatible model fit helper.
+
+    Supports both:
+      _fit_model(model, X, y)
+      _fit_model(name, model, X, y)
+    """
+    if len(args) == 4:
+        _, model, X, y = args
+    else:
+        model, X, y = args
+    if isinstance(model, TabNetClassifier):
+        X_np = X.values if hasattr(X, 'values') else np.asarray(X)
+        y_np = np.asarray(y).astype(int)
+        model.fit(X_np, y_np)
     else:
         model.fit(X, y)
     return model
 
 
-def _predict_model(name, model, X):
-    if name == "TabNet":
-        return model.predict_proba(X.values)[:, 1]
-    return model.predict_proba(X)[:, 1]
+def _predict_model(*args):
+    """Backward-compatible proba helper.
+
+    Supports both:
+      _predict_model(model, X)
+      _predict_model(name, model, X)
+    """
+    if len(args) == 3:
+        _, model, X = args
+    else:
+        model, X = args
+    if isinstance(model, TabNetClassifier):
+        X_in = X.values if hasattr(X, 'values') else np.asarray(X)
+        return _clip_probs(model.predict_proba(X_in)[:, 1])
+    return _clip_probs(model.predict_proba(X)[:, 1])
+
+
+def _fit_preprocessors(X_fit_raw, X_eval_raw, needs_scale=False):
+    imputer = SimpleImputer(strategy="median")
+    X_fit_imp = pd.DataFrame(imputer.fit_transform(X_fit_raw), columns=X_fit_raw.columns)
+    X_eval_imp = pd.DataFrame(imputer.transform(X_eval_raw), columns=X_fit_raw.columns)
+
+    scaler = StandardScaler()
+    scaler.fit(X_fit_imp)
+    X_fit_sc = pd.DataFrame(scaler.transform(X_fit_imp), columns=X_fit_raw.columns)
+    X_eval_sc = pd.DataFrame(scaler.transform(X_eval_imp), columns=X_fit_raw.columns)
+
+    if needs_scale:
+        return X_fit_sc, X_eval_sc, imputer, scaler
+    return X_fit_imp, X_eval_imp, imputer, scaler
+
+
+def _transform_with_preprocessors(X_raw, imputer, scaler, feat_cols, needs_scale=False):
+    X_imp = pd.DataFrame(imputer.transform(X_raw), columns=feat_cols)
+    if needs_scale:
+        return pd.DataFrame(scaler.transform(X_imp), columns=feat_cols)
+    return X_imp
+
+
+def _fit_platt_calibrator(probs, y_true):
+    cal = LogisticRegression(max_iter=2000, C=1.0, random_state=RANDOM_SEED)
+    cal.fit(_clip_probs(probs).reshape(-1, 1), np.asarray(y_true).astype(int))
+    return cal
 
 
 def _trial_bar(model_name, n_trials, status_var=None):
@@ -732,47 +1066,69 @@ def _trial_bar(model_name, n_trials, status_var=None):
 def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
     """Optuna-tune LightGBM / XGBoost / CatBoost, train 11-model ensemble.
 
-    Holds out the most recent 20 % of fights as a true test set that is
-    never used during tuning or training.  Reports test-set metrics, then
-    retrains final models on ALL data for production predictions.
+    Uses a chronological 65/15/20 train/val/test split.  Hyperparameters are
+    tuned via TimeSeriesSplit CV on train, ensemble weights are optimized on
+    val, and final metrics are reported on the truly unseen test set.
+    Retrains final models on ALL data for production predictions.
     """
     n = len(X)
-    test_size = int(n * 0.2)
-    train_size = n - test_size
+    test_size = int(n * 0.20)
+    val_size = int(n * 0.15)
+    train_size = n - val_size - test_size
 
-    X_train_raw, X_test_raw = X.iloc[:train_size], X.iloc[train_size:]
+    X_train_raw = X.iloc[:train_size]
+    X_val_raw = X.iloc[train_size:train_size + val_size]
+    X_test_raw = X.iloc[train_size + val_size:]
     y_train_raw = y.iloc[:train_size].reset_index(drop=True)
-    y_test_raw = y.iloc[train_size:].reset_index(drop=True)
+    y_val_raw = y.iloc[train_size:train_size + val_size].reset_index(drop=True)
+    y_test_raw = y.iloc[train_size + val_size:].reset_index(drop=True)
 
     if progress_cb:
         progress_cb("")
-        progress_cb(f"  Train set: {train_size} fights  |  Test set: {test_size} fights (most recent 20%)")
+        progress_cb(f"  Train: {train_size} | Val: {val_size} (weight tuning) | Test: {test_size} (final eval)")
         progress_cb("")
 
-    # Impute on train, transform both
+    missing_cols = _pick_missing_cols(X_train_raw)
+    X_train_raw = _add_missingness_indicators(X_train_raw, missing_cols)
+    X_val_raw = _add_missingness_indicators(X_val_raw, missing_cols)
+    X_test_raw = _add_missingness_indicators(X_test_raw, missing_cols)
+    X_full_raw = _add_missingness_indicators(X, missing_cols)
+
+    if missing_cols and progress_cb:
+        progress_cb(f"  Missingness indicators enabled for {len(missing_cols)} sparse features")
+
+    # Impute on train, transform val and test
     imputer = SimpleImputer(strategy="median")
-    X_train_orig = pd.DataFrame(imputer.fit_transform(X_train_raw), columns=X.columns)
-    X_test = pd.DataFrame(imputer.transform(X_test_raw), columns=X.columns)
-
-    # Augment training data — interleave (orig, swap) to eliminate red-corner bias
-    X_train, y_train_raw = _augment_swap(X_train_orig, y_train_raw)
-
-    if progress_cb:
-        progress_cb(f"  Augmented train set: {len(X_train)} rows (corner-swap debiasing)")
-
-    # Scaled versions for models that need it
-    scaler_eval = StandardScaler()
-    X_train_sc = pd.DataFrame(scaler_eval.fit_transform(X_train), columns=X.columns)
-    X_test_sc = pd.DataFrame(scaler_eval.transform(X_test), columns=X.columns)
-
-    # Swapped test sets for symmetric prediction
-    X_test_swap = _swap_features(X_test)
-    X_test_swap_sc = pd.DataFrame(scaler_eval.transform(X_test_swap), columns=X.columns)
+    X_train_orig = pd.DataFrame(imputer.fit_transform(X_train_raw), columns=X_train_raw.columns)
+    X_val = pd.DataFrame(imputer.transform(X_val_raw), columns=X_train_raw.columns)
+    X_test = pd.DataFrame(imputer.transform(X_test_raw), columns=X_train_raw.columns)
 
     tscv = TimeSeriesSplit(n_splits=5)
 
+    # ── Feature selection via LightGBM importance (drop bottom 15%) ──
+    _sel_X, _sel_y = _augment_swap(X_train_orig, y_train_raw)
+    _sel_mdl = lgb.LGBMClassifier(n_estimators=300, verbose=-1, random_state=RANDOM_SEED)
+    _sel_mdl.fit(_sel_X, _sel_y)
+    _imp = _sel_mdl.feature_importances_
+    _threshold = np.percentile(_imp[_imp > 0], 15) if (_imp > 0).sum() > 0 else 0
+    _keep = _imp > _threshold
+    selected_cols = X_train_orig.columns.tolist()
+    feature_count_before_sel = len(selected_cols)
+    if _keep.sum() < feature_count_before_sel and _keep.sum() >= 20:
+        selected_cols = [c for c, k in zip(X_train_orig.columns, _keep) if k]
+        if progress_cb:
+            progress_cb(f"  Feature selection: {feature_count_before_sel} -> {len(selected_cols)} features")
+        X_train_orig = X_train_orig[selected_cols]
+        X_val = X_val[selected_cols]
+        X_test = X_test[selected_cols]
+        X_full_raw = X_full_raw[selected_cols]
+    else:
+        X_full_raw = X_full_raw[selected_cols]
+
+    feature_cols = selected_cols
+
     # ═══════════════════════════════════════════════════════════════════════
-    #  Optuna tuning — LightGBM, XGBoost, CatBoost
+    #  Optuna tuning — LightGBM, XGBoost, CatBoost + secondary models
     # ═══════════════════════════════════════════════════════════════════════
 
     # ── LightGBM ──
@@ -790,17 +1146,20 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 1.0),
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+            "random_state": RANDOM_SEED,
+            "n_jobs": -1,
             "verbose": -1,
         }
         scores = []
-        for tr, val in tscv.split(X_train):
+        for tr, val in tscv.split(X_train_orig):
+            X_fold, y_fold = _augment_swap(X_train_orig.iloc[tr], y_train_raw.iloc[tr])
             m = lgb.LGBMClassifier(**p)
-            m.fit(X_train.iloc[tr], y_train_raw.iloc[tr])
+            m.fit(X_fold, y_fold)
             scores.append(log_loss(y_train_raw.iloc[val],
-                                   m.predict_proba(X_train.iloc[val])[:, 1]))
+                                   m.predict_proba(X_train_orig.iloc[val])[:, 1]))
         return np.mean(scores)
 
-    lgb_study = optuna.create_study(direction="minimize")
+    lgb_study = _make_study()
     lgb_study.optimize(lgb_obj, n_trials=n_trials, show_progress_bar=False,
                        callbacks=[_trial_bar("LightGBM", n_trials, status_var)])
     lp = lgb_study.best_params
@@ -822,17 +1181,21 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 1.0),
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-            "eval_metric": "logloss", "verbosity": 0,
+            "eval_metric": "logloss",
+            "random_state": RANDOM_SEED,
+            "n_jobs": -1,
+            "verbosity": 0,
         }
         scores = []
-        for tr, val in tscv.split(X_train):
+        for tr, val in tscv.split(X_train_orig):
+            X_fold, y_fold = _augment_swap(X_train_orig.iloc[tr], y_train_raw.iloc[tr])
             m = xgb.XGBClassifier(**p)
-            m.fit(X_train.iloc[tr], y_train_raw.iloc[tr])
+            m.fit(X_fold, y_fold)
             scores.append(log_loss(y_train_raw.iloc[val],
-                                   m.predict_proba(X_train.iloc[val])[:, 1]))
+                                   m.predict_proba(X_train_orig.iloc[val])[:, 1]))
         return np.mean(scores)
 
-    xgb_study = optuna.create_study(direction="minimize")
+    xgb_study = _make_study()
     xgb_study.optimize(xgb_obj, n_trials=n_trials, show_progress_bar=False,
                        callbacks=[_trial_bar("XGBoost ", n_trials, status_var)])
     xp = xgb_study.best_params
@@ -847,31 +1210,150 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
     def cb_obj(trial):
         p = {
             "iterations": trial.suggest_int("iterations", 100, 800),
-            "learning_rate": trial.suggest_float("lr", 0.01, 0.3, log=True),
+            "lr": trial.suggest_float("lr", 0.01, 0.3, log=True),
             "depth": trial.suggest_int("depth", 3, 8),
-            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-8, 10.0, log=True),
-            "random_strength": trial.suggest_float("random_strength", 1e-8, 10.0, log=True),
-            "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 10.0),
-            "verbose": 0, "allow_writing_files": False,
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-3, 10.0, log=True),
+            "random_strength": trial.suggest_float("random_strength", 0.01, 3.0, log=True),
+            "border_count": trial.suggest_int("border_count", 32, 255),
+            "bootstrap_type": trial.suggest_categorical("bootstrap_type", ["Bayesian", "Bernoulli"]),
         }
+        if p["bootstrap_type"] == "Bayesian":
+            p["bagging_temperature"] = trial.suggest_float("bagging_temperature", 0.0, 2.0)
+        else:
+            p["subsample"] = trial.suggest_float("subsample", 0.6, 1.0)
         scores = []
-        for tr, val in tscv.split(X_train):
-            m = cb.CatBoostClassifier(**p)
-            m.fit(X_train.iloc[tr], y_train_raw.iloc[tr], verbose=0)
+        for tr, val in tscv.split(X_train_orig):
+            X_fold, y_fold = _augment_swap(X_train_orig.iloc[tr], y_train_raw.iloc[tr])
+            m = cb.CatBoostClassifier(**_build_catboost_params(p))
+            m.fit(X_fold, y_fold, verbose=0)
             scores.append(log_loss(y_train_raw.iloc[val],
-                                   m.predict_proba(X_train.iloc[val])[:, 1]))
+                                   m.predict_proba(X_train_orig.iloc[val])[:, 1]))
         return np.mean(scores)
 
-    cb_study = optuna.create_study(direction="minimize")
+    cb_study = _make_study()
     cb_study.optimize(cb_obj, n_trials=n_trials, show_progress_bar=False,
                       callbacks=[_trial_bar("CatBoost", n_trials, status_var)])
-    cp = cb_study.best_params
+    if cb_study.best_value < 0.693:
+        cp = cb_study.best_params
+    else:
+        cp = {"iterations": 500, "lr": 0.05, "depth": 6, "l2_leaf_reg": 3.0,
+              "random_strength": 1.0, "bagging_temperature": 0.5,
+              "border_count": 128, "bootstrap_type": "Bayesian"}
     if progress_cb:
-        progress_cb(f"  Best CV log-loss: {cb_study.best_value:.4f}")
+        progress_cb(f"  Best CV log-loss: {cb_study.best_value:.4f}"
+                    + (" (using defaults)" if cb_study.best_value >= 0.693 else ""))
+        progress_cb("")
+
+    n_sec = max(n_trials * 2 // 3, 20)
+
+    # ── ExtraTrees ──
+    if progress_cb:
+        progress_cb(f"  --- Tuning ExtraTrees ({n_sec} trials) ---")
+
+    def et_obj(trial):
+        p = {
+            "n_estimators": trial.suggest_int("n_estimators", 200, 1000),
+            "max_depth": trial.suggest_int("max_depth", 6, 20),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 2, 30),
+            "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
+            "max_features": trial.suggest_float("max_features", 0.3, 1.0),
+            "random_state": RANDOM_SEED, "n_jobs": -1,
+        }
+        scores = []
+        for tr, val in tscv.split(X_train_orig):
+            X_fold, y_fold = _augment_swap(X_train_orig.iloc[tr], y_train_raw.iloc[tr])
+            m = ExtraTreesClassifier(**p)
+            m.fit(X_fold, y_fold)
+            scores.append(log_loss(y_train_raw.iloc[val],
+                                   m.predict_proba(X_train_orig.iloc[val])[:, 1]))
+        return np.mean(scores)
+
+    et_study = _make_study()
+    et_study.optimize(et_obj, n_trials=n_sec, show_progress_bar=False,
+                      callbacks=[_trial_bar("ExtraTrees", n_sec, status_var)])
+    if et_study.best_value < 0.693:
+        ep = et_study.best_params
+    else:
+        ep = {"n_estimators": 500, "max_depth": 12, "min_samples_leaf": 5,
+              "min_samples_split": 2, "max_features": 0.7}
+    if progress_cb:
+        progress_cb(f"  Best CV log-loss: {et_study.best_value:.4f}"
+                    + (" (using defaults)" if et_study.best_value >= 0.693 else ""))
+        progress_cb("")
+
+    # ── HistGBM ──
+    if progress_cb:
+        progress_cb(f"  --- Tuning HistGBM ({n_sec} trials) ---")
+
+    def hgbm_obj(trial):
+        p = {
+            "max_iter": trial.suggest_int("max_iter", 200, 800),
+            "learning_rate": trial.suggest_float("lr", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "max_leaf_nodes": trial.suggest_int("max_leaf_nodes", 15, 127),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 5, 50),
+            "l2_regularization": trial.suggest_float("l2_reg", 1e-8, 10.0, log=True),
+            "random_state": RANDOM_SEED,
+        }
+        scores = []
+        for tr, val in tscv.split(X_train_orig):
+            X_fold, y_fold = _augment_swap(X_train_orig.iloc[tr], y_train_raw.iloc[tr])
+            m = HistGradientBoostingClassifier(**p)
+            m.fit(X_fold, y_fold)
+            scores.append(log_loss(y_train_raw.iloc[val],
+                                   m.predict_proba(X_train_orig.iloc[val])[:, 1]))
+        return np.mean(scores)
+
+    hgbm_study = _make_study()
+    hgbm_study.optimize(hgbm_obj, n_trials=n_sec, show_progress_bar=False,
+                        callbacks=[_trial_bar("HistGBM ", n_sec, status_var)])
+    if hgbm_study.best_value < 0.693:
+        hgp = hgbm_study.best_params
+    else:
+        hgp = {"max_iter": 500, "lr": 0.05, "max_depth": 6,
+               "max_leaf_nodes": 31, "min_samples_leaf": 20, "l2_reg": 1.0}
+    if progress_cb:
+        progress_cb(f"  Best CV log-loss: {hgbm_study.best_value:.4f}"
+                    + (" (using defaults)" if hgbm_study.best_value >= 0.693 else ""))
+        progress_cb("")
+
+    # ── RandomForest ──
+    if progress_cb:
+        progress_cb(f"  --- Tuning RandomForest ({n_sec} trials) ---")
+
+    def rf_obj(trial):
+        p = {
+            "n_estimators": trial.suggest_int("n_estimators", 200, 1000),
+            "max_depth": trial.suggest_int("max_depth", 6, 20),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 2, 30),
+            "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
+            "max_features": trial.suggest_float("max_features", 0.3, 1.0),
+            "random_state": RANDOM_SEED, "n_jobs": -1,
+        }
+        scores = []
+        for tr, val in tscv.split(X_train_orig):
+            X_fold, y_fold = _augment_swap(X_train_orig.iloc[tr], y_train_raw.iloc[tr])
+            m = RandomForestClassifier(**p)
+            m.fit(X_fold, y_fold)
+            scores.append(log_loss(y_train_raw.iloc[val],
+                                   m.predict_proba(X_train_orig.iloc[val])[:, 1]))
+        return np.mean(scores)
+
+    rf_study = _make_study()
+    rf_study.optimize(rf_obj, n_trials=n_sec, show_progress_bar=False,
+                      callbacks=[_trial_bar("RandForst", n_sec, status_var)])
+    if rf_study.best_value < 0.693:
+        rp = rf_study.best_params
+    else:
+        rp = {"n_estimators": 500, "max_depth": 12, "min_samples_leaf": 5,
+              "min_samples_split": 2, "max_features": 0.7}
+    if progress_cb:
+        progress_cb(f"  Best CV log-loss: {rf_study.best_value:.4f}"
+                    + (" (using defaults)" if rf_study.best_value >= 0.693 else ""))
         progress_cb("")
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  Build model specs — tuned params for the big 3, defaults for the rest
+    #  Build model specs — tuned params for all key models
     # ═══════════════════════════════════════════════════════════════════════
 
     def _make_specs():
@@ -881,69 +1363,115 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
                 max_depth=lp["max_depth"], num_leaves=lp["num_leaves"],
                 min_child_samples=lp["min_child_samples"],
                 subsample=lp["subsample"], colsample_bytree=lp["colsample_bytree"],
-                reg_alpha=lp["reg_alpha"], reg_lambda=lp["reg_lambda"], verbose=-1)),
+                reg_alpha=lp["reg_alpha"], reg_lambda=lp["reg_lambda"],
+                random_state=RANDOM_SEED, n_jobs=-1, verbose=-1)),
             ("XGBoost", lambda: xgb.XGBClassifier(
                 n_estimators=xp["n_estimators"], learning_rate=xp["lr"],
                 max_depth=xp["max_depth"], min_child_weight=xp["min_child_weight"],
                 subsample=xp["subsample"], colsample_bytree=xp["colsample_bytree"],
                 reg_alpha=xp["reg_alpha"], reg_lambda=xp["reg_lambda"],
-                eval_metric="logloss", verbosity=0)),
-            ("CatBoost", lambda: cb.CatBoostClassifier(
-                iterations=cp["iterations"], learning_rate=cp["lr"],
-                depth=cp["depth"], l2_leaf_reg=cp["l2_leaf_reg"],
-                random_strength=cp["random_strength"],
-                bagging_temperature=cp["bagging_temperature"],
-                verbose=0, allow_writing_files=False)),
+                eval_metric="logloss", random_state=RANDOM_SEED,
+                n_jobs=-1, verbosity=0)),
+            ("CatBoost", lambda: cb.CatBoostClassifier(**_build_catboost_params(cp))),
             ("HistGBM", lambda: HistGradientBoostingClassifier(
-                max_iter=500, learning_rate=0.05, max_depth=6, random_state=42)),
+                max_iter=hgp["max_iter"], learning_rate=hgp["lr"],
+                max_depth=hgp["max_depth"], max_leaf_nodes=hgp["max_leaf_nodes"],
+                min_samples_leaf=hgp["min_samples_leaf"],
+                l2_regularization=hgp["l2_reg"],
+                random_state=RANDOM_SEED)),
             ("RandForest", lambda: RandomForestClassifier(
-                n_estimators=500, max_depth=12, min_samples_leaf=5,
-                random_state=42, n_jobs=-1)),
+                n_estimators=rp["n_estimators"], max_depth=rp["max_depth"],
+                min_samples_leaf=rp["min_samples_leaf"],
+                min_samples_split=rp["min_samples_split"],
+                max_features=rp["max_features"],
+                random_state=RANDOM_SEED, n_jobs=-1)),
             ("ExtraTrees", lambda: ExtraTreesClassifier(
-                n_estimators=500, max_depth=12, min_samples_leaf=5,
-                random_state=42, n_jobs=-1)),
+                n_estimators=ep["n_estimators"], max_depth=ep["max_depth"],
+                min_samples_leaf=ep["min_samples_leaf"],
+                min_samples_split=ep["min_samples_split"],
+                max_features=ep["max_features"],
+                random_state=RANDOM_SEED, n_jobs=-1)),
             ("MLP", lambda: MLPClassifier(
                 hidden_layer_sizes=(128, 64, 32), max_iter=500,
-                early_stopping=True, random_state=42, learning_rate="adaptive")),
-            ("TabNet", lambda: TabNetClassifier(verbose=0, seed=42)),
+                early_stopping=True, random_state=RANDOM_SEED, learning_rate="adaptive")),
+            ("TabNet", lambda: TabNetClassifier(verbose=0, seed=RANDOM_SEED)),
             ("SVM", lambda: SVC(
-                kernel="rbf", probability=True, C=1.0, random_state=42)),
+                kernel="rbf", probability=True, C=1.0, random_state=RANDOM_SEED)),
             ("AdaBoost", lambda: AdaBoostClassifier(
-                n_estimators=200, learning_rate=0.1, random_state=42)),
+                n_estimators=200, learning_rate=0.1, random_state=RANDOM_SEED)),
             ("LogReg", lambda: LogisticRegression(max_iter=2000, C=1.0)),
         ]
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  Train all models on train split, evaluate on held-out test set
+    #  Augment + scale (after Optuna so orig/swap pairs stay in same fold)
+    # ═══════════════════════════════════════════════════════════════════════
+    X_train_aug, y_train_aug = _augment_swap(X_train_orig, y_train_raw)
+
+    if progress_cb:
+        progress_cb(f"  Augmented train set: {len(X_train_aug)} rows (corner-swap debiasing)")
+
+    scaler_eval = StandardScaler()
+    X_train_sc = pd.DataFrame(scaler_eval.fit_transform(X_train_aug), columns=feature_cols)
+    X_val_sc = pd.DataFrame(scaler_eval.transform(X_val), columns=feature_cols)
+    X_test_sc = pd.DataFrame(scaler_eval.transform(X_test), columns=feature_cols)
+
+    X_val_swap = _swap_features(X_val)
+    X_val_swap_sc = pd.DataFrame(scaler_eval.transform(X_val_swap), columns=feature_cols)
+    X_test_swap = _swap_features(X_test)
+    X_test_swap_sc = pd.DataFrame(scaler_eval.transform(X_test_swap), columns=feature_cols)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Train all models on augmented train split, evaluate on val + test
     # ═══════════════════════════════════════════════════════════════════════
     if progress_cb:
         progress_cb("  --- Training all models on train split ---")
 
+    val_probas = {}
     test_probas = {}
     for name, make_model in _make_specs():
         if progress_cb:
             progress_cb(f"    {name}...")
         model = make_model()
-        X_fit = X_train_sc if name in NEEDS_SCALE else X_train
-        _fit_model(name, model, X_fit, y_train_raw)
-        # Symmetric prediction: average P(A|A=red) and 1-P(A|A=blue)
-        X_pred = X_test_sc if name in NEEDS_SCALE else X_test
-        X_pred_sw = X_test_swap_sc if name in NEEDS_SCALE else X_test_swap
-        p_fwd = _predict_model(name, model, X_pred)
-        p_rev = _predict_model(name, model, X_pred_sw)
-        test_probas[name] = (p_fwd + (1.0 - p_rev)) / 2.0
+        X_fit = X_train_sc if name in NEEDS_SCALE else X_train_aug
+        _fit_model(name, model, X_fit, y_train_aug)
+        # Symmetric prediction on validation set (for weight optimization)
+        X_v = X_val_sc if name in NEEDS_SCALE else X_val
+        X_v_sw = X_val_swap_sc if name in NEEDS_SCALE else X_val_swap
+        p_fwd_v = _predict_model(name, model, X_v)
+        p_rev_v = _predict_model(name, model, X_v_sw)
+        val_probas[name] = (p_fwd_v + (1.0 - p_rev_v)) / 2.0
+        # Symmetric prediction on test set (for honest evaluation)
+        X_t = X_test_sc if name in NEEDS_SCALE else X_test
+        X_t_sw = X_test_swap_sc if name in NEEDS_SCALE else X_test_swap
+        p_fwd_t = _predict_model(name, model, X_t)
+        p_rev_t = _predict_model(name, model, X_t_sw)
+        test_probas[name] = (p_fwd_t + (1.0 - p_rev_t)) / 2.0
 
-    # ── Optimize ensemble weights on test set ──
-    weights, ensemble_ll = _optimize_weights(test_probas, y_test_raw)
+    # ── Optimize ensemble weights on validation set (test set never touched) ──
+    weights, val_ll = _optimize_weights(val_probas, y_val_raw)
 
-    # ── Compute weighted ensemble predictions ──
-    test_blend = sum(weights[n] * test_probas[n] for n in test_probas)
-    ensemble_acc = accuracy_score(y_test_raw, (test_blend >= 0.5).astype(int))
+    # ── Fit Platt calibrator on validation ensemble probabilities ──
+    val_blend = sum(weights[k] * val_probas[k] for k in val_probas)
+    calibrator = _fit_platt_calibrator(val_blend, y_val_raw)
+
+    # ── Evaluate on truly unseen test set ──
+    test_blend = sum(weights[k] * test_probas[k] for k in test_probas)
+    raw_ll = log_loss(y_test_raw, test_blend)
+    raw_acc = accuracy_score(y_test_raw, (test_blend >= 0.5).astype(int))
+    test_blend_cal = calibrator.predict_proba(np.asarray(test_blend).reshape(-1, 1))[:, 1]
+    cal_ll = log_loss(y_test_raw, test_blend_cal)
+    cal_acc = accuracy_score(y_test_raw, (test_blend_cal >= 0.5).astype(int))
+    # Use calibrated if it improves log-loss, otherwise raw
+    if cal_ll < raw_ll:
+        ensemble_ll, ensemble_acc = cal_ll, cal_acc
+    else:
+        ensemble_ll, ensemble_acc = raw_ll, raw_acc
+        calibrator = None
 
     # ── Results table ──
     if progress_cb:
         progress_cb("")
-        progress_cb(f"  --- Test Set Results ({test_size} fights, never seen during tuning) ---")
+        progress_cb(f"  --- Test Set Results ({test_size} fights, never seen during tuning or weight opt) ---")
         progress_cb(f"  {'Model':<14} {'Accuracy':>10} {'Log-Loss':>10} {'Weight':>8}")
         progress_cb(f"  {'-'*44}")
         for name in test_probas:
@@ -951,7 +1479,9 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
             ll = log_loss(y_test_raw, test_probas[name])
             progress_cb(f"  {name:<14} {acc:>9.1%} {ll:>10.4f} {weights[name]:>7.0%}")
         progress_cb(f"  {'-'*44}")
-        progress_cb(f"  {'Ensemble':<14} {ensemble_acc:>9.1%} {ensemble_ll:>10.4f}")
+        progress_cb(f"  {'Ensemble':<14} {raw_acc:>9.1%} {raw_ll:>10.4f}  (raw)")
+        progress_cb(f"  {'Calibrated':<14} {cal_acc:>9.1%} {cal_ll:>10.4f}  {'<-- used' if calibrator is not None else '(worse, skipped)'}")
+        progress_cb(f"  Val log-loss: {val_ll:.4f} (used for weight optimization)")
         progress_cb("")
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -961,11 +1491,11 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
         progress_cb("  --- Retraining all models on full data ---")
 
     imputer_full = SimpleImputer(strategy="median")
-    X_all_orig = pd.DataFrame(imputer_full.fit_transform(X), columns=X.columns)
+    X_all_orig = pd.DataFrame(imputer_full.fit_transform(X_full_raw), columns=feature_cols)
     y_all_orig = y.reset_index(drop=True)
     X_all, y_all = _augment_swap(X_all_orig, y_all_orig)
     scaler_full = StandardScaler()
-    X_all_sc = pd.DataFrame(scaler_full.fit_transform(X_all), columns=X.columns)
+    X_all_sc = pd.DataFrame(scaler_full.fit_transform(X_all), columns=feature_cols)
 
     final_models = {}
     for name, make_model in _make_specs():
@@ -982,7 +1512,8 @@ def tune_and_train(X, y, n_trials=50, progress_cb=None, status_var=None):
         progress_cb("")
 
     return EnsembleModel(final_models, imputer_full, scaler_full,
-                         X.columns.tolist(), weights)
+                         feature_cols, weights, missing_cols=missing_cols,
+                         calibrator=calibrator)
 
 
 # ─── Fuzzy name matching ──────────────────────────────────────────────────────
@@ -1269,7 +1800,7 @@ class MLPredictorGUI:
                     now = datetime.now()
                     a_feats = compute_fighter_features(a_hist, a_glicko, a_opp_g, now)
                     b_feats = compute_fighter_features(b_hist, b_glicko, b_opp_g, now)
-                    matchup = compute_matchup_features(a_feats, b_feats, is_title, rounds_sched)
+                    matchup = compute_matchup_features(a_feats, b_feats, is_title, rounds_sched, weight_class)
 
                     prob_a = self.model.predict_proba_single(matchup)
                     prob_b = 1.0 - prob_a

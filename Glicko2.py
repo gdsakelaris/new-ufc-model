@@ -37,6 +37,22 @@ CONVERGENCE = 1e-6
 # A fighter is "active" if they fought within this many days of the latest event
 ACTIVE_DAYS = 730  # ~2 years
 
+# ─── Method-of-victory score weighting ───────────────────────────────────────
+# Finishes are unambiguous.  Decisions carry uncertainty proportional to judge
+# agreement: a split decision (one judge dissenting) conveys much weaker
+# evidence of superiority than a KO.
+METHOD_WIN_SCORES = {
+    "KO/TKO":              1.00,
+    "Submission":           1.00,
+    "Decision - Unanimous": 0.88,
+    "Decision - Majority":  0.80,
+    "Decision - Split":     0.72,
+}
+DEFAULT_WIN_SCORE = 0.85
+
+# One Glicko-2 "rating period" for inactivity RD inflation
+INACTIVITY_PERIOD_DAYS = 30.0
+
 
 # ─── Glicko-2 core ──────────────────────────────────────────────────────────
 
@@ -120,14 +136,40 @@ def win_probability(rating_a, rating_b):
     return _E(mu_a, mu_b, combined_phi)
 
 
+def inflate_rd(rating, days_inactive):
+    """Standard Glicko-2 RD inflation for periods without games."""
+    if days_inactive <= 0:
+        return rating
+    mu, phi, sigma = rating
+    phi_s = phi / SCALE
+    periods = days_inactive / INACTIVITY_PERIOD_DAYS
+    phi_new_s = math.sqrt(phi_s ** 2 + sigma ** 2 * periods)
+    phi_new_s = min(phi_new_s, PHI_0 / SCALE)
+    return (mu, phi_new_s * SCALE, sigma)
+
+
 # ─── Data loading ────────────────────────────────────────────────────────────
+
+def _categorize_method(method):
+    """Map raw method string to a summary bucket."""
+    if method == "KO/TKO":
+        return "ko"
+    if method == "Submission":
+        return "sub"
+    if method.startswith("Decision"):
+        return "dec"
+    return None
+
 
 def build_ratings(csv_path):
     ratings = {}
     fight_counts = defaultdict(int)
     records = defaultdict(lambda: [0, 0, 0])
     last_fight_date = {}
-    fighter_division = {}  # fighter -> (weight_class, gender)
+    fighter_division = {}
+    method_stats = defaultdict(lambda: {"ko_w": 0, "ko_l": 0,
+                                        "sub_w": 0, "sub_l": 0,
+                                        "dec_w": 0, "dec_l": 0})
 
     def get(fighter):
         if fighter not in ratings:
@@ -146,6 +188,7 @@ def build_ratings(csv_path):
         r_name = row["r_name"].strip()
         b_name = row["b_name"].strip()
         winner = row["winner"].strip()
+        method = row["method"].strip()
         event_date = datetime.strptime(row["event_date"], "%m/%d/%Y")
         weight_class = row["weight_class"].strip()
         gender = row["gender"].strip()
@@ -153,14 +196,34 @@ def build_ratings(csv_path):
         r_rating = get(r_name)
         b_rating = get(b_name)
 
+        # Inflate RD for time since each fighter's last bout
+        if r_name in last_fight_date:
+            days_off = (event_date - last_fight_date[r_name]).days
+            r_rating = inflate_rd(r_rating, days_off)
+            ratings[r_name] = r_rating
+        if b_name in last_fight_date:
+            days_off = (event_date - last_fight_date[b_name]).days
+            b_rating = inflate_rd(b_rating, days_off)
+            ratings[b_name] = b_rating
+
+        # Method-aware scoring
+        cat = _categorize_method(method)
         if winner == "Red":
-            r_score, b_score = 1.0, 0.0
+            w_score = METHOD_WIN_SCORES.get(method, DEFAULT_WIN_SCORE)
+            r_score, b_score = w_score, 1.0 - w_score
             records[r_name][0] += 1
             records[b_name][1] += 1
+            if cat:
+                method_stats[r_name][f"{cat}_w"] += 1
+                method_stats[b_name][f"{cat}_l"] += 1
         elif winner == "Blue":
-            r_score, b_score = 0.0, 1.0
+            w_score = METHOD_WIN_SCORES.get(method, DEFAULT_WIN_SCORE)
+            r_score, b_score = 1.0 - w_score, w_score
             records[b_name][0] += 1
             records[r_name][1] += 1
+            if cat:
+                method_stats[b_name][f"{cat}_w"] += 1
+                method_stats[r_name][f"{cat}_l"] += 1
         else:
             r_score, b_score = 0.5, 0.5
             records[r_name][2] += 1
@@ -175,13 +238,13 @@ def build_ratings(csv_path):
         last_fight_date[r_name] = event_date
         last_fight_date[b_name] = event_date
 
-        # Track most recent division (skip Catch Weight / Open Weight)
         if weight_class not in ("Catch Weight", "Open Weight"):
             division = _division_key(weight_class, gender)
             fighter_division[r_name] = division
             fighter_division[b_name] = division
 
-    return ratings, fight_counts, records, last_fight_date, fighter_division
+    return (ratings, fight_counts, records, last_fight_date,
+            fighter_division, method_stats)
 
 
 def _division_key(weight_class, gender):
@@ -226,6 +289,20 @@ def format_record(records, name):
     return f"{w}-{l}-{d}" if d > 0 else f"{w}-{l}"
 
 
+def format_method_pcts(method_stats, name):
+    """Compact win-method breakdown, e.g. 'KO 45% | Sub 20% | Dec 35%'."""
+    s = method_stats.get(name, {})
+    ko = s.get("ko_w", 0)
+    sub = s.get("sub_w", 0)
+    dec = s.get("dec_w", 0)
+    total = ko + sub + dec
+    if total == 0:
+        return "N/A"
+    return (f"KO {ko / total * 100:.0f}%  "
+            f"Sub {sub / total * 100:.0f}%  "
+            f"Dec {dec / total * 100:.0f}%")
+
+
 # ─── Excel export ────────────────────────────────────────────────────────────
 
 def _auto_width(ws):
@@ -241,7 +318,7 @@ def _auto_width(ws):
 
 
 def export_to_excel(output_path, predictions, ratings, records,
-                    last_fight_date, fighter_division):
+                    last_fight_date, fighter_division, method_stats):
     wb = Workbook()
 
     header_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
@@ -256,7 +333,8 @@ def export_to_excel(output_path, predictions, ratings, records,
     ws.title = "Predictions"
 
     headers = ["Fighter A", "Fighter B", "Rating A", "Rating B",
-               "Record A", "Record B", "Fighter A %", "Fighter B %",
+               "Record A", "Record B", "A Win Methods", "B Win Methods",
+               "Fighter A %", "Fighter B %",
                "Predicted Winner", "Win %"]
 
     for col_idx, hdr in enumerate(headers, 1):
@@ -274,6 +352,7 @@ def export_to_excel(output_path, predictions, ratings, records,
             pred["name_a"], pred["name_b"],
             round(pred["rating_a"]), round(pred["rating_b"]),
             pred["rec_a"], pred["rec_b"],
+            pred.get("methods_a", ""), pred.get("methods_b", ""),
             pred["prob_a"], pred["prob_b"],
             winner, win_pct,
         ]
@@ -282,7 +361,7 @@ def export_to_excel(output_path, predictions, ratings, records,
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
             cell.alignment = Alignment(horizontal="left", vertical="center")
             cell.border = border
-            if col_idx in (7, 8, 10):
+            if col_idx in (9, 10, 12):
                 cell.number_format = pct_fmt
 
     _auto_width(ws)
@@ -297,20 +376,19 @@ def export_to_excel(output_path, predictions, ratings, records,
         if last_fight_date.get(fighter, datetime.min) >= active_cutoff:
             mu, phi, sigma = ratings[fighter]
             rec = format_record(records, fighter)
-            division_fighters[division].append((fighter, mu, phi, rec))
+            methods = format_method_pcts(method_stats, fighter)
+            division_fighters[division].append((fighter, mu, phi, rec, methods))
 
-    # Sort each division by rating descending
     for div in division_fighters:
         division_fighters[div].sort(key=lambda x: x[1], reverse=True)
 
-    rank_headers = ["#", "Fighter", "Rating", "RD", "Record"]
+    rank_headers = ["#", "Fighter", "Rating", "RD", "Record", "Win Methods"]
 
     for div_name in DIVISION_ORDER:
         if div_name not in division_fighters:
             continue
 
         fighters = division_fighters[div_name][:25]
-        # Sheet name max 31 chars
         sheet_name = div_name[:31]
         ws_div = wb.create_sheet(title=sheet_name)
 
@@ -321,8 +399,8 @@ def export_to_excel(output_path, predictions, ratings, records,
             cell.alignment = header_align
             cell.border = border
 
-        for i, (fighter, mu, phi, rec) in enumerate(fighters, 1):
-            row_data = [i, fighter, round(mu), round(phi), rec]
+        for i, (fighter, mu, phi, rec, methods) in enumerate(fighters, 1):
+            row_data = [i, fighter, round(mu), round(phi), rec, methods]
             for col_idx, val in enumerate(row_data, 1):
                 cell = ws_div.cell(row=i + 1, column=col_idx, value=val)
                 cell.alignment = Alignment(horizontal="left", vertical="center")
@@ -360,6 +438,7 @@ class Glicko2GUI:
         self.records = None
         self.last_fight_date = None
         self.fighter_division = None
+        self.method_stats = None
 
         self._build_ui()
         self._load_ratings()
@@ -489,7 +568,8 @@ class Glicko2GUI:
                 self.status_var.set(f"Error: {data_path} not found")
                 return
             (self.ratings, self.fight_counts, self.records,
-             self.last_fight_date, self.fighter_division) = build_ratings(data_path)
+             self.last_fight_date, self.fighter_division,
+             self.method_stats) = build_ratings(data_path)
             n_fights = sum(self.fight_counts.values()) // 2
             self.status_var.set(
                 f"Loaded {n_fights} fights, {len(self.ratings)} fighters rated."
@@ -561,10 +641,14 @@ class Glicko2GUI:
             prob_a = win_probability(a_rating, b_rating)
             prob_b = 1.0 - prob_a
 
+            a_methods = format_method_pcts(self.method_stats, a_key) if a_key else "N/A"
+            b_methods = format_method_pcts(self.method_stats, b_key) if b_key else "N/A"
+
             predictions.append({
                 "name_a": a_display, "name_b": b_display,
                 "rating_a": a_rating[0], "rating_b": b_rating[0],
                 "rec_a": a_rec, "rec_b": b_rec,
+                "methods_a": a_methods, "methods_b": b_methods,
                 "prob_a": prob_a, "prob_b": prob_b,
             })
 
@@ -573,6 +657,7 @@ class Glicko2GUI:
                 a_rating[0], b_rating[0],
                 a_rec, b_rec,
                 prob_a, prob_b,
+                a_methods, b_methods,
             )
 
         # Export to Excel
@@ -581,6 +666,7 @@ class Glicko2GUI:
             export_to_excel(
                 output_path, predictions, self.ratings, self.records,
                 self.last_fight_date, self.fighter_division,
+                self.method_stats,
             )
             export_msg = f"Saved to {os.path.basename(output_path)}"
         except Exception as e:
@@ -596,7 +682,8 @@ class Glicko2GUI:
             self.status_var.set(f"{len(predictions)} matchups predicted. {export_msg}")
 
     def _add_matchup_card(self, name_a, name_b, rating_a, rating_b,
-                          rec_a, rec_b, prob_a, prob_b):
+                          rec_a, rec_b, prob_a, prob_b,
+                          methods_a="", methods_b=""):
         card = tk.Frame(self.results_inner, bg=BG_HEADER, pady=8, padx=12)
         card.pack(fill="x", pady=4, padx=4)
 
@@ -633,6 +720,32 @@ class Glicko2GUI:
             bg=BG_HEADER,
             anchor="e",
         ).pack(side="left")
+
+        # Win-method breakdown row
+        if methods_a or methods_b:
+            meth_frame = tk.Frame(card, bg=BG_HEADER)
+            meth_frame.pack(fill="x")
+            tk.Label(
+                meth_frame,
+                text=methods_a,
+                font=("Courier New", 8),
+                fg=MUTED,
+                bg=BG_HEADER,
+                anchor="w",
+            ).pack(side="left")
+            tk.Label(
+                meth_frame,
+                text="       ",
+                bg=BG_HEADER,
+            ).pack(side="left")
+            tk.Label(
+                meth_frame,
+                text=methods_b,
+                font=("Courier New", 8),
+                fg=MUTED,
+                bg=BG_HEADER,
+                anchor="w",
+            ).pack(side="left")
 
         # Probability bar
         bar_frame = tk.Frame(card, bg=BG_HEADER, pady=4)
