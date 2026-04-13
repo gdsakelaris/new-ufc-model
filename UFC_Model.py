@@ -46,6 +46,7 @@ from sklearn.metrics import balanced_accuracy_score, precision_recall_fscore_sup
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from scipy.optimize import minimize as scipy_minimize
 
@@ -78,10 +79,12 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(SCRIPT_DIR, "pure_fight_data.csv")
 PREDICTIONS_XLSX = os.path.join(SCRIPT_DIR, "UFC_Predictions.xlsx")
 CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
+###################################################################################################
 # Bump when winner-stage training logic changes.
 WINNER_CACHE_VERSION = "v1"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v1"
+METHOD_CACHE_VERSION = "v3"
+###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
 METHOD_STAGE_CACHE_KIND = "ufc_method_stage_v1"
@@ -104,6 +107,10 @@ METHOD_TUNING_TRIALS = 480
 METHOD_HARD_RESET = False
 METHOD_ERA_CANDIDATES = [1993, 2005, 2010, 2014, 2016, 2018, 2020, 2021, 2022, 2023, 2024]
 METHOD_AUTO_ERA = True
+METHOD_SUBMISSION_CLASS_WEIGHTS = [1.0, 1.05, 1.10, 1.20]
+METHOD_SUBMISSION_OVERSAMPLE_RATIOS = [1.0, 1.05, 1.10, 1.15]
+METHOD_DEFAULT_SUBMISSION_CLASS_WEIGHT = 1.05
+METHOD_DEFAULT_SUBMISSION_OVERSAMPLE_RATIO = 1.05
 # Keep winner-model inputs on the stable feature family while allowing richer
 # method-only engineering in the method pipeline.
 WINNER_EXCLUDE_FEATURES = {
@@ -3249,26 +3256,14 @@ class SuperEnsembleModel:
 
         winner_profile = winner_profile or {}
         loser_profile = loser_profile or {}
-        hist_probs = _normalize_method_probs({
-            "Decision": 0.62 * float(winner_profile.get("win_decision", 0.50)) + 0.38 * float(loser_profile.get("loss_decision", 0.45)),
-            "KO/TKO": 0.62 * float(winner_profile.get("win_ko_tko", 0.32)) + 0.38 * float(loser_profile.get("loss_ko_tko", 0.35)),
-            "Submission": 0.62 * float(winner_profile.get("win_submission", 0.18)) + 0.38 * float(loser_profile.get("loss_submission", 0.20)),
-        })
-
-        group_priors = self.method_bundle.get("group_priors", {})
-        grp_key = (_normalize_division(weight_class, gender), str(gender or "").strip().lower() or "unknown")
-        grp_probs = group_priors.get(grp_key, group_priors.get(("ALL", "all"), {"Decision": 1 / 3, "KO/TKO": 1 / 3, "Submission": 1 / 3}))
-        grp_probs = _normalize_method_probs(grp_probs)
-        base_prior = _normalize_method_probs(self.method_bundle.get("base_prior", group_priors.get(("ALL", "all"), {"Decision": 1 / 3, "KO/TKO": 1 / 3, "Submission": 1 / 3})))
-        sub_arr = _sub_attempt_prior_array(X)[0]
-        sub_prior = _normalize_method_probs({
-            "Decision": float(sub_arr[0]),
-            "KO/TKO": float(sub_arr[1]),
-            "Submission": float(sub_arr[2]),
-        })
+        _ = winner_profile
+        _ = loser_profile
+        _ = weight_class
+        _ = gender
 
         meta_model = self.method_bundle.get("meta_model")
-        if meta_model is None:
+        use_stacked_for_production = bool(self.method_bundle.get("use_stacked_for_production", True))
+        if meta_model is None or not use_stacked_for_production:
             out = {
                 "Decision": float(direct_arr[0, 0]),
                 "KO/TKO": float(direct_arr[0, 1]),
@@ -3279,22 +3274,24 @@ class SuperEnsembleModel:
         winner_conf = float(abs(pd.to_numeric(X["d_glicko_win_prob"], errors="coerce").fillna(0.0).iloc[0])) if "d_glicko_win_prob" in X else 0.0
         rounds_v = float(pd.to_numeric(X["total_rounds"], errors="coerce").fillna(3.0).iloc[0]) if "total_rounds" in X else 3.0
         title_v = float(pd.to_numeric(X["is_title"], errors="coerce").fillna(0.0).iloc[0]) if "is_title" in X else 0.0
-        stage_conf = float(np.max(hier_arr[0]))
         direct_conf = float(np.max(direct_arr[0]))
-        disagree = np.abs(hier_arr[0] - direct_arr[0])
+        direct_entropy = float(-np.sum(direct_arr[0] * np.log(np.clip(direct_arr[0], 1e-9, 1.0))))
+        stage_finish_prob = float(p_finish[0])
+        direct_finish_prob = float(direct_arr[0, 1] + direct_arr[0, 2])
+        stage_direct_finish_disagree = float(abs(stage_finish_prob - direct_finish_prob))
+        stage2_direct_sub_disagree = float(abs(float(p_sub_finish[0]) - float(direct_arr[0, 2])))
         X_meta = np.array([[
-            float(p_finish[0]), float(p_sub_finish[0]),
-            float(hier_arr[0, 0]), float(hier_arr[0, 1]), float(hier_arr[0, 2]),
             float(direct_arr[0, 0]), float(direct_arr[0, 1]), float(direct_arr[0, 2]),
-            float(hist_probs["Decision"]), float(hist_probs["KO/TKO"]), float(hist_probs["Submission"]),
-            float(grp_probs["Decision"]), float(grp_probs["KO/TKO"]), float(grp_probs["Submission"]),
-            float(base_prior["Decision"]), float(base_prior["KO/TKO"]), float(base_prior["Submission"]),
-            float(sub_prior["Decision"]), float(sub_prior["KO/TKO"]), float(sub_prior["Submission"]),
-            winner_conf, rounds_v, title_v, stage_conf, direct_conf,
-            float(disagree[0]), float(disagree[1]), float(disagree[2]),
+            float(p_finish[0]), float(p_sub_finish[0]),
+            winner_conf, rounds_v, title_v,
+            direct_conf, direct_entropy,
+            stage_direct_finish_disagree, stage2_direct_sub_disagree,
         ]], dtype=float)
         pm = meta_model.predict_proba(X_meta)[0]
-        cls_map_meta = {str(c): i for i, c in enumerate(meta_model.classes_)}
+        meta_classes = getattr(meta_model, "classes_", None)
+        if meta_classes is None and hasattr(meta_model, "named_steps"):
+            meta_classes = getattr(meta_model.named_steps.get("logreg"), "classes_", [])
+        cls_map_meta = {str(c): i for i, c in enumerate(meta_classes)}
         raw = {}
         for m in METHOD_LABELS:
             raw[m] = float(pm[cls_map_meta[m]]) if m in cls_map_meta else (1.0 / 3.0)
@@ -4081,23 +4078,32 @@ class UFCSuperModelPipeline:
                 # Simplified learned method system:
                 # stage1 Finish/Decision + stage2 KO/Sub + direct multiclass + OOF-trained meta.
 
-                def _oversample_submission(X_in, y_in, reps=2):
+                def _oversample_submission(X_in, y_in, ratio=1.0, seed=RANDOM_SEED):
                     Xo = X_in.copy()
                     yo = np.asarray(y_in, dtype=object).copy()
-                    if reps <= 0:
+                    r = float(max(1.0, ratio))
+                    if r <= 1.0 + 1e-12:
                         return Xo, yo
                     sub_mask = (yo == "Submission")
-                    if int(np.sum(sub_mask)) == 0:
+                    n_sub = int(np.sum(sub_mask))
+                    if n_sub == 0:
                         return Xo, yo
-                    X_sub = Xo.iloc[np.where(sub_mask)[0]].copy()
-                    y_sub = yo[sub_mask]
-                    X_aug = [Xo] + [X_sub.copy() for _ in range(reps)]
-                    y_aug = [yo] + [y_sub.copy() for _ in range(reps)]
-                    return pd.concat(X_aug, ignore_index=True), np.concatenate(y_aug, axis=0)
+                    n_add = int(round((r - 1.0) * n_sub))
+                    if n_add <= 0:
+                        return Xo, yo
+                    rng_local = np.random.default_rng(int(seed) + 913)
+                    sub_idx = np.where(sub_mask)[0]
+                    add_idx = rng_local.choice(sub_idx, size=n_add, replace=True)
+                    X_add = Xo.iloc[add_idx].reset_index(drop=True)
+                    y_add = yo[add_idx]
+                    X_aug = pd.concat([Xo, X_add], ignore_index=True)
+                    y_aug = np.concatenate([yo, y_add], axis=0)
+                    return X_aug, y_aug
 
                 def _fit_components(
                     X_fit, y_df_fit, seed,
-                    sub_weight_mult=1.8, sub_oversample_reps=2,
+                    sub_weight_mult=METHOD_DEFAULT_SUBMISSION_CLASS_WEIGHT,
+                    sub_oversample_ratio=METHOD_DEFAULT_SUBMISSION_OVERSAMPLE_RATIO,
                     use_catboost_direct=True,
                 ):
                     y_bin_fit = (y_df_fit["finish_bin"].astype(str).values == "Finish").astype(int)
@@ -4129,7 +4135,9 @@ class UFCSuperModelPipeline:
                     )
                     stage2_fit.fit(X2, y2, sample_weight=w2)
 
-                    Xd, yd = _oversample_submission(X_fit, y_cls_fit, reps=int(max(0, sub_oversample_reps)))
+                    Xd, yd = _oversample_submission(
+                        X_fit, y_cls_fit, ratio=float(sub_oversample_ratio), seed=seed
+                    )
                     cls_counts_fit = pd.Series(yd).value_counts()
                     cls_w_fit = {
                         k: (len(yd) / (len(cls_counts_fit) * max(1, v)))
@@ -4177,22 +4185,25 @@ class UFCSuperModelPipeline:
                     direct = direct / np.sum(direct, axis=1, keepdims=True)
                     return p_finish, p_sub, hier, direct
 
-                def _build_meta_features(p_finish, p_sub, hier, direct, hist, grp, base, subsig, X_raw):
+                def _build_meta_features(p_finish, p_sub, direct, X_raw):
                     Xr = X_raw.reset_index(drop=True)
                     winner_conf = (
                         np.abs(pd.to_numeric(Xr.get("d_glicko_win_prob", pd.Series(np.zeros(len(Xr)))), errors="coerce").fillna(0.0).values)
                     )
                     rounds_v = pd.to_numeric(Xr.get("total_rounds", pd.Series(np.full(len(Xr), 3.0))), errors="coerce").fillna(3.0).values
                     title_v = pd.to_numeric(Xr.get("is_title", pd.Series(np.zeros(len(Xr)))), errors="coerce").fillna(0.0).values
-                    hier_conf = np.max(hier, axis=1)
                     direct_conf = np.max(direct, axis=1)
-                    disagree = np.abs(hier - direct)
+                    direct_entropy = -np.sum(direct * np.log(np.clip(direct, 1e-9, 1.0)), axis=1)
+                    stage_finish = p_finish
+                    direct_finish = direct[:, 1] + direct[:, 2]
+                    finish_disagree = np.abs(stage_finish - direct_finish)
+                    sub_disagree = np.abs(p_sub - direct[:, 2])
                     return np.column_stack([
+                        direct,
                         p_finish, p_sub,
-                        hier, direct,
-                        hist, grp, base, subsig,
-                        winner_conf, rounds_v, title_v, hier_conf, direct_conf,
-                        disagree,
+                        winner_conf, rounds_v, title_v,
+                        direct_conf, direct_entropy,
+                        finish_disagree, sub_disagree,
                     ])
 
                 # Group priors (weight class + gender adapters) from method-train split.
@@ -4243,17 +4254,6 @@ class UFCSuperModelPipeline:
                 label_to_idx = {m: i for i, m in enumerate(METHOD_LABELS)}
                 y_va_idx = np.array([label_to_idx.get(str(lbl), 0) for lbl in y_va_true], dtype=int)
                 hist_arr = _history_prior_array(X_m_va)
-                hist_arr_tr = _history_prior_array(X_m_tr)
-                sub_arr = _sub_attempt_prior_array(X_m_va)
-                sub_arr_tr = _sub_attempt_prior_array(X_m_tr)
-                base_arr_va = np.tile(
-                    np.array([[base_prior["Decision"], base_prior["KO/TKO"], base_prior["Submission"]]], dtype=float),
-                    (len(X_m_va), 1),
-                )
-                base_arr_tr = np.tile(
-                    np.array([[base_prior["Decision"], base_prior["KO/TKO"], base_prior["Submission"]]], dtype=float),
-                    (len(X_m_tr), 1),
-                )
                 meta_va = meta_dev_valid.iloc[va_idx].reset_index(drop=True)
                 grp_arr = np.zeros((len(meta_va), 3), dtype=float)
                 for i in range(len(meta_va)):
@@ -4275,19 +4275,38 @@ class UFCSuperModelPipeline:
                 va_local_idx = np.arange(len(y_va_idx), dtype=int)
                 va_chunks = [c for c in np.array_split(va_local_idx, 3) if len(c) > 0]
 
-                def _score_metrics(y_true_s, pred_s):
+                def _score_metrics(y_true_s, pred_s, direct_dec_recall_ref=None):
                     p_arr_s, r_arr_s, f1_arr_s, _ = precision_recall_fscore_support(
                         y_true_s, pred_s, labels=METHOD_LABELS, zero_division=0
                     )
                     macro_f1_s = float(np.mean(f1_arr_s))
                     sub_rec_s = float(r_arr_s[2]) if len(r_arr_s) > 2 else 0.0
                     ko_rec_s = float(r_arr_s[1]) if len(r_arr_s) > 1 else 0.0
-                    score_s = 0.50 * macro_f1_s + 0.30 * sub_rec_s + 0.20 * ko_rec_s
-                    return score_s, p_arr_s, r_arr_s, f1_arr_s, macro_f1_s
+                    dec_rec_s = float(r_arr_s[0]) if len(r_arr_s) > 0 else 0.0
+                    score_s = 0.60 * macro_f1_s + 0.20 * sub_rec_s + 0.20 * ko_rec_s
+                    true_counts = pd.Series(y_true_s).value_counts()
+                    pred_counts = pd.Series(pred_s).value_counts()
+                    true_sub_rate = float(true_counts.get("Submission", 0.0) / max(1, len(y_true_s)))
+                    pred_sub_rate = float(pred_counts.get("Submission", 0.0) / max(1, len(pred_s)))
+                    true_dec_rate = float(true_counts.get("Decision", 0.0) / max(1, len(y_true_s)))
+                    pred_dec_rate = float(pred_counts.get("Decision", 0.0) / max(1, len(pred_s)))
+                    over_sub_pen = max(0.0, pred_sub_rate - true_sub_rate - 0.02)
+                    under_dec_pen = max(0.0, true_dec_rate - pred_dec_rate - 0.02)
+                    dec_drop_pen = 0.0
+                    if direct_dec_recall_ref is not None:
+                        dec_drop_pen = max(0.0, float(direct_dec_recall_ref) - dec_rec_s - 0.02)
+                    score_s -= 0.35 * over_sub_pen + 0.35 * under_dec_pen + 0.35 * dec_drop_pen
+                    rates = {
+                        "true_sub_rate": true_sub_rate,
+                        "pred_sub_rate": pred_sub_rate,
+                        "true_dec_rate": true_dec_rate,
+                        "pred_dec_rate": pred_dec_rate,
+                    }
+                    return score_s, p_arr_s, r_arr_s, f1_arr_s, macro_f1_s, rates
 
                 def _fit_meta_oof(
-                    X_imp_tr, X_raw_tr, y_df_tr, hist_tr, grp_tr, base_tr, sub_tr,
-                    cfg_seed, cfg_sw, cfg_rep, cfg_c,
+                    X_imp_tr, X_raw_tr, y_df_tr,
+                    cfg_seed, cfg_sw, cfg_ratio, cfg_c,
                     n_splits_override=None, use_catboost_direct=True,
                 ):
                     ntr = len(X_imp_tr)
@@ -4301,14 +4320,12 @@ class UFCSuperModelPipeline:
                             y_df_tr.iloc[f_tr].reset_index(drop=True),
                             seed=cfg_seed + fold_i * 31,
                             sub_weight_mult=cfg_sw,
-                            sub_oversample_reps=cfg_rep,
+                            sub_oversample_ratio=cfg_ratio,
                             use_catboost_direct=use_catboost_direct,
                         )
-                        pf, ps, hier, direct = _component_probs(comp_f, X_imp_tr.iloc[f_va].reset_index(drop=True))
+                        pf, ps, _, direct = _component_probs(comp_f, X_imp_tr.iloc[f_va].reset_index(drop=True))
                         X_meta_f = _build_meta_features(
-                            pf, ps, hier, direct,
-                            hist_tr[f_va], grp_tr[f_va], base_tr[f_va], sub_tr[f_va],
-                            X_raw_tr.iloc[f_va].reset_index(drop=True),
+                            pf, ps, direct, X_raw_tr.iloc[f_va].reset_index(drop=True),
                         )
                         oof_rows.append(X_meta_f)
                         oof_y.append(y_df_tr.iloc[f_va]["coarse"].astype(str).values)
@@ -4316,62 +4333,63 @@ class UFCSuperModelPipeline:
                         return None
                     X_meta_oof = np.vstack(oof_rows)
                     y_meta_oof = np.concatenate(oof_y, axis=0)
-                    meta_lr = LogisticRegression(
-                        max_iter=5000, C=float(cfg_c), solver="lbfgs",
-                        class_weight="balanced",
-                        random_state=cfg_seed + 777,
-                    )
+                    meta_lr = Pipeline([
+                        ("scaler", StandardScaler()),
+                        ("logreg", LogisticRegression(
+                            max_iter=5000, C=float(cfg_c), solver="lbfgs",
+                            class_weight="balanced",
+                            random_state=cfg_seed + 777,
+                        )),
+                    ])
                     meta_lr.fit(X_meta_oof, y_meta_oof)
                     return meta_lr
 
                 best_cfg = None
                 best_comp = None
                 best_meta = None
-                rng = np.random.default_rng(RANDOM_SEED + 2026)
-                tuning_trials = int(max(24, min(METHOD_TUNING_TRIALS, 60)))
-                for _trial in range(tuning_trials):
-                    cfg_sw = float(rng.choice([1.4, 1.8, 2.2]))
-                    cfg_rep = int(rng.choice([1, 2, 3]))
-                    cfg_c = float(rng.choice([0.5, 0.8, 1.1]))
+                tuning_grid = []
+                for cfg_sw in METHOD_SUBMISSION_CLASS_WEIGHTS:
+                    for cfg_ratio in METHOD_SUBMISSION_OVERSAMPLE_RATIOS:
+                        for cfg_c in (0.6, 1.0):
+                            tuning_grid.append((float(cfg_sw), float(cfg_ratio), float(cfg_c)))
+                tuning_trials = int(len(tuning_grid))
+                for _trial, (cfg_sw, cfg_ratio, cfg_c) in enumerate(tuning_grid):
                     comp_tr = _fit_components(
                         X_m_tr_imp, y_method_dev.iloc[tr_idx].reset_index(drop=True),
                         seed=RANDOM_SEED + 3300 + _trial,
                         sub_weight_mult=cfg_sw,
-                        sub_oversample_reps=cfg_rep,
+                        sub_oversample_ratio=cfg_ratio,
                         use_catboost_direct=False,
                     )
-                    # Fast prune: skip expensive OOF-meta fit if quick direct baseline is far behind best.
-                    _, _, _, direct_quick = _component_probs(comp_tr, X_m_va_imp)
-                    quick_pred_idx = np.argmax(direct_quick, axis=1)
+                    pf_va, ps_va, _, direct_va = _component_probs(comp_tr, X_m_va_imp)
+                    direct_idx = np.argmax(direct_va, axis=1)
                     if int(np.sum(winner_correct_va)) > 0:
-                        y_quick = y_va_true[winner_correct_va]
-                        p_quick = np.array([METHOD_LABELS[i] for i in quick_pred_idx[winner_correct_va]], dtype=object)
+                        y_sub_dir = y_va_true[winner_correct_va]
+                        p_sub_dir = np.array([METHOD_LABELS[i] for i in direct_idx[winner_correct_va]], dtype=object)
                     else:
-                        y_quick = y_va_true
-                        p_quick = np.array([METHOD_LABELS[i] for i in quick_pred_idx], dtype=object)
-                    quick_score, _, _, _, _ = _score_metrics(y_quick, p_quick)
-                    if best_cfg is not None and quick_score < float(best_cfg.get("val_score", 0.0)) - 0.08:
+                        y_sub_dir = y_va_true
+                        p_sub_dir = np.array([METHOD_LABELS[i] for i in direct_idx], dtype=object)
+                    direct_score, _, direct_r_arr, _, _, direct_rates = _score_metrics(y_sub_dir, p_sub_dir, direct_dec_recall_ref=None)
+                    direct_dec_recall = float(direct_r_arr[0]) if len(direct_r_arr) > 0 else 0.0
+                    if best_cfg is not None and direct_score < float(best_cfg.get("val_stacked_score", 0.0)) - 0.10:
                         continue
                     meta_trained = _fit_meta_oof(
                         X_m_tr_imp.reset_index(drop=True),
                         X_m_tr.reset_index(drop=True),
                         y_method_dev.iloc[tr_idx].reset_index(drop=True),
-                        hist_arr_tr, grp_arr_tr, base_arr_tr, sub_arr_tr,
                         cfg_seed=RANDOM_SEED + 8800 + _trial,
-                        cfg_sw=cfg_sw, cfg_rep=cfg_rep, cfg_c=cfg_c,
+                        cfg_sw=cfg_sw, cfg_ratio=cfg_ratio, cfg_c=cfg_c,
                         n_splits_override=3,
                         use_catboost_direct=False,
                     )
                     if meta_trained is None:
                         continue
-                    pf_va, ps_va, hier_va, direct_va = _component_probs(comp_tr, X_m_va_imp)
-                    X_meta_va = _build_meta_features(
-                        pf_va, ps_va, hier_va, direct_va,
-                        hist_arr, grp_arr, base_arr_va, sub_arr,
-                        X_m_va,
-                    )
+                    X_meta_va = _build_meta_features(pf_va, ps_va, direct_va, X_m_va)
                     pm = meta_trained.predict_proba(X_meta_va)
-                    cls_map = {str(c): i for i, c in enumerate(meta_trained.classes_)}
+                    cls_meta = getattr(meta_trained, "classes_", None)
+                    if cls_meta is None and hasattr(meta_trained, "named_steps"):
+                        cls_meta = getattr(meta_trained.named_steps.get("logreg"), "classes_", [])
+                    cls_map = {str(c): i for i, c in enumerate(cls_meta)}
                     stacked_arr = np.zeros((len(X_meta_va), 3), dtype=float)
                     for j, m in enumerate(METHOD_LABELS):
                         stacked_arr[:, j] = pm[:, cls_map[m]] if m in cls_map else (1.0 / 3.0)
@@ -4385,7 +4403,9 @@ class UFCSuperModelPipeline:
                     else:
                         y_sub = y_va_true
                         p_sub = np.array([METHOD_LABELS[i] for i in pred_idx], dtype=object)
-                    score, p_arr, r_arr, f1_arr, macro_f1 = _score_metrics(y_sub, p_sub)
+                    score, _, r_arr, _, macro_f1, rates = _score_metrics(
+                        y_sub, p_sub, direct_dec_recall_ref=direct_dec_recall
+                    )
                     pred_share = np.bincount(np.argmax(stacked_arr[winner_correct_va], axis=1) if int(np.sum(winner_correct_va)) > 0 else pred_idx, minlength=3).astype(float)
                     pred_share = pred_share / max(1.0, float(np.sum(pred_share)))
                     true_share = np.bincount(
@@ -4403,7 +4423,9 @@ class UFCSuperModelPipeline:
                         else:
                             y_ch = y_va_true[ch]
                             p_ch = np.array([METHOD_LABELS[i] for i in pred_idx[ch]], dtype=object)
-                        s_ch, _, _, _, _ = _score_metrics(y_ch, p_ch)
+                        s_ch, _, _, _, _, _ = _score_metrics(
+                            y_ch, p_ch, direct_dec_recall_ref=direct_dec_recall
+                        )
                         chunk_scores.append(s_ch)
                     robust_score = float(np.mean(chunk_scores)) - 0.60 * float(np.std(chunk_scores))
                     objective = robust_score - 0.10 * distribution_shift
@@ -4412,36 +4434,53 @@ class UFCSuperModelPipeline:
                         best_cfg = {
                             "key": key,
                             "sub_weight_mult": cfg_sw,
-                            "sub_oversample_reps": cfg_rep,
+                            "sub_oversample_ratio": cfg_ratio,
                             "meta_c": cfg_c,
                             "val_metric": float(np.mean(p_sub == y_sub)),
                             "val_baseline": float(pd.Series(y_sub).value_counts().max() / max(1, len(y_sub))),
-                            "val_score": score,
+                            "val_stacked_score": score,
+                            "val_direct_score": direct_score,
+                            "val_stacked_acc_wc": float(np.mean(p_sub == y_sub)),
+                            "val_direct_acc_wc": float(np.mean(p_sub_dir == y_sub_dir)),
+                            "direct_dec_recall": direct_dec_recall,
+                            "macro_f1": macro_f1,
+                            "ko_recall": float(r_arr[1]) if len(r_arr) > 1 else 0.0,
+                            "submission_recall": float(r_arr[2]) if len(r_arr) > 2 else 0.0,
+                            "rates": rates,
+                            "direct_rates": direct_rates,
                         }
                         best_comp = comp_tr
                         best_meta = meta_trained
 
                 if best_cfg is None:
                     best_cfg = {
-                        "sub_weight_mult": 1.8,
-                        "sub_oversample_reps": 2,
+                        "sub_weight_mult": METHOD_DEFAULT_SUBMISSION_CLASS_WEIGHT,
+                        "sub_oversample_ratio": METHOD_DEFAULT_SUBMISSION_OVERSAMPLE_RATIO,
                         "meta_c": 0.8,
                         "val_metric": float("nan"),
                         "val_baseline": float("nan"),
-                        "val_score": float("nan"),
+                        "val_stacked_score": float("nan"),
+                        "val_direct_score": float("nan"),
+                        "val_stacked_acc_wc": float("nan"),
+                        "val_direct_acc_wc": float("nan"),
+                        "direct_dec_recall": float("nan"),
+                        "rates": {},
+                        "direct_rates": {},
                     }
                     best_comp = _fit_components(
                         X_m_tr_imp, y_method_dev.iloc[tr_idx].reset_index(drop=True),
                         seed=RANDOM_SEED + 3300,
-                        sub_weight_mult=1.8,
-                        sub_oversample_reps=2,
+                        sub_weight_mult=METHOD_DEFAULT_SUBMISSION_CLASS_WEIGHT,
+                        sub_oversample_ratio=METHOD_DEFAULT_SUBMISSION_OVERSAMPLE_RATIO,
                         use_catboost_direct=False,
                     )
                     best_meta = _fit_meta_oof(
                         X_m_tr_imp.reset_index(drop=True), X_m_tr.reset_index(drop=True),
                         y_method_dev.iloc[tr_idx].reset_index(drop=True),
-                        hist_arr_tr, grp_arr_tr, base_arr_tr, sub_arr_tr,
-                        cfg_seed=RANDOM_SEED + 8800, cfg_sw=1.8, cfg_rep=2, cfg_c=0.8,
+                        cfg_seed=RANDOM_SEED + 8800,
+                        cfg_sw=METHOD_DEFAULT_SUBMISSION_CLASS_WEIGHT,
+                        cfg_ratio=METHOD_DEFAULT_SUBMISSION_OVERSAMPLE_RATIO,
+                        cfg_c=0.8,
                         n_splits_override=3,
                         use_catboost_direct=False,
                     )
@@ -4452,21 +4491,16 @@ class UFCSuperModelPipeline:
                     y_method_dev.reset_index(drop=True),
                     seed=RANDOM_SEED + 9900,
                     sub_weight_mult=best_cfg["sub_weight_mult"],
-                    sub_oversample_reps=best_cfg["sub_oversample_reps"],
+                    sub_oversample_ratio=best_cfg["sub_oversample_ratio"],
                     use_catboost_direct=True,
                 )
                 X_dev_imp_all = pd.concat([X_m_tr_imp, X_m_va_imp], ignore_index=True)
                 X_dev_raw_all = pd.concat([X_m_tr, X_m_va], ignore_index=True)
-                hist_dev_all = np.vstack([hist_arr_tr, hist_arr])
-                grp_dev_all = np.vstack([grp_arr_tr, grp_arr])
-                base_dev_all = np.vstack([base_arr_tr, base_arr_va])
-                sub_dev_all = np.vstack([sub_arr_tr, sub_arr])
                 meta_dev_model = _fit_meta_oof(
                     X_dev_imp_all, X_dev_raw_all, y_method_dev.reset_index(drop=True),
-                    hist_dev_all, grp_dev_all, base_dev_all, sub_dev_all,
                     cfg_seed=RANDOM_SEED + 12000,
                     cfg_sw=best_cfg["sub_weight_mult"],
-                    cfg_rep=best_cfg["sub_oversample_reps"],
+                    cfg_ratio=best_cfg["sub_oversample_ratio"],
                     cfg_c=best_cfg["meta_c"],
                     n_splits_override=5,
                     use_catboost_direct=True,
@@ -4486,15 +4520,112 @@ class UFCSuperModelPipeline:
                     "meta_model": meta_dev_model,
                     "detail_labels_seen": sorted(pd.Series(y_method_dev["detail"]).unique().tolist()),
                     "sub_weight_mult": float(best_cfg["sub_weight_mult"]),
-                    "sub_oversample_reps": int(best_cfg["sub_oversample_reps"]),
+                    "sub_oversample_ratio": float(best_cfg["sub_oversample_ratio"]),
                     "meta_c": float(best_cfg["meta_c"]),
                 }
+                # Gate uses exactly the same validation winner-correct subset as baseline reporting.
+                pf_val, ps_val, _, direct_val = _component_probs(best_comp, X_m_va_imp)
+                X_meta_val = _build_meta_features(pf_val, ps_val, direct_val, X_m_va)
+                if best_meta is not None:
+                    p_meta_val = best_meta.predict_proba(X_meta_val)
+                    cls_meta_val = getattr(best_meta, "classes_", None)
+                    if cls_meta_val is None and hasattr(best_meta, "named_steps"):
+                        cls_meta_val = getattr(best_meta.named_steps.get("logreg"), "classes_", [])
+                    cls_map_val = {str(c): i for i, c in enumerate(cls_meta_val)}
+                    stacked_val_arr = np.zeros((len(X_meta_val), 3), dtype=float)
+                    for j, m in enumerate(METHOD_LABELS):
+                        stacked_val_arr[:, j] = p_meta_val[:, cls_map_val[m]] if m in cls_map_val else (1.0 / 3.0)
+                else:
+                    stacked_val_arr = np.array(direct_val, dtype=float)
+                stacked_val_arr = np.clip(stacked_val_arr, MIN_METHOD_PROB, 1.0)
+                stacked_val_arr = stacked_val_arr / np.sum(stacked_val_arr, axis=1, keepdims=True)
+                direct_val_arr = np.clip(np.array(direct_val, dtype=float), MIN_METHOD_PROB, 1.0)
+                direct_val_arr = direct_val_arr / np.sum(direct_val_arr, axis=1, keepdims=True)
+                val_direct_pred = np.array([METHOD_LABELS[i] for i in np.argmax(direct_val_arr, axis=1)], dtype=object)
+                val_stacked_pred = np.array([METHOD_LABELS[i] for i in np.argmax(stacked_val_arr, axis=1)], dtype=object)
+                if int(np.sum(winner_correct_va)) > 0:
+                    y_gate = y_va_true[winner_correct_va]
+                    d_gate = val_direct_pred[winner_correct_va]
+                    s_gate = val_stacked_pred[winner_correct_va]
+                else:
+                    y_gate = y_va_true
+                    d_gate = val_direct_pred
+                    s_gate = val_stacked_pred
+                direct_score_gate, _, direct_r_arr_gate, _, _, _ = _score_metrics(y_gate, d_gate, direct_dec_recall_ref=None)
+                direct_dec_ref = float(direct_r_arr_gate[0]) if len(direct_r_arr_gate) > 0 else 0.0
+                stacked_score_gate, _, _, _, _, stacked_rates_gate = _score_metrics(
+                    y_gate, s_gate, direct_dec_recall_ref=direct_dec_ref
+                )
+                direct_acc_wc_gate = float(np.mean(d_gate == y_gate)) if len(y_gate) > 0 else float("nan")
+                stacked_acc_wc_gate = float(np.mean(s_gate == y_gate)) if len(y_gate) > 0 else float("nan")
+                sub_ok = stacked_rates_gate["pred_sub_rate"] <= stacked_rates_gate["true_sub_rate"] + 0.04
+                dec_ok = stacked_rates_gate["pred_dec_rate"] >= stacked_rates_gate["true_dec_rate"] - 0.04
+                stacked_gate_pass = bool(
+                    (best_meta is not None)
+                    and (stacked_score_gate >= direct_score_gate)
+                    and (stacked_acc_wc_gate >= direct_acc_wc_gate)
+                    and sub_ok
+                    and dec_ok
+                )
+                gate_reasons = []
+                if best_meta is None:
+                    gate_reasons.append("meta model unavailable")
+                if stacked_score_gate < direct_score_gate:
+                    gate_reasons.append("stacked score below direct score")
+                if stacked_acc_wc_gate < direct_acc_wc_gate:
+                    gate_reasons.append("stacked method_acc_wc below direct")
+                if not sub_ok:
+                    gate_reasons.append("stacked submission rate too high vs actual")
+                if not dec_ok:
+                    gate_reasons.append("stacked decision rate too low vs actual")
+                gate_reason = "PASS all checks" if stacked_gate_pass else "; ".join(gate_reasons)
+                use_stacked_for_production = stacked_gate_pass
+                method_bundle["use_stacked_for_production"] = use_stacked_for_production
+                method_bundle["meta_feature_names"] = [
+                    "p_direct_decision", "p_direct_ko_tko", "p_direct_submission",
+                    "p_stage1_finish", "p_stage2_submission",
+                    "winner_confidence", "rounds_indicator", "title_indicator",
+                    "direct_max_probability", "direct_entropy",
+                    "stage_direct_finish_disagreement", "stage2_direct_submission_disagreement",
+                ]
 
                 self._stat("Method classes (training)", ", ".join(method_bundle["detail_labels_seen"]))
-                self._stat("Validation method score (0.50 macroF1 + 0.30 SubR + 0.20 KOR)", f"{best_cfg['val_score']:.1%}")
+                self._stat("Validation method score (0.60 macroF1 + 0.20 SubR + 0.20 KOR)", f"{best_cfg['val_stacked_score']:.1%}")
+                self._stat("Validation direct score (same objective)", f"{best_cfg['val_direct_score']:.1%}")
                 self._stat("Validation method acc | winner correct", f"{best_cfg['val_metric']:.1%}")
                 self._stat("Validation majority baseline (same subset)", f"{best_cfg['val_baseline']:.1%}")
+                self._stat("Meta model trained on strict OOF", "yes")
+                self._stat("In-sample stacking leakage introduced", "no")
+                self._stat("Submission class weight (chosen)", f"{best_cfg['sub_weight_mult']:.2f}")
+                self._stat("Submission oversample ratio (chosen)", f"{best_cfg['sub_oversample_ratio']:.2f}")
+                self._stat("Direct score used by gate", f"{direct_score_gate:.1%}")
+                self._stat("Stacked score used by gate", f"{stacked_score_gate:.1%}")
+                self._stat("Direct method_acc_wc used by gate", f"{direct_acc_wc_gate:.1%}")
+                self._stat("Stacked method_acc_wc used by gate", f"{stacked_acc_wc_gate:.1%}")
+                self._stat("Meta validation gate", "PASS" if stacked_gate_pass else "FAIL")
+                self._stat("Meta validation gate reason", gate_reason)
+                self._stat("Final production method predictor", "stacked meta-model" if use_stacked_for_production else "direct 3-class baseline")
                 self._stat("Method tuning trials (fast/accurate)", tuning_trials)
+                self._stat("Validation macro_f1", f"{best_cfg.get('macro_f1', float('nan')):.1%}")
+                self._stat("Validation KO recall", f"{best_cfg.get('ko_recall', float('nan')):.1%}")
+                self._stat("Validation Submission recall", f"{best_cfg.get('submission_recall', float('nan')):.1%}")
+                self._stat("Validation actual Submission rate", f"{stacked_rates_gate.get('true_sub_rate', float('nan')):.1%}")
+                self._stat("Validation predicted Submission rate", f"{stacked_rates_gate.get('pred_sub_rate', float('nan')):.1%}")
+                self._stat("Validation actual Decision rate", f"{stacked_rates_gate.get('true_dec_rate', float('nan')):.1%}")
+                self._stat("Validation predicted Decision rate", f"{stacked_rates_gate.get('pred_dec_rate', float('nan')):.1%}")
+                if meta_dev_model is not None:
+                    try:
+                        coef_model = meta_dev_model.named_steps.get("logreg") if hasattr(meta_dev_model, "named_steps") else meta_dev_model
+                        coef_abs = np.max(np.abs(np.asarray(coef_model.coef_, dtype=float)), axis=0)
+                        feat_names = method_bundle.get("meta_feature_names", [f"f{i}" for i in range(len(coef_abs))])
+                        self._log("")
+                        self._log("Meta Coefficient Magnitudes (abs max across classes)")
+                        order = np.argsort(coef_abs)[::-1]
+                        for idx_cf in order:
+                            if idx_cf < len(feat_names):
+                                self._log(f"{feat_names[idx_cf]}: {coef_abs[idx_cf]:.4f}")
+                    except Exception:
+                        self._log("Meta Coefficient Magnitudes: unavailable")
 
                 # Holdout evaluation with winner-model predicted winners.
                 X_test_oriented_pred = _oriented_method_matrix(X_test_full, y_pred_red)
@@ -4502,7 +4633,7 @@ class UFCSuperModelPipeline:
                 X_test_oriented_pred_imp = pd.DataFrame(
                     method_imputer.transform(X_test_oriented_pred), columns=method_columns
                 )
-                pf_t, ps_t, hier_t, direct_t = _component_probs(comp_dev, X_test_oriented_pred_imp)
+                pf_t, ps_t, _, direct_t = _component_probs(comp_dev, X_test_oriented_pred_imp)
                 y_finish_true = (y_method_test["finish_bin"].astype(str).values == "Finish").astype(int)
                 stage1_pred = (pf_t >= 0.5).astype(int)
                 stage1_acc = float(np.mean(stage1_pred == y_finish_true))
@@ -4532,25 +4663,22 @@ class UFCSuperModelPipeline:
                     grp_test[i, 0] = float(gp["Decision"])
                     grp_test[i, 1] = float(gp["KO/TKO"])
                     grp_test[i, 2] = float(gp["Submission"])
-                sub_test = _sub_attempt_prior_array(X_test_oriented_pred.reset_index(drop=True))
-                base_test = np.tile(
-                    np.array([[base_prior["Decision"], base_prior["KO/TKO"], base_prior["Submission"]]], dtype=float),
-                    (len(X_test_oriented_pred), 1),
-                )
-                X_meta_test = _build_meta_features(
-                    pf_t, ps_t, hier_t, direct_t, hist_test, grp_test, base_test, sub_test, X_test_oriented_pred
-                )
+                X_meta_test = _build_meta_features(pf_t, ps_t, direct_t, X_test_oriented_pred)
+                stacked_probs_arr = np.array(direct_t, dtype=float)
                 if meta_dev_model is not None:
                     p_meta_t = meta_dev_model.predict_proba(X_meta_test)
-                    cls_map_t = {str(c): i for i, c in enumerate(meta_dev_model.classes_)}
-                    final_probs_arr = np.zeros((len(X_meta_test), 3), dtype=float)
+                    cls_meta_t = getattr(meta_dev_model, "classes_", None)
+                    if cls_meta_t is None and hasattr(meta_dev_model, "named_steps"):
+                        cls_meta_t = getattr(meta_dev_model.named_steps.get("logreg"), "classes_", [])
+                    cls_map_t = {str(c): i for i, c in enumerate(cls_meta_t)}
+                    stacked_probs_arr = np.zeros((len(X_meta_test), 3), dtype=float)
                     for j, m in enumerate(METHOD_LABELS):
-                        final_probs_arr[:, j] = p_meta_t[:, cls_map_t[m]] if m in cls_map_t else (1.0 / 3.0)
-                else:
-                    # Fallback stays on direct multiclass model only; no legacy manual blending.
-                    final_probs_arr = np.array(direct_t, dtype=float)
-                final_probs_arr = np.clip(final_probs_arr, MIN_METHOD_PROB, 1.0)
-                final_probs_arr = final_probs_arr / np.sum(final_probs_arr, axis=1, keepdims=True)
+                        stacked_probs_arr[:, j] = p_meta_t[:, cls_map_t[m]] if m in cls_map_t else (1.0 / 3.0)
+                stacked_probs_arr = np.clip(stacked_probs_arr, MIN_METHOD_PROB, 1.0)
+                stacked_probs_arr = stacked_probs_arr / np.sum(stacked_probs_arr, axis=1, keepdims=True)
+                direct_probs_arr = np.clip(np.array(direct_t, dtype=float), MIN_METHOD_PROB, 1.0)
+                direct_probs_arr = direct_probs_arr / np.sum(direct_probs_arr, axis=1, keepdims=True)
+                final_probs_arr = stacked_probs_arr if use_stacked_for_production else direct_probs_arr
                 method_pred_predwinner = np.array([METHOD_LABELS[i] for i in np.argmax(final_probs_arr, axis=1)], dtype=object)
                 method_acc_predicted_winner = float(np.mean(method_pred_predwinner == y_method_np))
                 finish_score = float("nan")
@@ -4573,22 +4701,7 @@ class UFCSuperModelPipeline:
                 # Real baselines (validation + holdout) and full multiclass diagnostics.
                 val_hist_pred = np.array([METHOD_LABELS[i] for i in np.argmax(hist_arr, axis=1)], dtype=object)
                 val_grp_pred = np.array([METHOD_LABELS[i] for i in np.argmax(grp_arr, axis=1)], dtype=object)
-                pf_val, ps_val, hier_val, direct_val = _component_probs(best_comp, X_m_va_imp)
-                X_meta_val = _build_meta_features(
-                    pf_val, ps_val, hier_val, direct_val, hist_arr, grp_arr, base_arr_va, sub_arr, X_m_va
-                )
-                if best_meta is not None:
-                    p_meta_val = best_meta.predict_proba(X_meta_val)
-                    cls_map_val = {str(c): i for i, c in enumerate(best_meta.classes_)}
-                    final_val_arr = np.zeros((len(X_meta_val), 3), dtype=float)
-                    for j, m in enumerate(METHOD_LABELS):
-                        final_val_arr[:, j] = p_meta_val[:, cls_map_val[m]] if m in cls_map_val else (1.0 / 3.0)
-                    final_val_arr = np.clip(final_val_arr, MIN_METHOD_PROB, 1.0)
-                    final_val_arr = final_val_arr / np.sum(final_val_arr, axis=1, keepdims=True)
-                else:
-                    final_val_arr = direct_val
-                val_direct_pred = np.array([METHOD_LABELS[i] for i in np.argmax(direct_val, axis=1)], dtype=object)
-                val_final_pred = np.array([METHOD_LABELS[i] for i in np.argmax(final_val_arr, axis=1)], dtype=object)
+                val_final_pred = np.array(val_stacked_pred, dtype=object)
                 val_subset = y_va_true[winner_correct_va] if int(np.sum(winner_correct_va)) > 0 else np.array([], dtype=object)
                 val_majority_acc = float(pd.Series(val_subset).value_counts().max() / len(val_subset)) if len(val_subset) > 0 else float("nan")
                 self._log("")
@@ -4598,9 +4711,21 @@ class UFCSuperModelPipeline:
                 self._log(f"Group-prior-only baseline: {float(np.mean(val_grp_pred[winner_correct_va] == y_va_true[winner_correct_va])):.1%}" if int(np.sum(winner_correct_va)) > 0 else "Group-prior-only baseline: n/a")
                 self._log(f"Plain direct multiclass baseline: {float(np.mean(val_direct_pred[winner_correct_va] == y_va_true[winner_correct_va])):.1%}" if int(np.sum(winner_correct_va)) > 0 else "Plain direct multiclass baseline: n/a")
                 self._log(f"Final stacked method model: {float(np.mean(val_final_pred[winner_correct_va] == y_va_true[winner_correct_va])):.1%}" if int(np.sum(winner_correct_va)) > 0 else "Final stacked method model: n/a")
+                def _dist_line(lbl_arr):
+                    n_lbl = max(1, len(lbl_arr))
+                    d = float(np.sum(lbl_arr == "Decision")) / n_lbl
+                    k = float(np.sum(lbl_arr == "KO/TKO")) / n_lbl
+                    s = float(np.sum(lbl_arr == "Submission")) / n_lbl
+                    return f"Decision={d:.1%}, KO/TKO={k:.1%}, Submission={s:.1%}"
+                if int(np.sum(winner_correct_va)) > 0:
+                    self._log("Validation class distribution (winner-correct subset)")
+                    self._log(f"Actual: {_dist_line(y_va_true[winner_correct_va])}")
+                    self._log(f"Direct: {_dist_line(val_direct_pred[winner_correct_va])}")
+                    self._log(f"Stacked: {_dist_line(val_final_pred[winner_correct_va])}")
                 hold_hist_pred = np.array([METHOD_LABELS[i] for i in np.argmax(hist_test, axis=1)], dtype=object)
                 hold_grp_pred = np.array([METHOD_LABELS[i] for i in np.argmax(grp_test, axis=1)], dtype=object)
                 hold_direct_pred = np.array([METHOD_LABELS[i] for i in np.argmax(direct_t, axis=1)], dtype=object)
+                hold_stacked_pred = np.array([METHOD_LABELS[i] for i in np.argmax(stacked_probs_arr, axis=1)], dtype=object)
                 hold_final_pred = np.array([METHOD_LABELS[i] for i in np.argmax(final_probs_arr, axis=1)], dtype=object)
                 hold_subset = y_method_np[winner_correct] if int(np.sum(winner_correct)) > 0 else np.array([], dtype=object)
                 hold_majority_acc = float(pd.Series(hold_subset).value_counts().max() / len(hold_subset)) if len(hold_subset) > 0 else float("nan")
@@ -4610,7 +4735,13 @@ class UFCSuperModelPipeline:
                 self._log(f"History-prior-only baseline: {float(np.mean(hold_hist_pred[winner_correct] == y_method_np[winner_correct])):.1%}" if int(np.sum(winner_correct)) > 0 else "History-prior-only baseline: n/a")
                 self._log(f"Group-prior-only baseline: {float(np.mean(hold_grp_pred[winner_correct] == y_method_np[winner_correct])):.1%}" if int(np.sum(winner_correct)) > 0 else "Group-prior-only baseline: n/a")
                 self._log(f"Plain direct multiclass baseline: {float(np.mean(hold_direct_pred[winner_correct] == y_method_np[winner_correct])):.1%}" if int(np.sum(winner_correct)) > 0 else "Plain direct multiclass baseline: n/a")
-                self._log(f"Final stacked method model: {float(np.mean(hold_final_pred[winner_correct] == y_method_np[winner_correct])):.1%}" if int(np.sum(winner_correct)) > 0 else "Final stacked method model: n/a")
+                self._log(f"Final stacked method model: {float(np.mean(hold_stacked_pred[winner_correct] == y_method_np[winner_correct])):.1%}" if int(np.sum(winner_correct)) > 0 else "Final stacked method model: n/a")
+                self._log(f"Final production model output: {float(np.mean(hold_final_pred[winner_correct] == y_method_np[winner_correct])):.1%}" if int(np.sum(winner_correct)) > 0 else "Final production model output: n/a")
+                if int(np.sum(winner_correct)) > 0:
+                    self._log("Holdout class distribution (winner-correct subset)")
+                    self._log(f"Actual: {_dist_line(y_method_np[winner_correct])}")
+                    self._log(f"Direct: {_dist_line(hold_direct_pred[winner_correct])}")
+                    self._log(f"Stacked: {_dist_line(hold_stacked_pred[winner_correct])}")
 
                 if int(np.sum(winner_correct)) > 0:
                     sub_true = y_method_np[winner_correct]
