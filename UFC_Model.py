@@ -98,14 +98,17 @@ METHOD_AUTO_ERA = True
 # method-only engineering in the method pipeline.
 WINNER_EXCLUDE_FEATURES = {
     "sub_entry_pressure_sum", "sub_defensive_leak_sum",
+    "ko_attack_pressure_sum", "ko_def_leak_sum",
     "d_head_acc", "d_distance_acc", "d_ground_acc", "d_clinch_acc",
     "d_body_acc", "d_leg_acc", "d_body_leg_attrition",
     "d_head_hunt_share", "d_distance_share",
-    "d_ground_strike_accuracy", "d_head_hunt_accuracy",
+    "d_ground_strike_accuracy", "d_head_hunt_accuracy", "d_distance_strike_accuracy",
     "d_sub_loss_pct", "d_recent_sub_win_rate",
     "d_sub_entry_pressure", "d_sub_control_conversion", "d_sub_scramble_threat",
     "d_sub_defensive_leak", "d_late_sub_pressure",
     "d_sub_recency_surge", "d_grapple_recency_surge", "d_sub_vs_control_axis",
+    "d_recent_ko_loss_rate", "d_r5_def_kd_pm", "d_ko_attack_pressure", "d_ko_def_leak",
+    "d_r1f_def_kd_pm", "d_r3_def_kd_pm",
 }
 STRICT_FUTURE_MODE = True
 FORCED_START_YEAR = None
@@ -293,6 +296,7 @@ def _augment_method_features(X_df):
     d_been_finished = _col("d_been_finished_pct", 0.0)
     d_finish_vs_resist = _col("d_finish_vs_resist", 0.0)
     d_str_vs_def = _col("d_striking_vs_defense", 0.0)
+    d_strike_exchange_ratio = _col("d_strike_exchange_ratio", 0.0)
     d_grap_vs_tdd = _col("d_grapple_vs_tdd", 0.0)
     d_ortho_vs_south = _col("d_ortho_vs_south", 0.0)
     d_power_ratio = _col("d_power_ratio", 0.0)
@@ -307,15 +311,17 @@ def _augment_method_features(X_df):
     d_rev_p15 = _col("d_rev_p15", 0.0)
     d_cardio_ratio = _col("d_cardio_ratio", 0.0)
     d_distance_pct = _col("d_distance_pct", 0.0)
+    d_body_pct = _col("d_body_pct", 0.0)
+    d_leg_pct = _col("d_leg_pct", 0.0)
     d_consistency = _col("d_consistency", 0.0)
     d_kd_pm = _col("d_kd_pm", _col("d_td_kd_pm", 0.0))
+    d_def_kd_pm = _col("d_def_kd_pm", 0.0)
     d_finish_resistance = _col("d_finish_resistance", 0.0)
     d_durability = _col("d_durability", 0.0)
     d_late_round_pct = _col("d_late_round_pct", 0.0)
     d_output_rate = _col("d_output_rate", 0.0)
     d_glicko = np.abs(_col("d_glicko_win_prob", 0.0))
     d_head_acc = _col("d_head_acc", 0.0)
-    d_head_hunt_share = _col("d_head_hunt_share", 0.0)
     d_distance_acc = _col("d_distance_acc", 0.0)
     d_distance_share = _col("d_distance_share", 0.0)
     d_ground_acc = _col("d_ground_acc", 0.0)
@@ -331,8 +337,14 @@ def _augment_method_features(X_df):
     d_sub_recency_surge = _col("d_sub_recency_surge", 0.0)
     d_grapple_recency_surge = _col("d_grapple_recency_surge", 0.0)
     d_sub_vs_control_axis = _col("d_sub_vs_control_axis", 0.0)
+    d_recent_ko_loss_rate = _col("d_recent_ko_loss_rate", 0.0)
+    d_r5_def_kd_pm = _col("d_r5_def_kd_pm", 0.0)
+    d_ko_attack_pressure = _col("d_ko_attack_pressure", 0.0)
+    d_ko_def_leak = _col("d_ko_def_leak", 0.0)
     sub_entry_sum = _col("sub_entry_pressure_sum", 0.0)
     sub_leak_sum = _col("sub_defensive_leak_sum", 0.0)
+    ko_attack_sum = _col("ko_attack_pressure_sum", 0.0)
+    ko_leak_sum = _col("ko_def_leak_sum", 0.0)
     total_rounds = _col("total_rounds", 3.0)
     is_title = _col("is_title", 0.0)
 
@@ -370,6 +382,13 @@ def _augment_method_features(X_df):
     X["m_ko_headhunter"] = d_power_ratio * d_head_pct * d_sig_str_diff_pm
     X["m_ko_fast_start"] = d_first_round_finish_rate * d_rd1_intensity_ratio * (4.0 - np.minimum(total_rounds, 4.0))
     X["m_ko_pressure_conversion"] = d_damage_efficiency * d_power_ratio * np.maximum(d_sig_str_acc, 0.0)
+    X["m_ko_exchange_edge"] = d_strike_exchange_ratio * d_power_ratio * d_sig_str_diff_pm
+    X["m_ko_distance_sniper"] = d_distance_pct * d_sig_str_acc * d_power_ratio
+    X["m_ko_knockdown_axis"] = d_kd_pm - 0.6 * d_def_kd_pm
+    X["m_ko_attrition"] = (d_body_pct + 0.7 * d_leg_pct) * d_output_rate * d_cardio_ratio
+    X["m_ko_confident_mismatch"] = d_glicko * np.maximum(d_power_ratio, 0.0) * np.maximum(d_sig_str_diff_pm, 0.0)
+    X["m_ko_burst_vs_decay"] = d_rd1_intensity_ratio - d_cardio_ratio
+    X["m_ko_path_specific"] = (d_ko_win + d_ko_loss) * (0.5 + d_head_pct + 0.5 * d_power_ratio)
     X["m_sub_ground_hunter"] = d_ground_pct * (d_ctrl_pct + 0.5 * d_sub_att)
     X["m_sub_scramble_threat"] = d_rev_p15 * (d_sub_att + d_ground_pct)
     X["m_sub_late_snowball"] = d_cardio_ratio * d_r3_sub_share * (d_ctrl_pct + d_sub_att)
@@ -379,8 +398,9 @@ def _augment_method_features(X_df):
     X["m_dec_stability"] = d_finish_resistance * d_durability * d_late_round_pct * d_consistency
     X["m_finish_confidence"] = d_glicko * np.maximum(X["m_finish_bias"], 0.0)
     X["m_sub_vs_ko_axis"] = (d_ground_pct + d_ctrl_pct + d_sub_att) - (d_head_pct + d_power_ratio + d_kd_pm)
-    X["m_ko_head_accuracy"] = d_head_acc * d_head_hunt_share
+    X["m_ko_head_accuracy"] = _col("d_head_hunt_accuracy", d_head_acc) * d_power_ratio
     X["m_ko_range_sniper"] = d_distance_acc * d_distance_share * d_power_ratio
+    X["m_ko_range_accuracy"] = _col("d_distance_strike_accuracy", d_distance_acc) * d_distance_pct * d_power_ratio
     X["m_ground_finish_conversion"] = d_ground_acc * d_ctrl_pct * d_sub_att
     X["m_clinch_breaker"] = d_clinch_acc * d_clinch_pct * d_kd_pm
     X["m_attrition_finish"] = d_body_leg_attrition * d_late_round_pct * d_output_rate
@@ -405,6 +425,14 @@ def _augment_method_features(X_df):
     X["m_sub_mismatch_max"] = np.maximum(sub_attack_vs_leak_w, sub_attack_vs_leak_l)
     X["m_sub_mismatch_sum"] = sub_attack_vs_leak_w + sub_attack_vs_leak_l
     X["m_sub_mismatch"] = X["m_sub_mismatch_explicit"]
+    ko_attack_w = 0.5 * (ko_attack_sum + d_ko_attack_pressure)
+    ko_attack_l = 0.5 * (ko_attack_sum - d_ko_attack_pressure)
+    ko_leak_w = 0.5 * (ko_leak_sum + d_ko_def_leak)
+    ko_leak_l = 0.5 * (ko_leak_sum - d_ko_def_leak)
+    ko_attack_vs_leak_w = ko_attack_w * ko_leak_l
+    ko_attack_vs_leak_l = ko_attack_l * ko_leak_w
+    X["m_ko_mismatch"] = ko_attack_vs_leak_w - ko_attack_vs_leak_l
+    X["m_ko_recent_fragility"] = d_r5_def_kd_pm + 0.7 * d_recent_ko_loss_rate
 
     # Keep ratios bounded and numerically stable for tree/linear blends.
     X["m_sub_ground_efficiency"] = (d_ground_pct * np.maximum(d_sub_att, 0.0)) / (1.0 + np.abs(d_ctrl_pct) + eps)
@@ -1063,9 +1091,13 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
     feats["last3_win_rate"] = _bayes_shrink(last3_wr, len(last3), prior=0.5, strength=6)
     feats["last5_win_rate"] = _bayes_shrink(last5_wr, len(last5), prior=0.5, strength=6)
     recent_sub_wins = sum(1 for h in last5 if h["result"] == "W" and "Sub" in str(h.get("method", "")))
+    recent_ko_losses = sum(1 for h in last5 if h["result"] == "L" and "KO" in str(h.get("method", "")))
     recent_n = max(min(n, 5), 1)
     feats["recent_sub_win_rate"] = _bayes_shrink(
         _safe_div(recent_sub_wins, recent_n, 0.12), recent_n, prior=0.12, strength=5
+    )
+    feats["recent_ko_loss_rate"] = _bayes_shrink(
+        _safe_div(recent_ko_losses, recent_n, 0.20), recent_n, prior=0.20, strength=5
     )
     win_streak = 0
     for h in reversed(history):
@@ -1146,6 +1178,7 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
         feats[f"{prefix_tag}_sub_att_p15"] = _safe_sum(h["sub_att"] for h in recent) / rt_15
         feats[f"{prefix_tag}_ctrl_pct"] = _safe_sum(h["ctrl_sec"] for h in recent) / rt if rt > 0 else 0
         feats[f"{prefix_tag}_def_sig_str_pm"] = _safe_sum(h["opp_sig_str"] for h in recent) / rt_min
+        feats[f"{prefix_tag}_def_kd_pm"] = _safe_sum(h["opp_kd"] for h in recent) / rt_min
         rec_sig_land = _safe_sum(h["sig_str"] for h in recent)
         rec_sig_att = _safe_sum(h["sig_str_att"] for h in recent)
         rec_td_land = _safe_sum(h["td"] for h in recent)
@@ -1288,6 +1321,7 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
     feats["body_leg_attrition"] = feats["body_acc"] + feats["leg_acc"]
     feats["ground_strike_accuracy"] = feats["ground_acc"]
     feats["head_hunt_accuracy"] = feats["head_acc"]
+    feats["distance_strike_accuracy"] = feats["distance_acc"]
 
     feats["head_hunt_share"] = _safe_div(total_head_att, total_sig_att_round + eps, 0.33)
     feats["distance_share"] = _safe_div(total_distance_att, total_sig_att_round + eps, 0.62)
@@ -1495,6 +1529,17 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
     feats["sub_vs_control_axis"] = (
         feats.get("sub_att_p15", 0.0) + 0.5 * feats.get("rev_p15", 0.0)
     ) - 0.6 * feats.get("ctrl_pct", 0.0)
+    # KO-side composites for explicit attacker-vs-vulnerability mismatch.
+    feats["ko_attack_pressure"] = (
+        feats.get("power_ratio", 0.0)
+        * feats.get("head_pct", 0.0)
+        * feats.get("sig_str_diff_pm", 0.0)
+    )
+    feats["ko_def_leak"] = (
+        feats.get("def_kd_pm", 0.0)
+        + feats.get("ko_loss_pct", 0.0)
+        + 0.5 * (1.0 - feats.get("durability", 0.8))
+    )
 
     # ── Opponent quality trend (facing tougher/weaker opponents recently?) ──
     if feats["avg_opp_glicko"] > 0:
@@ -1852,6 +1897,12 @@ def compute_matchup_features(a_feats, b_feats, is_title=0, total_rounds=3, weigh
     b_sub_leak = _num_or(b_feats.get("sub_defensive_leak"), 0.0)
     features["sub_entry_pressure_sum"] = a_sub_entry + b_sub_entry
     features["sub_defensive_leak_sum"] = a_sub_leak + b_sub_leak
+    a_ko_attack = _num_or(a_feats.get("ko_attack_pressure"), 0.0)
+    b_ko_attack = _num_or(b_feats.get("ko_attack_pressure"), 0.0)
+    a_ko_leak = _num_or(a_feats.get("ko_def_leak"), 0.0)
+    b_ko_leak = _num_or(b_feats.get("ko_def_leak"), 0.0)
+    features["ko_attack_pressure_sum"] = a_ko_attack + b_ko_attack
+    features["ko_def_leak_sum"] = a_ko_leak + b_ko_leak
 
     return features
 
