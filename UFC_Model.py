@@ -261,6 +261,7 @@ def _oriented_method_matrix(X_df, y_red_win):
 
 def _augment_method_features(X_df):
     X = X_df.copy()
+    eps = 1e-6
 
     def _col(name, default=0.0):
         if name not in X.columns:
@@ -281,6 +282,33 @@ def _augment_method_features(X_df):
     d_str_vs_def = _col("d_striking_vs_defense", 0.0)
     d_grap_vs_tdd = _col("d_grapple_vs_tdd", 0.0)
     d_ortho_vs_south = _col("d_ortho_vs_south", 0.0)
+    d_power_ratio = _col("d_power_ratio", 0.0)
+    d_head_pct = _col("d_head_pct", 0.0)
+    d_sig_str_diff_pm = _col("d_sig_str_diff_pm", 0.0)
+    d_first_round_finish_rate = _col("d_first_round_finish_rate", 0.0)
+    d_rd1_intensity_ratio = _col("d_rd1_intensity_ratio", 0.0)
+    d_damage_efficiency = _col("d_damage_efficiency", 0.0)
+    d_sig_str_acc = _col("d_sig_str_acc", _col("d_td_sig_str_acc", 0.0))
+    d_ground_pct = _col("d_ground_pct", 0.0)
+    d_ctrl_pct = _col("d_ctrl_pct", _col("d_td_ctrl_pct", 0.0))
+    d_rev_p15 = _col("d_rev_p15", 0.0)
+    d_cardio_ratio = _col("d_cardio_ratio", 0.0)
+    d_distance_pct = _col("d_distance_pct", 0.0)
+    d_consistency = _col("d_consistency", 0.0)
+    d_kd_pm = _col("d_kd_pm", _col("d_td_kd_pm", 0.0))
+    d_finish_resistance = _col("d_finish_resistance", 0.0)
+    d_durability = _col("d_durability", 0.0)
+    d_late_round_pct = _col("d_late_round_pct", 0.0)
+    d_output_rate = _col("d_output_rate", 0.0)
+    d_glicko = np.abs(_col("d_glicko_win_prob", 0.0))
+    d_head_acc = _col("d_head_acc", 0.0)
+    d_head_hunt_share = _col("d_head_hunt_share", 0.0)
+    d_distance_acc = _col("d_distance_acc", 0.0)
+    d_distance_share = _col("d_distance_share", 0.0)
+    d_ground_acc = _col("d_ground_acc", 0.0)
+    d_clinch_acc = _col("d_clinch_acc", 0.0)
+    d_clinch_pct = _col("d_clinch_pct", 0.0)
+    d_body_leg_attrition = _col("d_body_leg_attrition", 0.0)
     total_rounds = _col("total_rounds", 3.0)
     is_title = _col("is_title", 0.0)
 
@@ -313,6 +341,28 @@ def _augment_method_features(X_df):
     X["m_sub_finish_trigger"] = X["m_sub_chain_pressure"] + 0.45 * X["m_sub_trend_pressure"] + 0.30 * d_been_finished
     X["m_ko_chain_pressure"] = np.maximum(d_str_vs_def, -2.0) * (1.0 + np.maximum(d_ko_win, -1.0))
     X["m_title_rounds_interaction"] = is_title * total_rounds * X["m_dec_path"]
+
+    # Method-only explicit mechanics: KO-shaped pressure, sub chaining, and decision control.
+    X["m_ko_headhunter"] = d_power_ratio * d_head_pct * d_sig_str_diff_pm
+    X["m_ko_fast_start"] = d_first_round_finish_rate * d_rd1_intensity_ratio * (4.0 - np.minimum(total_rounds, 4.0))
+    X["m_ko_pressure_conversion"] = d_damage_efficiency * d_power_ratio * np.maximum(d_sig_str_acc, 0.0)
+    X["m_sub_ground_hunter"] = d_ground_pct * (d_ctrl_pct + 0.5 * d_sub_att)
+    X["m_sub_scramble_threat"] = d_rev_p15 * (d_sub_att + d_ground_pct)
+    X["m_sub_late_snowball"] = d_cardio_ratio * d_r3_sub_share * (d_ctrl_pct + d_sub_att)
+    X["m_dec_clean_pointing"] = (
+        d_distance_pct * d_sig_str_acc * d_consistency - 0.5 * (np.abs(d_kd_pm) + np.abs(d_sub_att))
+    )
+    X["m_dec_stability"] = d_finish_resistance * d_durability * d_late_round_pct * d_consistency
+    X["m_finish_confidence"] = d_glicko * np.maximum(X["m_finish_bias"], 0.0)
+    X["m_sub_vs_ko_axis"] = (d_ground_pct + d_ctrl_pct + d_sub_att) - (d_head_pct + d_power_ratio + d_kd_pm)
+    X["m_ko_head_accuracy"] = d_head_acc * d_head_hunt_share
+    X["m_ko_range_sniper"] = d_distance_acc * d_distance_share * d_power_ratio
+    X["m_ground_finish_conversion"] = d_ground_acc * d_ctrl_pct * d_sub_att
+    X["m_clinch_breaker"] = d_clinch_acc * d_clinch_pct * d_kd_pm
+    X["m_attrition_finish"] = d_body_leg_attrition * d_late_round_pct * d_output_rate
+
+    # Keep ratios bounded and numerically stable for tree/linear blends.
+    X["m_sub_ground_efficiency"] = (d_ground_pct * np.maximum(d_sub_att, 0.0)) / (1.0 + np.abs(d_ctrl_pct) + eps)
     return X
 
 
@@ -570,7 +620,8 @@ def _calibration_curve_rmse(y_true, probs, n_bins=10):
 # Per-round stat names to track
 RD_STATS = [
     "sig_str", "sig_str_att", "kd", "td", "td_att", "sub_att", "ctrl_sec",
-    "head", "body", "leg", "distance", "clinch", "ground",
+    "head", "head_att", "body", "body_att", "leg", "leg_att",
+    "distance", "distance_att", "clinch", "clinch_att", "ground", "ground_att",
 ]
 
 # ─── Fight record extraction ───────────────────────────────────────────────────
@@ -1150,6 +1201,43 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
         _safe_sum(h["opp_sig_str"] for h in history),
         max(_safe_sum(h["sig_str"] for h in history), 1),
     )
+
+    # ── Target/position attempt-driven accuracy and intent shares (round 1-5) ──
+    eps = 1e-6
+
+    def _round_stat_total(stat_name):
+        vals = []
+        for h in history:
+            for rd in range(1, 6):
+                v = h.get(f"rd{rd}_{stat_name}", float("nan"))
+                if not _isnan(v):
+                    vals.append(v)
+        return _safe_sum(vals)
+
+    total_sig_att_round = _round_stat_total("sig_str_att")
+    total_head_land = _round_stat_total("head")
+    total_head_att = _round_stat_total("head_att")
+    total_body_land = _round_stat_total("body")
+    total_body_att = _round_stat_total("body_att")
+    total_leg_land = _round_stat_total("leg")
+    total_leg_att = _round_stat_total("leg_att")
+    total_distance_land = _round_stat_total("distance")
+    total_distance_att = _round_stat_total("distance_att")
+    total_clinch_land = _round_stat_total("clinch")
+    total_clinch_att = _round_stat_total("clinch_att")
+    total_ground_land = _round_stat_total("ground")
+    total_ground_att = _round_stat_total("ground_att")
+
+    feats["head_acc"] = _safe_div(total_head_land, total_head_att + eps, 0.16)
+    feats["distance_acc"] = _safe_div(total_distance_land, total_distance_att + eps, 0.45)
+    feats["ground_acc"] = _safe_div(total_ground_land, total_ground_att + eps, 0.35)
+    feats["clinch_acc"] = _safe_div(total_clinch_land, total_clinch_att + eps, 0.30)
+    feats["body_acc"] = _safe_div(total_body_land, total_body_att + eps, 0.28)
+    feats["leg_acc"] = _safe_div(total_leg_land, total_leg_att + eps, 0.28)
+    feats["body_leg_attrition"] = feats["body_acc"] + feats["leg_acc"]
+
+    feats["head_hunt_share"] = _safe_div(total_head_att, total_sig_att_round + eps, 0.33)
+    feats["distance_share"] = _safe_div(total_distance_att, total_sig_att_round + eps, 0.62)
 
     # Fights per year
     if n > 1:
