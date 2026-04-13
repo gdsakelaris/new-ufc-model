@@ -94,6 +94,19 @@ METHOD_TUNING_TRIALS = 480
 METHOD_HARD_RESET = False
 METHOD_ERA_CANDIDATES = [1993, 2005, 2010, 2014, 2016, 2018, 2020, 2021, 2022, 2023, 2024]
 METHOD_AUTO_ERA = True
+# Keep winner-model inputs on the stable feature family while allowing richer
+# method-only engineering in the method pipeline.
+WINNER_EXCLUDE_FEATURES = {
+    "sub_entry_pressure_sum", "sub_defensive_leak_sum",
+    "d_head_acc", "d_distance_acc", "d_ground_acc", "d_clinch_acc",
+    "d_body_acc", "d_leg_acc", "d_body_leg_attrition",
+    "d_head_hunt_share", "d_distance_share",
+    "d_ground_strike_accuracy", "d_head_hunt_accuracy",
+    "d_sub_loss_pct", "d_recent_sub_win_rate",
+    "d_sub_entry_pressure", "d_sub_control_conversion", "d_sub_scramble_threat",
+    "d_sub_defensive_leak", "d_late_sub_pressure",
+    "d_sub_recency_surge", "d_grapple_recency_surge", "d_sub_vs_control_axis",
+}
 STRICT_FUTURE_MODE = True
 FORCED_START_YEAR = None
 MISSINGNESS_THRESHOLD = 0.35
@@ -309,6 +322,17 @@ def _augment_method_features(X_df):
     d_clinch_acc = _col("d_clinch_acc", 0.0)
     d_clinch_pct = _col("d_clinch_pct", 0.0)
     d_body_leg_attrition = _col("d_body_leg_attrition", 0.0)
+    d_sub_loss_pct = _col("d_sub_loss_pct", 0.0)
+    d_recent_sub_win_rate = _col("d_recent_sub_win_rate", 0.0)
+    d_sub_entry_pressure = _col("d_sub_entry_pressure", 0.0)
+    d_sub_control_conversion = _col("d_sub_control_conversion", 0.0)
+    d_sub_defensive_leak = _col("d_sub_defensive_leak", 0.0)
+    d_late_sub_pressure = _col("d_late_sub_pressure", 0.0)
+    d_sub_recency_surge = _col("d_sub_recency_surge", 0.0)
+    d_grapple_recency_surge = _col("d_grapple_recency_surge", 0.0)
+    d_sub_vs_control_axis = _col("d_sub_vs_control_axis", 0.0)
+    sub_entry_sum = _col("sub_entry_pressure_sum", 0.0)
+    sub_leak_sum = _col("sub_defensive_leak_sum", 0.0)
     total_rounds = _col("total_rounds", 3.0)
     is_title = _col("is_title", 0.0)
 
@@ -360,6 +384,27 @@ def _augment_method_features(X_df):
     X["m_ground_finish_conversion"] = d_ground_acc * d_ctrl_pct * d_sub_att
     X["m_clinch_breaker"] = d_clinch_acc * d_clinch_pct * d_kd_pm
     X["m_attrition_finish"] = d_body_leg_attrition * d_late_round_pct * d_output_rate
+    X["m_sub_loss_vulnerability"] = d_sub_loss_pct
+    X["m_recent_sub_win_rate_gap"] = d_recent_sub_win_rate
+    X["m_sub_entry_pressure"] = d_sub_entry_pressure
+    X["m_sub_control_conversion"] = d_sub_control_conversion
+    X["m_sub_defensive_leak"] = d_sub_defensive_leak
+    X["m_late_sub_pressure"] = d_late_sub_pressure
+    X["m_sub_recency_surge"] = d_sub_recency_surge
+    X["m_grapple_recency_surge"] = d_grapple_recency_surge
+    X["m_sub_vs_control_axis"] = d_sub_vs_control_axis
+    # Exact side-specific reconstruction from oriented differential + invariant sums:
+    # winner_side = 0.5 * (sum + d), loser_side = 0.5 * (sum - d)
+    sub_entry_w = 0.5 * (sub_entry_sum + d_sub_entry_pressure)
+    sub_entry_l = 0.5 * (sub_entry_sum - d_sub_entry_pressure)
+    sub_leak_w = 0.5 * (sub_leak_sum + d_sub_defensive_leak)
+    sub_leak_l = 0.5 * (sub_leak_sum - d_sub_defensive_leak)
+    sub_attack_vs_leak_w = sub_entry_w * sub_leak_l
+    sub_attack_vs_leak_l = sub_entry_l * sub_leak_w
+    X["m_sub_mismatch_explicit"] = sub_attack_vs_leak_w - sub_attack_vs_leak_l
+    X["m_sub_mismatch_max"] = np.maximum(sub_attack_vs_leak_w, sub_attack_vs_leak_l)
+    X["m_sub_mismatch_sum"] = sub_attack_vs_leak_w + sub_attack_vs_leak_l
+    X["m_sub_mismatch"] = X["m_sub_mismatch_explicit"]
 
     # Keep ratios bounded and numerically stable for tree/linear blends.
     X["m_sub_ground_efficiency"] = (d_ground_pct * np.maximum(d_sub_att, 0.0)) / (1.0 + np.abs(d_ctrl_pct) + eps)
@@ -1007,6 +1052,7 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
     ko_l = sum(1 for h in history if h["result"] == "L" and "KO" in str(h["method"]))
     sub_l = sum(1 for h in history if h["result"] == "L" and "Sub" in str(h["method"]))
     feats["ko_loss_pct"] = _bayes_shrink(_safe_div(ko_l, n, 0.2), n, prior=0.2, strength=10)
+    feats["sub_loss_pct"] = _bayes_shrink(_safe_div(sub_l, max(losses, 1), 0.20), losses, prior=0.20, strength=8)
     feats["been_finished_pct"] = _safe_div(ko_l + sub_l, max(losses, 1))
 
     # ── Form ──
@@ -1016,6 +1062,11 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
     last5_wr = sum(1 for h in last5 if h["result"] == "W") / len(last5)
     feats["last3_win_rate"] = _bayes_shrink(last3_wr, len(last3), prior=0.5, strength=6)
     feats["last5_win_rate"] = _bayes_shrink(last5_wr, len(last5), prior=0.5, strength=6)
+    recent_sub_wins = sum(1 for h in last5 if h["result"] == "W" and "Sub" in str(h.get("method", "")))
+    recent_n = max(min(n, 5), 1)
+    feats["recent_sub_win_rate"] = _bayes_shrink(
+        _safe_div(recent_sub_wins, recent_n, 0.12), recent_n, prior=0.12, strength=5
+    )
     win_streak = 0
     for h in reversed(history):
         if h["result"] == "W":
@@ -1235,6 +1286,8 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
     feats["body_acc"] = _safe_div(total_body_land, total_body_att + eps, 0.28)
     feats["leg_acc"] = _safe_div(total_leg_land, total_leg_att + eps, 0.28)
     feats["body_leg_attrition"] = feats["body_acc"] + feats["leg_acc"]
+    feats["ground_strike_accuracy"] = feats["ground_acc"]
+    feats["head_hunt_accuracy"] = feats["head_acc"]
 
     feats["head_hunt_share"] = _safe_div(total_head_att, total_sig_att_round + eps, 0.33)
     feats["distance_share"] = _safe_div(total_distance_att, total_sig_att_round + eps, 0.62)
@@ -1409,6 +1462,39 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
         feats["cardio_ratio"] = rd3_val / (rd1_val + 0.01)
     else:
         feats["cardio_ratio"] = 1.0
+
+    # ── Submission pressure/vulnerability composites ──
+    feats["sub_entry_pressure"] = (
+        feats.get("td_att_p15", 0.0) * feats.get("td_acc", 0.35)
+        + 0.7 * feats.get("sub_att_p15", 0.0)
+        + 0.4 * feats.get("rev_p15", 0.0)
+    )
+    feats["sub_control_conversion"] = (
+        feats.get("sub_att_p15", 0.0)
+        * (0.25 + feats.get("ctrl_pct", 0.0))
+        * (0.25 + feats.get("ground_pct", 0.0))
+    )
+    feats["sub_scramble_threat"] = (
+        feats.get("sub_att_p15", 0.0) + feats.get("rev_p15", 0.0)
+    ) * (1.0 + feats.get("ground_pct", 0.0))
+    feats["sub_defensive_leak"] = (
+        feats.get("def_sub_att_p15", 0.0) * (1.0 - feats.get("td_defense_rate", 0.65))
+        + 0.75 * feats.get("sub_loss_pct", 0.20)
+    )
+    feats["late_sub_pressure"] = (
+        feats.get("sub_att_p15", 0.0)
+        * feats.get("cardio_ratio", 1.0)
+        * (0.5 + feats.get("rd3_sub_share", 0.0))
+    )
+    feats["sub_recency_surge"] = feats.get("r1f_sub_att_p15", 0.0) - feats.get("r5_sub_att_p15", 0.0)
+    feats["grapple_recency_surge"] = (
+        feats.get("r1f_td_p15", 0.0) + feats.get("r1f_sub_att_p15", 0.0)
+    ) - (
+        feats.get("r5_td_p15", 0.0) + feats.get("r5_sub_att_p15", 0.0)
+    )
+    feats["sub_vs_control_axis"] = (
+        feats.get("sub_att_p15", 0.0) + 0.5 * feats.get("rev_p15", 0.0)
+    ) - 0.6 * feats.get("ctrl_pct", 0.0)
 
     # ── Opponent quality trend (facing tougher/weaker opponents recently?) ──
     if feats["avg_opp_glicko"] > 0:
@@ -1757,6 +1843,15 @@ def compute_matchup_features(a_feats, b_feats, is_title=0, total_rounds=3, weigh
     features["d_stability_endurance"] = (
         a_conf * a_quality_endurance - b_conf * b_quality_endurance
     )
+
+    # Sum channels to allow exact side-specific reconstruction for method-only
+    # mismatch features after winner-orientation is applied.
+    a_sub_entry = _num_or(a_feats.get("sub_entry_pressure"), 0.0)
+    b_sub_entry = _num_or(b_feats.get("sub_entry_pressure"), 0.0)
+    a_sub_leak = _num_or(a_feats.get("sub_defensive_leak"), 0.0)
+    b_sub_leak = _num_or(b_feats.get("sub_defensive_leak"), 0.0)
+    features["sub_entry_pressure_sum"] = a_sub_entry + b_sub_entry
+    features["sub_defensive_leak_sum"] = a_sub_leak + b_sub_leak
 
     return features
 
@@ -3298,12 +3393,26 @@ class UFCSuperModelPipeline:
         self._stat("Validation rows", len(X_val_raw))
         self._stat("Holdout test rows", len(X_test_raw))
         self._stat("Feature count", X.shape[1])
+        full_feature_cols = list(X.columns)
+        feature_cols = [c for c in full_feature_cols if c not in WINNER_EXCLUDE_FEATURES]
+        X_full = X[full_feature_cols].reset_index(drop=True)
+        X_winner = X[feature_cols].reset_index(drop=True)
+        X_train_raw = X_winner.iloc[:train_end].reset_index(drop=True)
+        X_val_raw = X_winner.iloc[train_end:val_end].reset_index(drop=True)
+        X_test_raw = X_winner.iloc[val_end:].reset_index(drop=True)
+        X_train_raw_full = X_full.iloc[:train_end].reset_index(drop=True)
+        X_val_raw_full = X_full.iloc[train_end:val_end].reset_index(drop=True)
+        X_test_raw_full = X_full.iloc[val_end:].reset_index(drop=True)
+        self._stat("Winner feature count", len(feature_cols))
 
-        feature_cols = list(X.columns)
         imputer = SimpleImputer(strategy="median")
         X_train = pd.DataFrame(imputer.fit_transform(X_train_raw), columns=feature_cols)
         X_val = pd.DataFrame(imputer.transform(X_val_raw), columns=feature_cols)
         X_test = pd.DataFrame(imputer.transform(X_test_raw), columns=feature_cols)
+        full_imputer = SimpleImputer(strategy="median")
+        X_train_full = pd.DataFrame(full_imputer.fit_transform(X_train_raw_full), columns=full_feature_cols)
+        X_val_full = pd.DataFrame(full_imputer.transform(X_val_raw_full), columns=full_feature_cols)
+        X_test_full = pd.DataFrame(full_imputer.transform(X_test_raw_full), columns=full_feature_cols)
 
         # Lightweight feature pruning to reduce noisy tails.
         MAX_FEATURES = 320
@@ -3600,7 +3709,7 @@ class UFCSuperModelPipeline:
         method_bundle = None
         try:
             self._section("Method Model")
-            X_dev_full = pd.concat([X_train, X_val], ignore_index=True)
+            X_dev_full = pd.concat([X_train_full, X_val_full], ignore_index=True)
             y_dev_true = pd.concat([y_train, y_val], ignore_index=True).astype(int).values
             y_dev_method_df = pd.concat([y_method_train, y_method_val], ignore_index=True).reset_index(drop=True)
             meta_dev = row_meta.iloc[:val_end].reset_index(drop=True)
@@ -4204,7 +4313,7 @@ class UFCSuperModelPipeline:
             self._stat("Validation majority baseline (same subset)", f"{best_cfg['val_baseline']:.1%}")
 
             # Holdout evaluation with winner-model predicted winners.
-            X_test_oriented_pred = _oriented_method_matrix(X_test, y_pred_red)
+            X_test_oriented_pred = _oriented_method_matrix(X_test_full, y_pred_red)
             X_test_oriented_pred = _augment_method_features(X_test_oriented_pred)
             X_test_oriented_pred_imp = pd.DataFrame(
                 method_imputer.transform(X_test_oriented_pred), columns=method_columns
@@ -4365,6 +4474,7 @@ class UFCSuperModelPipeline:
                 [max(METHOD_LABELS, key=lambda m: p[m]) for p in final_probs], dtype=object
             )
             method_acc_predicted_winner = float(np.mean(method_pred_predwinner == y_method_np))
+            finish_score = float("nan")
             if int(np.sum(winner_correct)) > 0:
                 method_acc_when_winner_correct = float(
                     np.mean(method_pred_predwinner[winner_correct] == y_method_np[winner_correct])
@@ -4393,8 +4503,13 @@ class UFCSuperModelPipeline:
                 )
                 bal_acc = float(balanced_accuracy_score(sub_true, sub_pred))
                 macro_f1 = float(np.mean(f1_arr))
+                ko_recall = float(r_arr[1]) if len(r_arr) > 1 else 0.0
+                sub_recall = float(r_arr[2]) if len(r_arr) > 2 else 0.0
+                ko_sub_macro_f1 = float(np.mean(f1_arr[1:3])) if len(f1_arr) >= 3 else macro_f1
+                finish_score = 0.4 * ko_recall + 0.4 * sub_recall + 0.2 * ko_sub_macro_f1
                 self._stat("Balanced accuracy | winner pick correct", f"{bal_acc:.1%}")
                 self._stat("Macro F1 | winner pick correct", f"{macro_f1:.1%}")
+                self._stat("FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1)", f"{finish_score:.1%}")
                 self._log("")
                 self._log("Per-Class Metrics (Method | winner pick correct)")
                 self._log("Class          Precision    Recall      F1")
@@ -4420,7 +4535,8 @@ class UFCSuperModelPipeline:
             method_bundle = None
 
         # Retrain for production on all rows.
-        X_all = pd.DataFrame(imputer.fit_transform(X[feature_cols]), columns=feature_cols)
+        X_all = pd.DataFrame(imputer.fit_transform(X_winner[feature_cols]), columns=feature_cols)
+        X_all_full = pd.DataFrame(full_imputer.fit_transform(X_full[full_feature_cols]), columns=full_feature_cols)
         X_all_aug, y_all_aug = _augment_swap(X_all, y.reset_index(drop=True))
         w_all_aug = _augment_weights(_time_weights(len(X_all), floor=0.35))
         scaler_all = StandardScaler()
@@ -4444,7 +4560,7 @@ class UFCSuperModelPipeline:
 
         # Retrain method head on all rows, oriented by winner-model predictions.
         method_bundle_all = None
-        method_feat_cols_all = list(feature_cols)
+        method_feat_cols_all = list(full_feature_cols)
         if method_bundle is not None:
             try:
                 X_all_sw = _swap_features(X_all)
@@ -4463,7 +4579,7 @@ class UFCSuperModelPipeline:
                     )
                 y_pred_all = (np.asarray(all_probs) >= decision_threshold).astype(int)
 
-                X_all_method = _oriented_method_matrix(X_all, y_pred_all)
+                X_all_method = _oriented_method_matrix(X_all_full, y_pred_all)
                 X_all_method = _augment_method_features(X_all_method)
                 method_feat_cols_all = list(X_all_method.columns)
                 method_imputer_all = SimpleImputer(strategy="median")
@@ -4650,6 +4766,7 @@ class UFCSuperModelPipeline:
             "method_acc_when_winner_correct": method_acc_when_winner_correct,
             "method_acc_true_winner": method_holdout_acc_oracle,
             "method_majority_baseline_when_winner_correct": method_majority_baseline_when_winner_correct,
+            "method_finish_score_winner_correct": finish_score,
         }
 
         ml_baseline = None
@@ -5054,12 +5171,15 @@ def main():
                 v2 = mm.get("method_acc_when_winner_correct")
                 v3 = mm.get("method_acc_true_winner")
                 v4 = mm.get("method_majority_baseline_when_winner_correct")
+                v5 = mm.get("method_finish_score_winner_correct")
                 if v1 == v1:
                     print(f"Method acc (predicted winner conditioned): {v1:.1%}")
                 if v2 == v2:
                     print(f"Method acc | winner pick correct: {v2:.1%}")
                 if v4 == v4:
                     print(f"Majority baseline | winner pick correct: {v4:.1%}")
+                if v5 == v5:
+                    print(f"FinishScore (winner pick correct): {v5:.1%}")
                 if v3 == v3:
                     print(f"Method acc (true winner conditioned): {v3:.1%}")
         return
