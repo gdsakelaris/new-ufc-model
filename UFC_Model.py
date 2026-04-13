@@ -4083,27 +4083,36 @@ class UFCSuperModelPipeline:
 
             best_cfg = None
             rng = np.random.default_rng(RANDOM_SEED + 2026)
-            n_trials = int(max(40, METHOD_TUNING_TRIALS))
-            stage1_trials = int(max(24, round(0.8 * n_trials)))
-            stage2_trials = int(max(16, n_trials - stage1_trials))
-
-            def _evaluate_method_cfg(cfg):
-                w_hist = float(cfg["w_hist"])
-                w_group = float(cfg["w_group"])
-                w_base = float(cfg["w_base"])
-                w_subsig = float(cfg["w_subsig"])
-                if w_hist + w_group + w_base + w_subsig >= 0.82:
-                    return None
+            for _trial in range(int(max(40, METHOD_TUNING_TRIALS))):
+                a1 = float(rng.choice([0.55, 0.70, 0.85]))
+                a2 = float(rng.choice([0.55, 0.70, 0.85]))
+                t_dec = float(rng.choice([0.7, 0.85, 1.0, 1.15, 1.3]))
+                t_fin = float(rng.choice([0.7, 0.85, 1.0, 1.15, 1.3]))
+                b_fin = float(rng.choice([-0.35, -0.15, 0.0, 0.15, 0.35]))
+                b_sub = float(rng.choice([-0.30, -0.10, 0.0, 0.10, 0.30]))
+                fin_thr = float(rng.choice([0.42, 0.46, 0.50, 0.54, 0.58]))
+                sub_thr = float(rng.choice([0.42, 0.46, 0.50, 0.54, 0.58]))
+                a_dir = float(rng.choice([0.90, 0.96, 1.00]))
+                b_dir = float(rng.choice([0.60, 0.75, 0.90]))
+                a_ovr = float(rng.choice([0.90, 0.97, 1.00]))
+                a_simple = float(rng.choice([0.65, 0.80, 0.95]))
+                w_hist = float(rng.choice([0.00, 0.08, 0.15, 0.22, 0.30]))
+                w_group = float(rng.choice([0.00, 0.04, 0.08, 0.12]))
+                w_base = float(rng.choice([0.00, 0.06, 0.12, 0.18]))
+                w_subsig = float(rng.choice([0.00, 0.06, 0.10, 0.14, 0.18]))
+                sub_boost_k = float(rng.choice([0.0, 0.4, 0.8, 1.2, 1.6]))
+                bias_dec = float(rng.choice([-0.05, 0.00, 0.10, 0.20, 0.30]))
+                bias_ko = float(rng.choice([-0.25, -0.15, -0.05, 0.00, 0.05]))
+                bias_sub = float(rng.choice([-0.20, -0.10, 0.00, 0.05, 0.10]))
+                if w_hist + w_group + w_base + w_subsig >= 0.78:
+                    continue
                 w_ml = 1.0 - w_hist - w_group - w_base - w_subsig
+
                 ml_df = _stage_probs(
-                    X_m_va_imp,
-                    temp_dec=float(cfg["t_dec"]), temp_fin=float(cfg["t_fin"]),
-                    alpha1=float(cfg["alpha_stage1"]), alpha2=float(cfg["alpha_stage2"]),
-                    bias_finish=float(cfg["bias_finish"]), bias_sub=float(cfg["bias_sub"]),
-                    alpha_direct=float(cfg["alpha_direct"]), beta_direct=float(cfg["beta_direct"]),
-                    alpha_ovr=float(cfg["alpha_ovr"]),
-                    finish_thr=float(cfg["finish_threshold"]), sub_thr=float(cfg["sub_threshold"]),
-                    alpha_simple=float(cfg["alpha_simple"]),
+                    X_m_va_imp, temp_dec=t_dec, temp_fin=t_fin,
+                    alpha1=a1, alpha2=a2, bias_finish=b_fin, bias_sub=b_sub,
+                    alpha_direct=a_dir, beta_direct=b_dir, alpha_ovr=a_ovr,
+                    finish_thr=fin_thr, sub_thr=sub_thr, alpha_simple=a_simple
                 )
                 ml_arr = ml_df[["Decision", "KO/TKO", "Submission"]].to_numpy(dtype=float)
                 base_arr = np.tile(
@@ -4115,129 +4124,65 @@ class UFCSuperModelPipeline:
                 probs_arr = probs_arr / np.sum(probs_arr, axis=1, keepdims=True)
                 probs_arr = _apply_method_logit_bias_arr(
                     probs_arr,
-                    np.array(
-                        [
-                            float(cfg["method_bias_decision"]),
-                            float(cfg["method_bias_ko_tko"]),
-                            float(cfg["method_bias_submission"]),
-                        ],
-                        dtype=float,
-                    ),
+                    np.array([bias_dec, bias_ko, bias_sub], dtype=float)
                 )
-                probs_arr = _apply_submission_signal_boost_arr(probs_arr, sub_arr[:, 2], float(cfg["sub_boost_k"]))
+                probs_arr = _apply_submission_signal_boost_arr(probs_arr, sub_arr[:, 2], sub_boost_k)
                 probs_arr = probs_arr / np.sum(probs_arr, axis=1, keepdims=True)
                 pred_idx = np.argmax(probs_arr, axis=1)
 
                 if int(np.sum(winner_correct_va)) == 0:
-                    y_eval = y_va_idx
-                    pred_eval = pred_idx
+                    score = float(np.mean(pred_idx == y_va_idx))
                     baseline = float(pd.Series(y_va_true).value_counts().max() / len(y_va_true))
+                    macro_recall = score
+                    minority_recall = score
+                    pred_share = np.bincount(pred_idx, minlength=len(METHOD_LABELS)).astype(float)
+                    pred_share = pred_share / max(1.0, float(np.sum(pred_share)))
+                    true_share = np.bincount(y_va_idx, minlength=len(METHOD_LABELS)).astype(float)
+                    true_share = true_share / max(1.0, float(np.sum(true_share)))
                 else:
-                    y_eval = y_va_idx[winner_correct_va]
-                    pred_eval = pred_idx[winner_correct_va]
-                    baseline = float(pd.Series(y_va_true[winner_correct_va]).value_counts().max() / len(y_eval))
-                if len(y_eval) == 0:
-                    return None
-                method_acc = float(np.mean(pred_eval == y_eval))
-
-                _, r_arr, f1_arr, _ = precision_recall_fscore_support(
-                    y_eval, pred_eval, labels=[0, 1, 2], average=None, zero_division=0
-                )
-                ko_recall = float(r_arr[1]) if len(r_arr) > 1 else 0.0
-                sub_recall = float(r_arr[2]) if len(r_arr) > 2 else 0.0
-                ko_f1 = float(f1_arr[1]) if len(f1_arr) > 1 else 0.0
-                sub_f1 = float(f1_arr[2]) if len(f1_arr) > 2 else 0.0
-                finish_focus = 0.35 * ko_recall + 0.35 * sub_recall + 0.15 * ko_f1 + 0.15 * sub_f1
-
-                pred_share = np.bincount(pred_eval, minlength=len(METHOD_LABELS)).astype(float)
-                pred_share = pred_share / max(1.0, float(np.sum(pred_share)))
-                true_share = np.bincount(y_eval, minlength=len(METHOD_LABELS)).astype(float)
-                true_share = true_share / max(1.0, float(np.sum(true_share)))
+                    y_sub_idx = y_va_idx[winner_correct_va]
+                    pred_sub_idx = pred_idx[winner_correct_va]
+                    score = float(np.mean(pred_sub_idx == y_sub_idx))
+                    baseline = float(pd.Series(y_va_true[winner_correct_va]).value_counts().max() / len(y_sub_idx))
+                    recalls = []
+                    for cls_i in range(len(METHOD_LABELS)):
+                        mask_cls = (y_sub_idx == cls_i)
+                        if int(np.sum(mask_cls)) > 0:
+                            recalls.append(float(np.mean(pred_sub_idx[mask_cls] == cls_i)))
+                    macro_recall = float(np.mean(recalls)) if recalls else score
+                    minority_recall = float(np.mean(recalls[1:])) if len(recalls) >= 3 else macro_recall
+                    pred_share = np.bincount(pred_sub_idx, minlength=len(METHOD_LABELS)).astype(float)
+                    pred_share = pred_share / max(1.0, float(np.sum(pred_share)))
+                    true_share = np.bincount(y_sub_idx, minlength=len(METHOD_LABELS)).astype(float)
+                    true_share = true_share / max(1.0, float(np.sum(true_share)))
                 distribution_shift = float(np.sum(np.abs(pred_share - true_share)))
-
                 chunk_scores = []
                 for ch in va_chunks:
                     ch_wc = winner_correct_va[ch]
                     if int(np.sum(ch_wc)) > 0:
-                        y_ch = y_va_idx[ch][ch_wc]
-                        p_ch = pred_idx[ch][ch_wc]
+                        chunk_scores.append(float(np.mean(pred_idx[ch][ch_wc] == y_va_idx[ch][ch_wc])))
                     else:
-                        y_ch = y_va_idx[ch]
-                        p_ch = pred_idx[ch]
-                    if len(y_ch) == 0:
-                        continue
-                    _, r_ch, f1_ch, _ = precision_recall_fscore_support(
-                        y_ch, p_ch, labels=[0, 1, 2], average=None, zero_division=0
-                    )
-                    ko_r_ch = float(r_ch[1]) if len(r_ch) > 1 else 0.0
-                    sub_r_ch = float(r_ch[2]) if len(r_ch) > 2 else 0.0
-                    ko_f1_ch = float(f1_ch[1]) if len(f1_ch) > 1 else 0.0
-                    sub_f1_ch = float(f1_ch[2]) if len(f1_ch) > 2 else 0.0
-                    chunk_scores.append(0.35 * ko_r_ch + 0.35 * sub_r_ch + 0.15 * ko_f1_ch + 0.15 * sub_f1_ch)
-                robust_finish = (
-                    float(np.mean(chunk_scores)) - 0.60 * float(np.std(chunk_scores))
-                ) if chunk_scores else finish_focus
-                objective = robust_finish - 0.10 * distribution_shift
-                return {
-                    "objective": objective,
-                    "robust_finish": robust_finish,
-                    "finish_focus": finish_focus,
-                    "method_acc": method_acc,
-                    "baseline": baseline,
-                    "distribution_shift": distribution_shift,
-                    "key": (
-                        objective, robust_finish, finish_focus, method_acc,
-                        -distribution_shift, -baseline,
-                    ),
-                }
-
-            # Stage 1: tune first/second-priority knobs + priors. Bias terms fixed.
-            for _trial in range(stage1_trials):
-                cfg = {
-                    "alpha_stage1": float(rng.choice([0.50, 0.60, 0.70, 0.80, 0.90])),
-                    "alpha_stage2": float(rng.choice([0.50, 0.60, 0.70, 0.80, 0.90])),
-                    "t_dec": float(rng.choice([0.70, 0.85, 1.00, 1.15, 1.30])),
-                    "t_fin": float(rng.choice([0.70, 0.85, 1.00, 1.15, 1.30])),
-                    "bias_finish": float(rng.uniform(-0.35, 0.35)),
-                    "bias_sub": float(rng.uniform(-0.35, 0.35)),
-                    "finish_threshold": float(rng.uniform(0.42, 0.62)),
-                    "sub_threshold": float(rng.uniform(0.40, 0.65)),
-                    "alpha_direct": float(rng.uniform(0.65, 0.95)),
-                    "beta_direct": float(rng.choice([0.55, 0.70, 0.85])),
-                    "alpha_ovr": float(rng.choice([0.80, 0.90, 1.00])),
-                    "alpha_simple": float(rng.choice([0.60, 0.75, 0.90])),
-                    "w_hist": float(rng.choice([0.00, 0.06, 0.12, 0.18, 0.24, 0.30])),
-                    "w_group": float(rng.choice([0.00, 0.03, 0.06, 0.09, 0.12])),
-                    "w_base": float(rng.choice([0.00, 0.04, 0.08, 0.12, 0.16])),
-                    "w_subsig": float(rng.choice([0.00, 0.05, 0.10, 0.14, 0.18])),
-                    "sub_boost_k": float(rng.choice([0.0, 0.4, 0.8, 1.2, 1.6])),
-                    "method_bias_decision": 0.10,
-                    "method_bias_ko_tko": -0.10,
-                    "method_bias_submission": 0.00,
-                }
-                eval_out = _evaluate_method_cfg(cfg)
-                if eval_out is None:
-                    continue
-                if best_cfg is None or eval_out["key"] > best_cfg["key"]:
-                    best_cfg = {**cfg, **eval_out}
-
-            # Stage 2: with best base config fixed, tune class/logit bias terms.
-            if best_cfg is not None:
-                for _trial in range(stage2_trials):
-                    cfg = dict(best_cfg)
-                    cfg["method_bias_decision"] = float(rng.uniform(-0.15, 0.30))
-                    cfg["method_bias_ko_tko"] = float(rng.uniform(-0.30, 0.20))
-                    cfg["method_bias_submission"] = float(rng.uniform(-0.25, 0.20))
-                    eval_out = _evaluate_method_cfg(cfg)
-                    if eval_out is None:
-                        continue
-                    if eval_out["key"] > best_cfg["key"]:
-                        best_cfg = {**cfg, **eval_out}
-
-            if best_cfg is not None:
-                best_cfg["val_metric"] = float(best_cfg["method_acc"])
-                best_cfg["val_finish_focus"] = float(best_cfg["finish_focus"])
-                best_cfg["val_baseline"] = float(best_cfg["baseline"])
+                        chunk_scores.append(float(np.mean(pred_idx[ch] == y_va_idx[ch])))
+                robust_score = float(np.mean(chunk_scores)) - 0.60 * float(np.std(chunk_scores))
+                objective = robust_score + 0.04 * macro_recall + 0.02 * minority_recall - 0.10 * distribution_shift
+                key = (objective, robust_score, score, minority_recall, -distribution_shift, -baseline)
+                if best_cfg is None or key > best_cfg["key"]:
+                    best_cfg = {
+                        "key": key, "t_dec": t_dec, "t_fin": t_fin,
+                        "bias_finish": b_fin, "bias_sub": b_sub,
+                        "finish_threshold": fin_thr, "sub_threshold": sub_thr,
+                        "w_hist": w_hist, "w_group": w_group, "w_base": w_base,
+                        "w_subsig": w_subsig,
+                        "sub_boost_k": sub_boost_k,
+                        "method_bias_decision": bias_dec,
+                        "method_bias_ko_tko": bias_ko,
+                        "method_bias_submission": bias_sub,
+                        "alpha_stage1": a1, "alpha_stage2": a2,
+                        "alpha_direct": a_dir, "beta_direct": b_dir,
+                        "alpha_ovr": a_ovr,
+                        "alpha_simple": a_simple,
+                        "val_metric": score, "val_baseline": baseline,
+                    }
             if best_cfg is None:
                 best_cfg = {
                     "key": (0.0, 0.0, 0.0), "t_dec": 1.0, "t_fin": 1.0,
@@ -4252,7 +4197,7 @@ class UFCSuperModelPipeline:
                     "alpha_direct": 0.85, "beta_direct": 0.70,
                     "alpha_ovr": 0.85,
                     "alpha_simple": 0.80,
-                    "val_metric": float("nan"), "val_baseline": float("nan"), "val_finish_focus": float("nan"),
+                    "val_metric": float("nan"), "val_baseline": float("nan"),
                 }
 
             # Hard reset: keep only stable components that generalized better.
@@ -4415,11 +4360,7 @@ class UFCSuperModelPipeline:
             self._stat("Method classes (training)", ", ".join(method_bundle["detail_labels_seen"]))
             if METHOD_HARD_RESET:
                 self._stat("Method stack mode", "hard-reset (stable components only)")
-            self._stat(
-                "Validation finish-focused score (winner-correct subset)",
-                f"{float(best_cfg.get('val_finish_focus', float('nan'))):.1%}",
-            )
-            self._stat("Validation method acc (winner-correct subset)", f"{best_cfg['val_metric']:.1%}")
+            self._stat("Validation metric target (method | winner correct)", f"{best_cfg['val_metric']:.1%}")
             self._stat("Validation majority baseline (same subset)", f"{best_cfg['val_baseline']:.1%}")
 
             # Holdout evaluation with winner-model predicted winners.
@@ -5036,6 +4977,12 @@ class UFCSuperModelPipeline:
             "method_pct": method_probs[predicted_method],
         }
 
+    def is_debutant(self, fighter_name):
+        key = fuzzy_find(fighter_name, self.fighter_history)
+        if key is None:
+            return True
+        return not bool(self.fighter_history.get(key))
+
     def division_rankings(self):
         by_div = defaultdict(list)
         now = pd.Timestamp(datetime.now().date())
@@ -5080,8 +5027,8 @@ def export_to_excel(path, predictions, rankings):
     ws = wb.active
     ws.title = "Predictions"
     headers = [
-        "Red Corner", "Blue Corner", "Weight Class", "Predicted Winner", "Win %",
-        "Predicted Method", "Method %", "Decision %", "KO/TKO %", "Submission %",
+        "Red Corner", "Blue Corner", "Weight Class", "Winner", "Win %",
+        "Method", "Method %", "DEC %", "(T)KO %", "SUB %",
     ]
     for ci, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=ci, value=h)
@@ -5200,11 +5147,15 @@ class SuperModelGUI:
                     self.pipeline.train()
 
                 preds = []
+                skipped_debut = 0
                 for line in [ln.strip() for ln in text.splitlines() if ln.strip()]:
                     parts = [p.strip() for p in line.split(",")]
                     if len(parts) < 2:
                         continue
                     a, b = parts[0], parts[1]
+                    if self.pipeline.is_debutant(a) or self.pipeline.is_debutant(b):
+                        skipped_debut += 1
+                        continue
                     wc = parts[2] if len(parts) > 2 else ""
                     g = parts[3] if len(parts) > 3 else ""
                     try:
@@ -5228,10 +5179,18 @@ class SuperModelGUI:
 
                 try:
                     export_to_excel(PREDICTIONS_XLSX, preds, self.pipeline.division_rankings())
-                    msg = f"{len(preds)} matchups predicted. Saved to {os.path.basename(PREDICTIONS_XLSX)}"
+                    msg = (
+                        f"{len(preds)} matchups predicted. "
+                        f"Skipped {skipped_debut} debutant matchup(s). "
+                        f"Saved to {os.path.basename(PREDICTIONS_XLSX)}"
+                    )
                 except Exception as e:
                     err = str(e)
-                    msg = f"{len(preds)} matchups predicted. Excel export failed: {err}"
+                    msg = (
+                        f"{len(preds)} matchups predicted. "
+                        f"Skipped {skipped_debut} debutant matchup(s). "
+                        f"Excel export failed: {err}"
+                    )
                     self.root.after(0, lambda em=err: messagebox.showerror("Export Error", em))
                 self.root.after(0, lambda: self.status_var.set(msg))
                 print("")
