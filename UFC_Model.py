@@ -4705,7 +4705,7 @@ class UFCSuperModelPipeline:
                     _pred_sub_rate = float(pred_share[2])
                     _true_sub_rate = float(true_share[2])
                     _sub_underpredict = max(0.0, _true_sub_rate - _pred_sub_rate - 0.04)
-                    objective = robust_score + 0.04 * macro_recall + 0.12 * minority_recall - 0.04 * distribution_shift + 0.08 * finish_score_tune - 0.10 * _finish_underpredict - 0.30 * _sub_underpredict
+                    objective = robust_score + 0.04 * macro_recall + 0.12 * minority_recall - 0.04 * distribution_shift + 0.08 * finish_score_tune - 0.10 * _finish_underpredict - 0.18 * _sub_underpredict
                     key = (objective, robust_score, score, minority_recall, -distribution_shift, -baseline)
                     if best_cfg is None or key > best_cfg["key"]:
                         best_cfg = {
