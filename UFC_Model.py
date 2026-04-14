@@ -17,6 +17,7 @@ Optional CLI:
 
 import argparse
 import hashlib
+import json
 import math
 import os
 import pickle
@@ -78,6 +79,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(SCRIPT_DIR, "pure_fight_data.csv")
 PREDICTIONS_XLSX = os.path.join(SCRIPT_DIR, "UFC_Predictions.xlsx")
 CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
+METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_champion_cfg.json")
 ###################################################################################################
 # Bump when winner-stage training logic changes.
 WINNER_CACHE_VERSION = "v1"
@@ -4740,6 +4742,107 @@ class UFCSuperModelPipeline:
                         "alpha_simple": 0.80,
                         "val_metric": float("nan"), "val_baseline": float("nan"),
                     }
+
+                # ── Champion / challenger ─────────────────────────────────────
+                # Load the previously saved champion config (if any) and evaluate
+                # it on the CURRENT validation set. Only replace it if the new
+                # tuning run found something genuinely better.
+                def _eval_cfg_objective(cfg):
+                    """Re-evaluate a config dict on the current val set, return objective."""
+                    try:
+                        _ml = _stage_probs(
+                            X_m_va_imp,
+                            temp_dec=cfg["t_dec"], temp_fin=cfg["t_fin"],
+                            alpha1=cfg["alpha_stage1"], alpha2=cfg["alpha_stage2"],
+                            bias_finish=cfg["bias_finish"], bias_sub=cfg["bias_sub"],
+                            alpha_direct=cfg["alpha_direct"], beta_direct=cfg["beta_direct"],
+                            alpha_ovr=cfg["alpha_ovr"],
+                            finish_thr=cfg["finish_threshold"], sub_thr=cfg["sub_threshold"],
+                            alpha_simple=cfg["alpha_simple"],
+                        )
+                        _ml_arr = _ml[["Decision", "KO/TKO", "Submission"]].to_numpy(dtype=float)
+                        _base = np.tile(
+                            np.array([[base_prior["Decision"], base_prior["KO/TKO"], base_prior["Submission"]]], dtype=float),
+                            (len(_ml_arr), 1)
+                        )
+                        _p = (cfg["w_hist"] * hist_arr + cfg["w_group"] * grp_arr +
+                              cfg["w_base"] * _base + cfg["w_subsig"] * sub_arr +
+                              (1.0 - cfg["w_hist"] - cfg["w_group"] - cfg["w_base"] - cfg["w_subsig"]) * _ml_arr)
+                        _p = np.clip(_p, MIN_METHOD_PROB, 1.0)
+                        _p = _p / np.sum(_p, axis=1, keepdims=True)
+                        _p = _apply_method_logit_bias_arr(
+                            _p, np.array([cfg["method_bias_decision"], cfg["method_bias_ko_tko"],
+                                          cfg["method_bias_submission"]], dtype=float)
+                        )
+                        _p = _apply_submission_signal_boost_arr(_p, sub_arr[:, 2], cfg["sub_boost_k"])
+                        _p = _p / np.sum(_p, axis=1, keepdims=True)
+                        _pidx = np.argmax(_p, axis=1)
+                        if int(np.sum(winner_correct_va)) == 0:
+                            _sc = float(np.mean(_pidx == y_va_idx))
+                            _mr = _sc
+                            _minr = _sc
+                            _fs = 0.0
+                            _ps = np.bincount(_pidx, minlength=3).astype(float)
+                            _ps /= max(1.0, _ps.sum())
+                            _ts = np.bincount(y_va_idx, minlength=3).astype(float)
+                            _ts /= max(1.0, _ts.sum())
+                        else:
+                            _ys = y_va_idx[winner_correct_va]
+                            _ps_idx = _pidx[winner_correct_va]
+                            _sc = float(np.mean(_ps_idx == _ys))
+                            _recs = [float(np.mean(_ps_idx[_ys == c] == c)) for c in range(3) if int(np.sum(_ys == c)) > 0]
+                            _mr = float(np.mean(_recs)) if _recs else _sc
+                            _kr = float(_recs[1]) if len(_recs) > 1 else 0.0
+                            _sr = float(_recs[2]) if len(_recs) > 2 else 0.0
+                            _minr = 2.0 * _kr * _sr / max(1e-9, _kr + _sr)
+                            _ps = np.bincount(_ps_idx, minlength=3).astype(float)
+                            _ps /= max(1.0, _ps.sum())
+                            _ts = np.bincount(_ys, minlength=3).astype(float)
+                            _ts /= max(1.0, _ts.sum())
+                            _kp = float(np.sum((_ps_idx == 1) & (_ys == 1))) / max(1, int(np.sum(_ps_idx == 1)))
+                            _sp = float(np.sum((_ps_idx == 2) & (_ys == 2))) / max(1, int(np.sum(_ps_idx == 2)))
+                            _kf1 = 2 * _kp * _kr / max(1e-9, _kp + _kr)
+                            _sf1 = 2 * _sp * _sr / max(1e-9, _sp + _sr)
+                            _fs = 0.4 * _kr + 0.4 * _sr + 0.2 * 0.5 * (_kf1 + _sf1)
+                        _ds = float(np.sum(np.abs(_ps - _ts)))
+                        _cscores = []
+                        for _ch in va_chunks:
+                            _cwc = winner_correct_va[_ch]
+                            if int(np.sum(_cwc)) > 0:
+                                _cscores.append(float(np.mean(_pidx[_ch][_cwc] == y_va_idx[_ch][_cwc])))
+                            else:
+                                _cscores.append(float(np.mean(_pidx[_ch] == y_va_idx[_ch])))
+                        _rs = float(np.mean(_cscores)) - 0.60 * float(np.std(_cscores))
+                        _fup = max(0.0, float(_ts[1]+_ts[2]) - float(_ps[1]+_ps[2]) - 0.08)
+                        _sup = max(0.0, float(_ts[2]) - float(_ps[2]) - 0.04)
+                        return _rs + 0.04*_mr + 0.12*_minr - 0.04*_ds + 0.08*_fs - 0.10*_fup - 0.18*_sup
+                    except Exception:
+                        return float("-inf")
+
+                try:
+                    os.makedirs(os.path.dirname(METHOD_CHAMPION_PATH), exist_ok=True)
+                    champion_cfg = None
+                    if os.path.exists(METHOD_CHAMPION_PATH) and not METHOD_HARD_RESET:
+                        with open(METHOD_CHAMPION_PATH, "r") as _f:
+                            champion_cfg = json.load(_f)
+                    if champion_cfg is not None:
+                        champ_obj = _eval_cfg_objective(champion_cfg)
+                        new_obj = _eval_cfg_objective(best_cfg)
+                        if champ_obj >= new_obj:
+                            self._stat("Method config", f"Champion retained (champ={champ_obj:.5f} >= new={new_obj:.5f})")
+                            best_cfg = champion_cfg
+                        else:
+                            self._stat("Method config", f"Challenger wins (new={new_obj:.5f} > champ={champ_obj:.5f}) — champion updated")
+                            with open(METHOD_CHAMPION_PATH, "w") as _f:
+                                json.dump({k: (list(v) if isinstance(v, tuple) else v)
+                                           for k, v in best_cfg.items()}, _f, indent=2)
+                    else:
+                        self._stat("Method config", "No champion on file — saving current best as champion")
+                        with open(METHOD_CHAMPION_PATH, "w") as _f:
+                            json.dump({k: (list(v) if isinstance(v, tuple) else v)
+                                       for k, v in best_cfg.items()}, _f, indent=2)
+                except Exception as _e:
+                    self._stat("Method config", f"Champion load/save failed ({_e}) — using tuned config")
 
                 # Hard reset: keep only stable components that generalized better.
                 if METHOD_HARD_RESET:
