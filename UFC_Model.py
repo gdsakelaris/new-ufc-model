@@ -46,7 +46,6 @@ from sklearn.metrics import balanced_accuracy_score, precision_recall_fscore_sup
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.neural_network import MLPClassifier
-from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from scipy.optimize import minimize as scipy_minimize
 
@@ -83,7 +82,7 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
 # Bump when winner-stage training logic changes.
 WINNER_CACHE_VERSION = "v1"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v3"
+METHOD_CACHE_VERSION = "v4"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -107,10 +106,6 @@ METHOD_TUNING_TRIALS = 480
 METHOD_HARD_RESET = False
 METHOD_ERA_CANDIDATES = [1993, 2005, 2010, 2014, 2016, 2018, 2020, 2021, 2022, 2023, 2024]
 METHOD_AUTO_ERA = True
-METHOD_SUBMISSION_CLASS_WEIGHTS = [1.0, 1.05, 1.10, 1.20]
-METHOD_SUBMISSION_OVERSAMPLE_RATIOS = [1.0, 1.05, 1.10, 1.15]
-METHOD_DEFAULT_SUBMISSION_CLASS_WEIGHT = 1.05
-METHOD_DEFAULT_SUBMISSION_OVERSAMPLE_RATIO = 1.05
 # Keep winner-model inputs on the stable feature family while allowing richer
 # method-only engineering in the method pipeline.
 WINNER_EXCLUDE_FEATURES = {
@@ -309,8 +304,8 @@ def _normalize_method_probs(prob_map):
     return {k: float(v) for k, v in zip(METHOD_LABELS, vals)}
 
 
-# Deprecated: legacy manual method-probability shaping helpers.
-# Kept only as unreachable historical utilities; live method inference no longer calls them.
+# Method-probability shaping helpers: logit-space bias application and submission signal boost.
+# Called during tuning (blending loop) and inference (predict_method_probs).
 def _apply_method_logit_bias_arr(probs_arr, bias_vec):
     arr = np.asarray(probs_arr, dtype=float)
     if arr.ndim == 1:
@@ -3227,75 +3222,165 @@ class SuperEnsembleModel:
             self.method_bundle["imputer"].transform(X),
             columns=self.method_bundle["method_columns"],
         )
-        stage1 = self.method_bundle.get("stage1")
-        stage2 = self.method_bundle.get("stage2")
-        direct_model = self.method_bundle.get("direct_model")
-        if stage1 is None or stage2 is None or direct_model is None:
-            return {"Decision": 1.0 / 3.0, "KO/TKO": 1.0 / 3.0, "Submission": 1.0 / 3.0}
+        stage1 = self.method_bundle["stage1"]
+        stage2 = self.method_bundle["stage2"]
+        stage1_rf = self.method_bundle.get("stage1_rf")
+        stage2_rf = self.method_bundle.get("stage2_rf")
+        stage1_et = self.method_bundle.get("stage1_et")
+        stage2_et = self.method_bundle.get("stage2_et")
+        direct_hgb = self.method_bundle.get("direct_hgb")
+        direct_rf = self.method_bundle.get("direct_rf")
+        direct_et = self.method_bundle.get("direct_et")
+        ovr_models = self.method_bundle.get("ovr_models", {})
+        simple_method = self.method_bundle.get("simple_method")
+        direct_classes = self.method_bundle.get("direct_classes", [])
+        alpha_stage1 = float(self.method_bundle.get("alpha_stage1", 0.75))
+        alpha_stage2 = float(self.method_bundle.get("alpha_stage2", 0.75))
+        alpha_direct = float(self.method_bundle.get("alpha_direct", 0.85))
+        beta_direct = float(self.method_bundle.get("beta_direct", 0.70))
+        alpha_ovr = float(self.method_bundle.get("alpha_ovr", 0.85))
+        alpha_simple = float(self.method_bundle.get("alpha_simple", 0.80))
+        temp_dec = float(self.method_bundle.get("temp_decision", 1.0))
+        temp_fin = float(self.method_bundle.get("temp_finish", 1.0))
+        finish_thr = float(self.method_bundle.get("finish_threshold", 0.50))
+        sub_thr = float(self.method_bundle.get("sub_threshold", 0.50))
 
-        p_finish = np.clip(stage1.predict_proba(X_imp)[:, 1], 1e-6, 1.0 - 1e-6)
-        p_sub_finish = np.clip(stage2.predict_proba(X_imp)[:, 1], 1e-6, 1.0 - 1e-6)
-        hier_arr = np.column_stack([
-            1.0 - p_finish,
-            p_finish * (1.0 - p_sub_finish),
-            p_finish * p_sub_finish,
-        ])
-        hier_arr = np.clip(hier_arr, MIN_METHOD_PROB, 1.0)
-        hier_arr = hier_arr / np.sum(hier_arr, axis=1, keepdims=True)
-
-        p_dir = direct_model.predict_proba(X_imp)
-        cls_map = {str(c): i for i, c in enumerate(direct_model.classes_)}
-        direct_arr = np.zeros((len(X_imp), len(METHOD_LABELS)), dtype=float)
-        for j, m in enumerate(METHOD_LABELS):
-            if m in cls_map:
-                direct_arr[:, j] = p_dir[:, cls_map[m]]
+        p_finish_raw = float(stage1.predict_proba(X_imp)[:, 1][0])
+        if stage1_rf is not None:
+            p_finish_rf = float(stage1_rf.predict_proba(X_imp)[:, 1][0])
+            if stage1_et is not None:
+                p_finish_et = float(stage1_et.predict_proba(X_imp)[:, 1][0])
+                p_finish_tree = 0.55 * p_finish_rf + 0.45 * p_finish_et
             else:
-                direct_arr[:, j] = 1.0 / 3.0
-        direct_arr = np.clip(direct_arr, MIN_METHOD_PROB, 1.0)
-        direct_arr = direct_arr / np.sum(direct_arr, axis=1, keepdims=True)
+                p_finish_tree = p_finish_rf
+            p_finish_raw = alpha_stage1 * p_finish_raw + (1.0 - alpha_stage1) * p_finish_tree
+        logit = np.log(p_finish_raw / max(1e-9, 1.0 - p_finish_raw))
+        p_finish = 1.0 / (1.0 + np.exp(-(logit / max(0.35, temp_dec))))
+        p_finish = float(_apply_binary_threshold_warp(p_finish, finish_thr))
+        p_finish = float(np.clip(p_finish, 1e-4, 1.0 - 1e-4))
+
+        p_sub_raw = float(stage2.predict_proba(X_imp)[:, 1][0])
+        if stage2_rf is not None:
+            p_sub_rf = float(stage2_rf.predict_proba(X_imp)[:, 1][0])
+            if stage2_et is not None:
+                p_sub_et = float(stage2_et.predict_proba(X_imp)[:, 1][0])
+                p_sub_tree = 0.55 * p_sub_rf + 0.45 * p_sub_et
+            else:
+                p_sub_tree = p_sub_rf
+            p_sub_raw = alpha_stage2 * p_sub_raw + (1.0 - alpha_stage2) * p_sub_tree
+        logit_sub = np.log(p_sub_raw / max(1e-9, 1.0 - p_sub_raw))
+        p_sub_finish = 1.0 / (1.0 + np.exp(-(logit_sub / max(0.35, temp_fin))))
+        p_sub_finish = float(_apply_binary_threshold_warp(p_sub_finish, sub_thr))
+        p_sub_finish = float(np.clip(p_sub_finish, 1e-4, 1.0 - 1e-4))
+
+        ml_probs = _normalize_method_probs({
+            "Decision": 1.0 - p_finish,
+            "KO/TKO": p_finish * (1.0 - p_sub_finish),
+            "Submission": p_finish * p_sub_finish,
+        })
+
+        if direct_hgb is not None and direct_rf is not None and direct_classes:
+            p_h = direct_hgb.predict_proba(X_imp)[0]
+            p_r = direct_rf.predict_proba(X_imp)[0]
+            p_e = direct_et.predict_proba(X_imp)[0] if direct_et is not None else p_r
+            direct_raw = {}
+            for i, cls in enumerate(direct_classes):
+                tree_mix = 0.55 * float(p_r[i]) + 0.45 * float(p_e[i])
+                direct_raw[str(cls)] = beta_direct * float(p_h[i]) + (1.0 - beta_direct) * tree_mix
+            direct_probs = _normalize_method_probs(direct_raw)
+            ml_probs = _normalize_method_probs({
+                m: alpha_direct * ml_probs[m] + (1.0 - alpha_direct) * direct_probs[m]
+                for m in METHOD_LABELS
+            })
+        if ovr_models:
+            ovr_raw = {}
+            for m in METHOD_LABELS:
+                mdl = ovr_models.get(m)
+                if mdl is None:
+                    ovr_raw[m] = 1.0 / 3.0
+                else:
+                    ovr_raw[m] = float(mdl.predict_proba(X_imp)[:, 1][0])
+            ovr_probs = _normalize_method_probs(ovr_raw)
+            ml_probs = _normalize_method_probs({
+                m: alpha_ovr * ml_probs[m] + (1.0 - alpha_ovr) * ovr_probs[m]
+                for m in METHOD_LABELS
+            })
+        if simple_method is not None:
+            p_s = simple_method.predict_proba(X_imp)[0]
+            cls_map_s = {str(c): i for i, c in enumerate(simple_method.classes_)}
+            simple_raw = {}
+            for m in METHOD_LABELS:
+                simple_raw[m] = float(p_s[cls_map_s[m]]) if m in cls_map_s else (1.0 / 3.0)
+            simple_probs = _normalize_method_probs(simple_raw)
+            ml_probs = _normalize_method_probs({
+                m: alpha_simple * ml_probs[m] + (1.0 - alpha_simple) * simple_probs[m]
+                for m in METHOD_LABELS
+            })
 
         winner_profile = winner_profile or {}
         loser_profile = loser_profile or {}
-        _ = winner_profile
-        _ = loser_profile
-        _ = weight_class
-        _ = gender
+        hist_probs = _normalize_method_probs({
+            "Decision": 0.62 * float(winner_profile.get("win_decision", 0.50)) + 0.38 * float(loser_profile.get("loss_decision", 0.45)),
+            "KO/TKO": 0.62 * float(winner_profile.get("win_ko_tko", 0.32)) + 0.38 * float(loser_profile.get("loss_ko_tko", 0.35)),
+            "Submission": 0.62 * float(winner_profile.get("win_submission", 0.18)) + 0.38 * float(loser_profile.get("loss_submission", 0.20)),
+        })
 
+        group_priors = self.method_bundle.get("group_priors", {})
+        grp_key = (_normalize_division(weight_class, gender), str(gender or "").strip().lower() or "unknown")
+        grp_probs = group_priors.get(grp_key, group_priors.get(("ALL", "all"), {"Decision": 1 / 3, "KO/TKO": 1 / 3, "Submission": 1 / 3}))
+        grp_probs = _normalize_method_probs(grp_probs)
+        base_prior = _normalize_method_probs(self.method_bundle.get("base_prior", group_priors.get(("ALL", "all"), {"Decision": 1 / 3, "KO/TKO": 1 / 3, "Submission": 1 / 3})))
+        sub_arr = _sub_attempt_prior_array(X)[0]
+        sub_prior = _normalize_method_probs({
+            "Decision": float(sub_arr[0]),
+            "KO/TKO": float(sub_arr[1]),
+            "Submission": float(sub_arr[2]),
+        })
+
+        w_hist = float(self.method_bundle.get("w_hist", 0.25))
+        w_group = float(self.method_bundle.get("w_group", 0.10))
+        w_base = float(self.method_bundle.get("w_base", 0.0))
+        w_subsig = float(self.method_bundle.get("w_subsig", 0.10))
+        w_ml = max(0.0, 1.0 - w_hist - w_group - w_base - w_subsig)
+        blended = {
+            m: (
+                w_ml * ml_probs[m]
+                + w_hist * hist_probs[m]
+                + w_group * grp_probs[m]
+                + w_base * base_prior[m]
+                + w_subsig * sub_prior[m]
+            )
+            for m in METHOD_LABELS
+        }
+        blended = _normalize_method_probs(blended)
+        method_bias_map = {
+            "Decision": float(self.method_bundle.get("method_bias_decision", 0.0)),
+            "KO/TKO": float(self.method_bundle.get("method_bias_ko_tko", 0.0)),
+            "Submission": float(self.method_bundle.get("method_bias_submission", 0.0)),
+        }
+        blended = _apply_method_logit_bias_map(blended, method_bias_map)
+        blended = _apply_submission_signal_boost_map(
+            blended, float(sub_prior["Submission"]), float(self.method_bundle.get("sub_boost_k", 0.0))
+        )
         meta_model = self.method_bundle.get("meta_model")
-        use_stacked_for_production = bool(self.method_bundle.get("use_stacked_for_production", True))
-        if meta_model is None or not use_stacked_for_production:
-            out = {
-                "Decision": float(direct_arr[0, 0]),
-                "KO/TKO": float(direct_arr[0, 1]),
-                "Submission": float(direct_arr[0, 2]),
-            }
-            return _normalize_method_probs(out)
-
-        winner_conf = float(abs(pd.to_numeric(X["d_glicko_win_prob"], errors="coerce").fillna(0.0).iloc[0])) if "d_glicko_win_prob" in X else 0.0
-        rounds_v = float(pd.to_numeric(X["total_rounds"], errors="coerce").fillna(3.0).iloc[0]) if "total_rounds" in X else 3.0
-        title_v = float(pd.to_numeric(X["is_title"], errors="coerce").fillna(0.0).iloc[0]) if "is_title" in X else 0.0
-        direct_conf = float(np.max(direct_arr[0]))
-        direct_entropy = float(-np.sum(direct_arr[0] * np.log(np.clip(direct_arr[0], 1e-9, 1.0))))
-        stage_finish_prob = float(p_finish[0])
-        direct_finish_prob = float(direct_arr[0, 1] + direct_arr[0, 2])
-        stage_direct_finish_disagree = float(abs(stage_finish_prob - direct_finish_prob))
-        stage2_direct_sub_disagree = float(abs(float(p_sub_finish[0]) - float(direct_arr[0, 2])))
-        X_meta = np.array([[
-            float(direct_arr[0, 0]), float(direct_arr[0, 1]), float(direct_arr[0, 2]),
-            float(p_finish[0]), float(p_sub_finish[0]),
-            winner_conf, rounds_v, title_v,
-            direct_conf, direct_entropy,
-            stage_direct_finish_disagree, stage2_direct_sub_disagree,
-        ]], dtype=float)
-        pm = meta_model.predict_proba(X_meta)[0]
-        meta_classes = getattr(meta_model, "classes_", None)
-        if meta_classes is None and hasattr(meta_model, "named_steps"):
-            meta_classes = getattr(meta_model.named_steps.get("logreg"), "classes_", [])
-        cls_map_meta = {str(c): i for i, c in enumerate(meta_classes)}
-        raw = {}
-        for m in METHOD_LABELS:
-            raw[m] = float(pm[cls_map_meta[m]]) if m in cls_map_meta else (1.0 / 3.0)
-        return _normalize_method_probs(raw)
+        meta_eta = float(self.method_bundle.get("meta_eta", 0.0))
+        if meta_model is not None and meta_eta > 0.0:
+            arr_blend = np.array([[blended["Decision"], blended["KO/TKO"], blended["Submission"]]], dtype=float)
+            arr_hist = np.array([[hist_probs["Decision"], hist_probs["KO/TKO"], hist_probs["Submission"]]], dtype=float)
+            arr_grp = np.array([[grp_probs["Decision"], grp_probs["KO/TKO"], grp_probs["Submission"]]], dtype=float)
+            arr_bp = np.array([[base_prior["Decision"], base_prior["KO/TKO"], base_prior["Submission"]]], dtype=float)
+            X_meta = np.hstack([arr_blend, arr_hist, arr_grp, arr_bp, np.log(np.clip(arr_blend, 1e-6, 1.0))])
+            pm = meta_model.predict_proba(X_meta)[0]
+            cls_map = {str(c): i for i, c in enumerate(meta_model.classes_)}
+            raw = {}
+            for m in METHOD_LABELS:
+                raw[m] = float(pm[cls_map[m]]) if m in cls_map else (1.0 / 3.0)
+            p_meta = _normalize_method_probs(raw)
+            blended = _normalize_method_probs({
+                m: (1.0 - meta_eta) * blended[m] + meta_eta * p_meta[m]
+                for m in METHOD_LABELS
+            })
+        return blended
 
 
 class UFCSuperModelPipeline:
@@ -4075,136 +4160,177 @@ class UFCSuperModelPipeline:
                 X_m_tr_imp = pd.DataFrame(method_imputer.fit_transform(X_m_tr), columns=method_columns)
                 X_m_va_imp = pd.DataFrame(method_imputer.transform(X_m_va), columns=method_columns)
 
-                # Simplified learned method system:
-                # stage1 Finish/Decision + stage2 KO/Sub + direct multiclass + OOF-trained meta.
+                # Multi-model method ensemble: stage1 (Finish/Decision) + stage2 (KO/Sub)
+                # + direct multiclass + OVR heads + simple LR + tuned blending + meta calibrator.
+                y_bin_tr = (y_method_dev.iloc[tr_idx]["finish_bin"].values == "Finish").astype(int)
+                y_sub_tr = (y_method_dev.iloc[tr_idx]["finish_subtype"].values == "Submission").astype(int)
 
-                def _oversample_submission(X_in, y_in, ratio=1.0, seed=RANDOM_SEED):
-                    Xo = X_in.copy()
-                    yo = np.asarray(y_in, dtype=object).copy()
-                    r = float(max(1.0, ratio))
-                    if r <= 1.0 + 1e-12:
-                        return Xo, yo
-                    sub_mask = (yo == "Submission")
-                    n_sub = int(np.sum(sub_mask))
-                    if n_sub == 0:
-                        return Xo, yo
-                    n_add = int(round((r - 1.0) * n_sub))
-                    if n_add <= 0:
-                        return Xo, yo
-                    rng_local = np.random.default_rng(int(seed) + 913)
-                    sub_idx = np.where(sub_mask)[0]
-                    add_idx = rng_local.choice(sub_idx, size=n_add, replace=True)
-                    X_add = Xo.iloc[add_idx].reset_index(drop=True)
-                    y_add = yo[add_idx]
-                    X_aug = pd.concat([Xo, X_add], ignore_index=True)
-                    y_aug = np.concatenate([yo, y_add], axis=0)
-                    return X_aug, y_aug
+                # Weighted objectives for class imbalance.
+                w_time = _time_weights(len(X_m_tr_imp), floor=0.45)
+                p_finish = max(1e-6, float(np.mean(y_bin_tr)))
+                finish_w = np.where(y_bin_tr == 1, 0.5 / p_finish, 0.5 / max(1e-6, 1.0 - p_finish))
+                w_stage1 = w_time * finish_w
 
-                def _fit_components(
-                    X_fit, y_df_fit, seed,
-                    sub_weight_mult=METHOD_DEFAULT_SUBMISSION_CLASS_WEIGHT,
-                    sub_oversample_ratio=METHOD_DEFAULT_SUBMISSION_OVERSAMPLE_RATIO,
-                    use_catboost_direct=True,
+                stage1 = HistGradientBoostingClassifier(
+                    loss="log_loss",
+                    max_iter=360, learning_rate=0.045, max_depth=6,
+                    max_leaf_nodes=31, min_samples_leaf=16, l2_regularization=0.8,
+                    random_state=RANDOM_SEED + 808,
+                )
+                stage1.fit(X_m_tr_imp, y_bin_tr, sample_weight=w_stage1)
+                stage1_rf = RandomForestClassifier(
+                    n_estimators=420, max_depth=10, min_samples_leaf=4,
+                    max_features=0.7, random_state=RANDOM_SEED + 910, n_jobs=-1,
+                    class_weight="balanced_subsample",
+                )
+                stage1_rf.fit(X_m_tr_imp, y_bin_tr)
+                stage1_et = ExtraTreesClassifier(
+                    n_estimators=560, max_depth=12, min_samples_leaf=3,
+                    max_features=0.72, random_state=RANDOM_SEED + 914, n_jobs=-1,
+                    class_weight="balanced_subsample",
+                )
+                stage1_et.fit(X_m_tr_imp, y_bin_tr)
+
+                finish_tr_mask = (y_method_dev.iloc[tr_idx]["finish_bin"].values == "Finish")
+                if int(np.sum(finish_tr_mask)) < 60:
+                    finish_tr_mask = np.ones(len(tr_idx), dtype=bool)
+                X2_tr = X_m_tr_imp.iloc[np.where(finish_tr_mask)[0]].reset_index(drop=True)
+                y2_tr = y_sub_tr[np.where(finish_tr_mask)[0]]
+                p_sub = max(1e-6, float(np.mean(y2_tr))) if len(y2_tr) > 0 else 0.5
+                w2 = np.where(y2_tr == 1, 0.5 / p_sub, 0.5 / max(1e-6, 1.0 - p_sub))
+
+                stage2 = HistGradientBoostingClassifier(
+                    loss="log_loss",
+                    max_iter=320, learning_rate=0.05, max_depth=5,
+                    max_leaf_nodes=31, min_samples_leaf=14, l2_regularization=0.7,
+                    random_state=RANDOM_SEED + 809,
+                )
+                stage2.fit(X2_tr, y2_tr, sample_weight=w2)
+                stage2_rf = RandomForestClassifier(
+                    n_estimators=360, max_depth=9, min_samples_leaf=3,
+                    max_features=0.7, random_state=RANDOM_SEED + 911, n_jobs=-1,
+                    class_weight="balanced_subsample",
+                )
+                stage2_rf.fit(X2_tr, y2_tr)
+                stage2_et = ExtraTreesClassifier(
+                    n_estimators=520, max_depth=11, min_samples_leaf=3,
+                    max_features=0.72, random_state=RANDOM_SEED + 915, n_jobs=-1,
+                    class_weight="balanced_subsample",
+                )
+                stage2_et.fit(X2_tr, y2_tr)
+
+                # Direct multiclass head to reduce collapse to Decision.
+                y_cls_tr = y_method_dev.iloc[tr_idx]["coarse"].values
+                cls_counts = pd.Series(y_cls_tr).value_counts()
+                cls_w = {k: (len(y_cls_tr) / (len(cls_counts) * max(1, v))) for k, v in cls_counts.items()}
+                w_cls = np.array([cls_w.get(lbl, 1.0) for lbl in y_cls_tr], dtype=float)
+                w_direct = w_time * w_cls
+                direct_hgb = HistGradientBoostingClassifier(
+                    loss="log_loss",
+                    max_iter=300, learning_rate=0.05, max_depth=6,
+                    max_leaf_nodes=31, min_samples_leaf=14, l2_regularization=0.7,
+                    random_state=RANDOM_SEED + 912,
+                )
+                direct_hgb.fit(X_m_tr_imp, y_cls_tr, sample_weight=w_direct)
+                direct_rf = RandomForestClassifier(
+                    n_estimators=520, max_depth=11, min_samples_leaf=3,
+                    max_features=0.72, random_state=RANDOM_SEED + 913, n_jobs=-1,
+                    class_weight="balanced_subsample",
+                )
+                direct_rf.fit(X_m_tr_imp, y_cls_tr)
+                direct_et = ExtraTreesClassifier(
+                    n_estimators=680, max_depth=13, min_samples_leaf=3,
+                    max_features=0.72, random_state=RANDOM_SEED + 916, n_jobs=-1,
+                    class_weight="balanced_subsample",
+                )
+                direct_et.fit(X_m_tr_imp, y_cls_tr)
+                direct_classes = [str(c) for c in direct_hgb.classes_]
+
+                # OVR method head (one binary model per method class).
+                ovr_models = {}
+                for j, lbl in enumerate(METHOD_LABELS):
+                    y_ovr = (pd.Series(y_cls_tr).astype(str).values == lbl).astype(int)
+                    p_pos = max(1e-6, float(np.mean(y_ovr)))
+                    w_ovr = w_time * np.where(y_ovr == 1, 0.5 / p_pos, 0.5 / max(1e-6, 1.0 - p_pos))
+                    mdl = HistGradientBoostingClassifier(
+                        loss="log_loss",
+                        max_iter=260, learning_rate=0.05, max_depth=5,
+                        max_leaf_nodes=31, min_samples_leaf=14, l2_regularization=0.8,
+                        random_state=RANDOM_SEED + 1500 + j,
+                    )
+                    mdl.fit(X_m_tr_imp, y_ovr, sample_weight=w_ovr)
+                    ovr_models[lbl] = mdl
+                simple_method = LogisticRegression(
+                    max_iter=8000, C=0.8, solver="saga", tol=1e-3, n_jobs=-1,
+                    class_weight="balanced", random_state=RANDOM_SEED + 1601,
+                )
+                simple_method.fit(X_m_tr_imp, pd.Series(y_cls_tr).astype(str).values)
+
+                def _stage_probs(
+                    X_imp, temp_dec=1.0, temp_fin=1.0, alpha1=0.75, alpha2=0.75,
+                    bias_finish=0.0, bias_sub=0.0, alpha_direct=0.85, beta_direct=0.70,
+                    alpha_ovr=0.85, finish_thr=0.50, sub_thr=0.50, alpha_simple=0.80
                 ):
-                    y_bin_fit = (y_df_fit["finish_bin"].astype(str).values == "Finish").astype(int)
-                    y_sub_fit = (y_df_fit["finish_subtype"].astype(str).values == "Submission").astype(int)
-                    y_cls_fit = y_df_fit["coarse"].astype(str).values
+                    p_finish_hist = stage1.predict_proba(X_imp)[:, 1]
+                    p_finish_rf = stage1_rf.predict_proba(X_imp)[:, 1]
+                    p_finish_et = stage1_et.predict_proba(X_imp)[:, 1]
+                    p_finish_tree = 0.55 * p_finish_rf + 0.45 * p_finish_et
+                    p_finish_raw = alpha1 * p_finish_hist + (1.0 - alpha1) * p_finish_tree
+                    logit = np.log(np.clip(p_finish_raw, 1e-6, 1 - 1e-6) / np.clip(1.0 - p_finish_raw, 1e-6, 1 - 1e-6))
+                    p_finish_c = 1.0 / (1.0 + np.exp(-((logit / max(0.35, float(temp_dec))) + float(bias_finish))))
+                    p_finish_c = _apply_binary_threshold_warp(p_finish_c, finish_thr)
 
-                    p_finish_fit = max(1e-6, float(np.mean(y_bin_fit)))
-                    w_stage1 = _time_weights(len(X_fit), floor=0.45) * np.where(
-                        y_bin_fit == 1, 0.5 / p_finish_fit, 0.5 / max(1e-6, 1.0 - p_finish_fit)
-                    )
-                    stage1_fit = HistGradientBoostingClassifier(
-                        loss="log_loss", max_iter=360, learning_rate=0.045, max_depth=6,
-                        max_leaf_nodes=31, min_samples_leaf=16, l2_regularization=0.8,
-                        random_state=seed + 101,
-                    )
-                    stage1_fit.fit(X_fit, y_bin_fit, sample_weight=w_stage1)
+                    p_sub_hist = stage2.predict_proba(X_imp)[:, 1]
+                    p_sub_rf = stage2_rf.predict_proba(X_imp)[:, 1]
+                    p_sub_et = stage2_et.predict_proba(X_imp)[:, 1]
+                    p_sub_tree = 0.55 * p_sub_rf + 0.45 * p_sub_et
+                    p_sub_raw = alpha2 * p_sub_hist + (1.0 - alpha2) * p_sub_tree
+                    logit2 = np.log(np.clip(p_sub_raw, 1e-6, 1 - 1e-6) / np.clip(1.0 - p_sub_raw, 1e-6, 1 - 1e-6))
+                    p_sub_c = 1.0 / (1.0 + np.exp(-((logit2 / max(0.35, float(temp_fin))) + float(bias_sub))))
+                    p_sub_c = _apply_binary_threshold_warp(p_sub_c, sub_thr)
 
-                    finish_mask_fit = (y_df_fit["finish_bin"].astype(str).values == "Finish")
-                    if int(np.sum(finish_mask_fit)) < 40:
-                        finish_mask_fit = np.ones(len(y_df_fit), dtype=bool)
-                    X2 = X_fit.iloc[np.where(finish_mask_fit)[0]].reset_index(drop=True)
-                    y2 = y_sub_fit[np.where(finish_mask_fit)[0]]
-                    p_sub_fit = max(1e-6, float(np.mean(y2))) if len(y2) > 0 else 0.5
-                    w2 = np.where(y2 == 1, 0.5 / p_sub_fit, 0.5 / max(1e-6, 1.0 - p_sub_fit))
-                    stage2_fit = HistGradientBoostingClassifier(
-                        loss="log_loss", max_iter=320, learning_rate=0.05, max_depth=5,
-                        max_leaf_nodes=31, min_samples_leaf=14, l2_regularization=0.7,
-                        random_state=seed + 102,
-                    )
-                    stage2_fit.fit(X2, y2, sample_weight=w2)
-
-                    Xd, yd = _oversample_submission(
-                        X_fit, y_cls_fit, ratio=float(sub_oversample_ratio), seed=seed
-                    )
-                    cls_counts_fit = pd.Series(yd).value_counts()
-                    cls_w_fit = {
-                        k: (len(yd) / (len(cls_counts_fit) * max(1, v)))
-                        for k, v in cls_counts_fit.items()
-                    }
-                    cls_w_fit["Submission"] = float(cls_w_fit.get("Submission", 1.0)) * float(sub_weight_mult)
-                    w_dir = np.array([cls_w_fit.get(lbl, 1.0) for lbl in yd], dtype=float)
-                    if use_catboost_direct and cb is not None:
-                        direct_fit = cb.CatBoostClassifier(
-                            loss_function="MultiClass", eval_metric="MultiClass",
-                            iterations=420, learning_rate=0.05, depth=6, l2_leaf_reg=3.0,
-                            random_seed=seed + 103, verbose=0,
-                        )
-                        direct_fit.fit(Xd, yd, sample_weight=w_dir)
-                    else:
-                        direct_fit = HistGradientBoostingClassifier(
-                            loss="log_loss", max_iter=360, learning_rate=0.05, max_depth=6,
-                            max_leaf_nodes=31, min_samples_leaf=14, l2_regularization=0.7,
-                            random_state=seed + 103,
-                        )
-                        direct_fit.fit(Xd, yd, sample_weight=w_dir)
-                    return {
-                        "stage1": stage1_fit,
-                        "stage2": stage2_fit,
-                        "direct_model": direct_fit,
-                        "direct_classes": [str(c) for c in direct_fit.classes_],
-                    }
-
-                def _component_probs(comp, X_eval):
-                    p_finish = np.clip(comp["stage1"].predict_proba(X_eval)[:, 1], 1e-6, 1.0 - 1e-6)
-                    p_sub = np.clip(comp["stage2"].predict_proba(X_eval)[:, 1], 1e-6, 1.0 - 1e-6)
-                    hier = np.column_stack([
-                        1.0 - p_finish,
-                        p_finish * (1.0 - p_sub),
-                        p_finish * p_sub,
-                    ])
-                    hier = np.clip(hier, MIN_METHOD_PROB, 1.0)
-                    hier = hier / np.sum(hier, axis=1, keepdims=True)
-                    p_dir = comp["direct_model"].predict_proba(X_eval)
-                    cls_map = {str(c): i for i, c in enumerate(comp["direct_model"].classes_)}
-                    direct = np.zeros((len(X_eval), 3), dtype=float)
+                    probs = pd.DataFrame({
+                        "Decision": 1.0 - p_finish_c,
+                        "KO/TKO": p_finish_c * (1.0 - p_sub_c),
+                        "Submission": p_finish_c * p_sub_c,
+                    })
+                    probs = probs.apply(lambda s: np.clip(s, MIN_METHOD_PROB, 1.0), axis=0)
+                    probs = probs.div(probs.sum(axis=1), axis=0)
+                    p_h = direct_hgb.predict_proba(X_imp)
+                    p_r = direct_rf.predict_proba(X_imp)
+                    p_e = direct_et.predict_proba(X_imp)
+                    direct_rows = []
+                    for row_idx in range(len(X_imp)):
+                        raw = {}
+                        for j, cls in enumerate(direct_classes):
+                            tree_mix = 0.55 * float(p_r[row_idx][j]) + 0.45 * float(p_e[row_idx][j])
+                            raw[cls] = beta_direct * float(p_h[row_idx][j]) + (1.0 - beta_direct) * tree_mix
+                        direct_rows.append(_normalize_method_probs(raw))
+                    direct_df = pd.DataFrame(direct_rows)[METHOD_LABELS]
+                    probs = alpha_direct * probs[METHOD_LABELS] + (1.0 - alpha_direct) * direct_df
+                    probs = probs.apply(lambda s: np.clip(s, MIN_METHOD_PROB, 1.0), axis=0)
+                    probs = probs.div(probs.sum(axis=1), axis=0)
+                    ovr_arr = np.zeros((len(X_imp), len(METHOD_LABELS)), dtype=float)
+                    for k, lbl in enumerate(METHOD_LABELS):
+                        ovr_arr[:, k] = ovr_models[lbl].predict_proba(X_imp)[:, 1]
+                    ovr_arr = np.clip(ovr_arr, MIN_METHOD_PROB, 1.0)
+                    ovr_arr = ovr_arr / np.sum(ovr_arr, axis=1, keepdims=True)
+                    ovr_df = pd.DataFrame(ovr_arr, columns=METHOD_LABELS)
+                    probs = alpha_ovr * probs[METHOD_LABELS] + (1.0 - alpha_ovr) * ovr_df
+                    probs = probs.apply(lambda s: np.clip(s, MIN_METHOD_PROB, 1.0), axis=0)
+                    probs = probs.div(probs.sum(axis=1), axis=0)
+                    p_s = simple_method.predict_proba(X_imp)
+                    cls_map_s = {str(c): i for i, c in enumerate(simple_method.classes_)}
+                    simple_arr = np.zeros((len(X_imp), len(METHOD_LABELS)), dtype=float)
                     for j, m in enumerate(METHOD_LABELS):
-                        direct[:, j] = p_dir[:, cls_map[m]] if m in cls_map else (1.0 / 3.0)
-                    direct = np.clip(direct, MIN_METHOD_PROB, 1.0)
-                    direct = direct / np.sum(direct, axis=1, keepdims=True)
-                    return p_finish, p_sub, hier, direct
-
-                def _build_meta_features(p_finish, p_sub, direct, X_raw):
-                    Xr = X_raw.reset_index(drop=True)
-                    winner_conf = (
-                        np.abs(pd.to_numeric(Xr.get("d_glicko_win_prob", pd.Series(np.zeros(len(Xr)))), errors="coerce").fillna(0.0).values)
-                    )
-                    rounds_v = pd.to_numeric(Xr.get("total_rounds", pd.Series(np.full(len(Xr), 3.0))), errors="coerce").fillna(3.0).values
-                    title_v = pd.to_numeric(Xr.get("is_title", pd.Series(np.zeros(len(Xr)))), errors="coerce").fillna(0.0).values
-                    direct_conf = np.max(direct, axis=1)
-                    direct_entropy = -np.sum(direct * np.log(np.clip(direct, 1e-9, 1.0)), axis=1)
-                    stage_finish = p_finish
-                    direct_finish = direct[:, 1] + direct[:, 2]
-                    finish_disagree = np.abs(stage_finish - direct_finish)
-                    sub_disagree = np.abs(p_sub - direct[:, 2])
-                    return np.column_stack([
-                        direct,
-                        p_finish, p_sub,
-                        winner_conf, rounds_v, title_v,
-                        direct_conf, direct_entropy,
-                        finish_disagree, sub_disagree,
-                    ])
+                        simple_arr[:, j] = p_s[:, cls_map_s[m]] if m in cls_map_s else (1.0 / 3.0)
+                    simple_arr = np.clip(simple_arr, MIN_METHOD_PROB, 1.0)
+                    simple_arr = simple_arr / np.sum(simple_arr, axis=1, keepdims=True)
+                    simple_df = pd.DataFrame(simple_arr, columns=METHOD_LABELS)
+                    probs = alpha_simple * probs[METHOD_LABELS] + (1.0 - alpha_simple) * simple_df
+                    probs = probs.apply(lambda s: np.clip(s, MIN_METHOD_PROB, 1.0), axis=0)
+                    probs = probs.div(probs.sum(axis=1), axis=0)
+                    return probs
 
                 # Group priors (weight class + gender adapters) from method-train split.
                 grp_train = meta_dev_valid.iloc[tr_idx].reset_index(drop=True)
@@ -4249,11 +4375,19 @@ class UFCSuperModelPipeline:
                         out[i, 2] = float(p["Submission"])
                     return out
 
-                y_va_true = y_method_dev.iloc[va_idx]["coarse"].astype(str).values
-                winner_correct_va = (y_dev_pred_valid[va_idx] == y_dev_true_valid[va_idx])
+                # Tune calibration + blend weights by primary metric.
+                y_va_true = y_method_dev.iloc[va_idx]["coarse"].values
+                winner_correct_va = (
+                    y_dev_pred_valid[va_idx] == y_dev_true_valid[va_idx]
+                )
                 label_to_idx = {m: i for i, m in enumerate(METHOD_LABELS)}
                 y_va_idx = np.array([label_to_idx.get(str(lbl), 0) for lbl in y_va_true], dtype=int)
                 hist_arr = _history_prior_array(X_m_va)
+                hist_arr_tr = _history_prior_array(X_m_tr)
+                sub_arr = _sub_attempt_prior_array(X_m_va)
+                sub_arr_tr = _sub_attempt_prior_array(X_m_tr)
+                va_local_idx = np.arange(len(y_va_idx), dtype=int)
+                va_chunks = [c for c in np.array_split(va_local_idx, 3) if len(c) > 0]
                 meta_va = meta_dev_valid.iloc[va_idx].reset_index(drop=True)
                 grp_arr = np.zeros((len(meta_va), 3), dtype=float)
                 for i in range(len(meta_va)):
@@ -4272,360 +4406,288 @@ class UFCSuperModelPipeline:
                     grp_arr_tr[i, 0] = float(gp["Decision"])
                     grp_arr_tr[i, 1] = float(gp["KO/TKO"])
                     grp_arr_tr[i, 2] = float(gp["Submission"])
-                va_local_idx = np.arange(len(y_va_idx), dtype=int)
-                va_chunks = [c for c in np.array_split(va_local_idx, 3) if len(c) > 0]
-
-                def _score_metrics(y_true_s, pred_s, direct_dec_recall_ref=None):
-                    p_arr_s, r_arr_s, f1_arr_s, _ = precision_recall_fscore_support(
-                        y_true_s, pred_s, labels=METHOD_LABELS, zero_division=0
-                    )
-                    macro_f1_s = float(np.mean(f1_arr_s))
-                    sub_rec_s = float(r_arr_s[2]) if len(r_arr_s) > 2 else 0.0
-                    ko_rec_s = float(r_arr_s[1]) if len(r_arr_s) > 1 else 0.0
-                    dec_rec_s = float(r_arr_s[0]) if len(r_arr_s) > 0 else 0.0
-                    score_s = 0.60 * macro_f1_s + 0.20 * sub_rec_s + 0.20 * ko_rec_s
-                    true_counts = pd.Series(y_true_s).value_counts()
-                    pred_counts = pd.Series(pred_s).value_counts()
-                    true_sub_rate = float(true_counts.get("Submission", 0.0) / max(1, len(y_true_s)))
-                    pred_sub_rate = float(pred_counts.get("Submission", 0.0) / max(1, len(pred_s)))
-                    true_dec_rate = float(true_counts.get("Decision", 0.0) / max(1, len(y_true_s)))
-                    pred_dec_rate = float(pred_counts.get("Decision", 0.0) / max(1, len(pred_s)))
-                    over_sub_pen = max(0.0, pred_sub_rate - true_sub_rate - 0.02)
-                    under_dec_pen = max(0.0, true_dec_rate - pred_dec_rate - 0.02)
-                    dec_drop_pen = 0.0
-                    if direct_dec_recall_ref is not None:
-                        dec_drop_pen = max(0.0, float(direct_dec_recall_ref) - dec_rec_s - 0.02)
-                    score_s -= 0.35 * over_sub_pen + 0.35 * under_dec_pen + 0.35 * dec_drop_pen
-                    rates = {
-                        "true_sub_rate": true_sub_rate,
-                        "pred_sub_rate": pred_sub_rate,
-                        "true_dec_rate": true_dec_rate,
-                        "pred_dec_rate": pred_dec_rate,
-                    }
-                    return score_s, p_arr_s, r_arr_s, f1_arr_s, macro_f1_s, rates
-
-                def _fit_meta_oof(
-                    X_imp_tr, X_raw_tr, y_df_tr,
-                    cfg_seed, cfg_sw, cfg_ratio, cfg_c,
-                    n_splits_override=None, use_catboost_direct=True,
-                ):
-                    ntr = len(X_imp_tr)
-                    n_splits = int(n_splits_override) if n_splits_override is not None else min(5, max(2, ntr // 250))
-                    tscv = TimeSeriesSplit(n_splits=n_splits)
-                    oof_rows = []
-                    oof_y = []
-                    for fold_i, (f_tr, f_va) in enumerate(tscv.split(np.arange(ntr)), start=1):
-                        comp_f = _fit_components(
-                            X_imp_tr.iloc[f_tr].reset_index(drop=True),
-                            y_df_tr.iloc[f_tr].reset_index(drop=True),
-                            seed=cfg_seed + fold_i * 31,
-                            sub_weight_mult=cfg_sw,
-                            sub_oversample_ratio=cfg_ratio,
-                            use_catboost_direct=use_catboost_direct,
-                        )
-                        pf, ps, _, direct = _component_probs(comp_f, X_imp_tr.iloc[f_va].reset_index(drop=True))
-                        X_meta_f = _build_meta_features(
-                            pf, ps, direct, X_raw_tr.iloc[f_va].reset_index(drop=True),
-                        )
-                        oof_rows.append(X_meta_f)
-                        oof_y.append(y_df_tr.iloc[f_va]["coarse"].astype(str).values)
-                    if not oof_rows:
-                        return None
-                    X_meta_oof = np.vstack(oof_rows)
-                    y_meta_oof = np.concatenate(oof_y, axis=0)
-                    meta_lr = Pipeline([
-                        ("scaler", StandardScaler()),
-                        ("logreg", LogisticRegression(
-                            max_iter=5000, C=float(cfg_c), solver="lbfgs",
-                            class_weight="balanced",
-                            random_state=cfg_seed + 777,
-                        )),
-                    ])
-                    meta_lr.fit(X_meta_oof, y_meta_oof)
-                    return meta_lr
 
                 best_cfg = None
-                best_comp = None
-                best_meta = None
-                tuning_grid = []
-                for cfg_sw in METHOD_SUBMISSION_CLASS_WEIGHTS:
-                    for cfg_ratio in METHOD_SUBMISSION_OVERSAMPLE_RATIOS:
-                        for cfg_c in (0.6, 1.0):
-                            tuning_grid.append((float(cfg_sw), float(cfg_ratio), float(cfg_c)))
-                tuning_trials = int(len(tuning_grid))
-                for _trial, (cfg_sw, cfg_ratio, cfg_c) in enumerate(tuning_grid):
-                    comp_tr = _fit_components(
-                        X_m_tr_imp, y_method_dev.iloc[tr_idx].reset_index(drop=True),
-                        seed=RANDOM_SEED + 3300 + _trial,
-                        sub_weight_mult=cfg_sw,
-                        sub_oversample_ratio=cfg_ratio,
-                        use_catboost_direct=False,
-                    )
-                    pf_va, ps_va, _, direct_va = _component_probs(comp_tr, X_m_va_imp)
-                    direct_idx = np.argmax(direct_va, axis=1)
-                    if int(np.sum(winner_correct_va)) > 0:
-                        y_sub_dir = y_va_true[winner_correct_va]
-                        p_sub_dir = np.array([METHOD_LABELS[i] for i in direct_idx[winner_correct_va]], dtype=object)
-                    else:
-                        y_sub_dir = y_va_true
-                        p_sub_dir = np.array([METHOD_LABELS[i] for i in direct_idx], dtype=object)
-                    direct_score, _, direct_r_arr, _, _, direct_rates = _score_metrics(y_sub_dir, p_sub_dir, direct_dec_recall_ref=None)
-                    direct_dec_recall = float(direct_r_arr[0]) if len(direct_r_arr) > 0 else 0.0
-                    if best_cfg is not None and direct_score < float(best_cfg.get("val_stacked_score", 0.0)) - 0.10:
+                rng = np.random.default_rng(RANDOM_SEED + 2026)
+                for _trial in range(int(max(40, METHOD_TUNING_TRIALS))):
+                    a1 = float(rng.choice([0.55, 0.70, 0.85]))
+                    a2 = float(rng.choice([0.55, 0.70, 0.85]))
+                    t_dec = float(rng.choice([0.7, 0.85, 1.0, 1.15, 1.3]))
+                    t_fin = float(rng.choice([0.7, 0.85, 1.0, 1.15, 1.3]))
+                    b_fin = float(rng.choice([-0.35, -0.15, 0.0, 0.15, 0.35]))
+                    b_sub = float(rng.choice([-0.30, -0.10, 0.0, 0.10, 0.30]))
+                    fin_thr = float(rng.choice([0.42, 0.46, 0.50, 0.54, 0.58]))
+                    sub_thr = float(rng.choice([0.42, 0.46, 0.50, 0.54, 0.58]))
+                    a_dir = float(rng.choice([0.90, 0.96, 1.00]))
+                    b_dir = float(rng.choice([0.60, 0.75, 0.90]))
+                    a_ovr = float(rng.choice([0.90, 0.97, 1.00]))
+                    a_simple = float(rng.choice([0.65, 0.80, 0.95]))
+                    w_hist = float(rng.choice([0.00, 0.08, 0.15, 0.22, 0.30]))
+                    w_group = float(rng.choice([0.00, 0.04, 0.08, 0.12]))
+                    w_base = float(rng.choice([0.00, 0.06, 0.12, 0.18]))
+                    w_subsig = float(rng.choice([0.00, 0.06, 0.10, 0.14, 0.18]))
+                    sub_boost_k = float(rng.choice([0.0, 0.4, 0.8, 1.2, 1.6]))
+                    bias_dec = float(rng.choice([-0.05, 0.00, 0.10, 0.20, 0.30]))
+                    bias_ko = float(rng.choice([-0.25, -0.15, -0.05, 0.00, 0.05]))
+                    bias_sub = float(rng.choice([-0.20, -0.10, 0.00, 0.05, 0.10]))
+                    if w_hist + w_group + w_base + w_subsig >= 0.78:
                         continue
-                    meta_trained = _fit_meta_oof(
-                        X_m_tr_imp.reset_index(drop=True),
-                        X_m_tr.reset_index(drop=True),
-                        y_method_dev.iloc[tr_idx].reset_index(drop=True),
-                        cfg_seed=RANDOM_SEED + 8800 + _trial,
-                        cfg_sw=cfg_sw, cfg_ratio=cfg_ratio, cfg_c=cfg_c,
-                        n_splits_override=3,
-                        use_catboost_direct=False,
-                    )
-                    if meta_trained is None:
-                        continue
-                    X_meta_va = _build_meta_features(pf_va, ps_va, direct_va, X_m_va)
-                    pm = meta_trained.predict_proba(X_meta_va)
-                    cls_meta = getattr(meta_trained, "classes_", None)
-                    if cls_meta is None and hasattr(meta_trained, "named_steps"):
-                        cls_meta = getattr(meta_trained.named_steps.get("logreg"), "classes_", [])
-                    cls_map = {str(c): i for i, c in enumerate(cls_meta)}
-                    stacked_arr = np.zeros((len(X_meta_va), 3), dtype=float)
-                    for j, m in enumerate(METHOD_LABELS):
-                        stacked_arr[:, j] = pm[:, cls_map[m]] if m in cls_map else (1.0 / 3.0)
-                    stacked_arr = np.clip(stacked_arr, MIN_METHOD_PROB, 1.0)
-                    stacked_arr = stacked_arr / np.sum(stacked_arr, axis=1, keepdims=True)
-                    pred_idx = np.argmax(stacked_arr, axis=1)
+                    w_ml = 1.0 - w_hist - w_group - w_base - w_subsig
 
-                    if int(np.sum(winner_correct_va)) > 0:
-                        y_sub = y_va_true[winner_correct_va]
-                        p_sub = np.array([METHOD_LABELS[i] for i in pred_idx[winner_correct_va]], dtype=object)
-                    else:
-                        y_sub = y_va_true
-                        p_sub = np.array([METHOD_LABELS[i] for i in pred_idx], dtype=object)
-                    score, _, r_arr, _, macro_f1, rates = _score_metrics(
-                        y_sub, p_sub, direct_dec_recall_ref=direct_dec_recall
+                    ml_df = _stage_probs(
+                        X_m_va_imp, temp_dec=t_dec, temp_fin=t_fin,
+                        alpha1=a1, alpha2=a2, bias_finish=b_fin, bias_sub=b_sub,
+                        alpha_direct=a_dir, beta_direct=b_dir, alpha_ovr=a_ovr,
+                        finish_thr=fin_thr, sub_thr=sub_thr, alpha_simple=a_simple
                     )
-                    pred_share = np.bincount(np.argmax(stacked_arr[winner_correct_va], axis=1) if int(np.sum(winner_correct_va)) > 0 else pred_idx, minlength=3).astype(float)
-                    pred_share = pred_share / max(1.0, float(np.sum(pred_share)))
-                    true_share = np.bincount(
-                        np.array([label_to_idx[v] for v in y_sub], dtype=int),
-                        minlength=3,
-                    ).astype(float)
-                    true_share = true_share / max(1.0, float(np.sum(true_share)))
+                    ml_arr = ml_df[["Decision", "KO/TKO", "Submission"]].to_numpy(dtype=float)
+                    base_arr = np.tile(
+                        np.array([[base_prior["Decision"], base_prior["KO/TKO"], base_prior["Submission"]]], dtype=float),
+                        (len(ml_arr), 1)
+                    )
+                    probs_arr = w_ml * ml_arr + w_hist * hist_arr + w_group * grp_arr + w_base * base_arr + w_subsig * sub_arr
+                    probs_arr = np.clip(probs_arr, MIN_METHOD_PROB, 1.0)
+                    probs_arr = probs_arr / np.sum(probs_arr, axis=1, keepdims=True)
+                    probs_arr = _apply_method_logit_bias_arr(
+                        probs_arr,
+                        np.array([bias_dec, bias_ko, bias_sub], dtype=float)
+                    )
+                    probs_arr = _apply_submission_signal_boost_arr(probs_arr, sub_arr[:, 2], sub_boost_k)
+                    probs_arr = probs_arr / np.sum(probs_arr, axis=1, keepdims=True)
+                    pred_idx = np.argmax(probs_arr, axis=1)
+
+                    if int(np.sum(winner_correct_va)) == 0:
+                        score = float(np.mean(pred_idx == y_va_idx))
+                        baseline = float(pd.Series(y_va_true).value_counts().max() / len(y_va_true))
+                        macro_recall = score
+                        minority_recall = score
+                        pred_share = np.bincount(pred_idx, minlength=len(METHOD_LABELS)).astype(float)
+                        pred_share = pred_share / max(1.0, float(np.sum(pred_share)))
+                        true_share = np.bincount(y_va_idx, minlength=len(METHOD_LABELS)).astype(float)
+                        true_share = true_share / max(1.0, float(np.sum(true_share)))
+                    else:
+                        y_sub_idx = y_va_idx[winner_correct_va]
+                        pred_sub_idx = pred_idx[winner_correct_va]
+                        score = float(np.mean(pred_sub_idx == y_sub_idx))
+                        baseline = float(pd.Series(y_va_true[winner_correct_va]).value_counts().max() / len(y_sub_idx))
+                        recalls = []
+                        for cls_i in range(len(METHOD_LABELS)):
+                            mask_cls = (y_sub_idx == cls_i)
+                            if int(np.sum(mask_cls)) > 0:
+                                recalls.append(float(np.mean(pred_sub_idx[mask_cls] == cls_i)))
+                        macro_recall = float(np.mean(recalls)) if recalls else score
+                        minority_recall = float(np.mean(recalls[1:])) if len(recalls) >= 3 else macro_recall
+                        pred_share = np.bincount(pred_sub_idx, minlength=len(METHOD_LABELS)).astype(float)
+                        pred_share = pred_share / max(1.0, float(np.sum(pred_share)))
+                        true_share = np.bincount(y_sub_idx, minlength=len(METHOD_LABELS)).astype(float)
+                        true_share = true_share / max(1.0, float(np.sum(true_share)))
                     distribution_shift = float(np.sum(np.abs(pred_share - true_share)))
                     chunk_scores = []
                     for ch in va_chunks:
                         ch_wc = winner_correct_va[ch]
                         if int(np.sum(ch_wc)) > 0:
-                            y_ch = y_va_true[ch][ch_wc]
-                            p_ch = np.array([METHOD_LABELS[i] for i in pred_idx[ch][ch_wc]], dtype=object)
+                            chunk_scores.append(float(np.mean(pred_idx[ch][ch_wc] == y_va_idx[ch][ch_wc])))
                         else:
-                            y_ch = y_va_true[ch]
-                            p_ch = np.array([METHOD_LABELS[i] for i in pred_idx[ch]], dtype=object)
-                        s_ch, _, _, _, _, _ = _score_metrics(
-                            y_ch, p_ch, direct_dec_recall_ref=direct_dec_recall
-                        )
-                        chunk_scores.append(s_ch)
+                            chunk_scores.append(float(np.mean(pred_idx[ch] == y_va_idx[ch])))
                     robust_score = float(np.mean(chunk_scores)) - 0.60 * float(np.std(chunk_scores))
-                    objective = robust_score - 0.10 * distribution_shift
-                    key = (objective, robust_score, score, macro_f1, -distribution_shift)
+                    objective = robust_score + 0.04 * macro_recall + 0.02 * minority_recall - 0.10 * distribution_shift
+                    key = (objective, robust_score, score, minority_recall, -distribution_shift, -baseline)
                     if best_cfg is None or key > best_cfg["key"]:
                         best_cfg = {
-                            "key": key,
-                            "sub_weight_mult": cfg_sw,
-                            "sub_oversample_ratio": cfg_ratio,
-                            "meta_c": cfg_c,
-                            "val_metric": float(np.mean(p_sub == y_sub)),
-                            "val_baseline": float(pd.Series(y_sub).value_counts().max() / max(1, len(y_sub))),
-                            "val_stacked_score": score,
-                            "val_direct_score": direct_score,
-                            "val_stacked_acc_wc": float(np.mean(p_sub == y_sub)),
-                            "val_direct_acc_wc": float(np.mean(p_sub_dir == y_sub_dir)),
-                            "direct_dec_recall": direct_dec_recall,
-                            "macro_f1": macro_f1,
-                            "ko_recall": float(r_arr[1]) if len(r_arr) > 1 else 0.0,
-                            "submission_recall": float(r_arr[2]) if len(r_arr) > 2 else 0.0,
-                            "rates": rates,
-                            "direct_rates": direct_rates,
+                            "key": key, "t_dec": t_dec, "t_fin": t_fin,
+                            "bias_finish": b_fin, "bias_sub": b_sub,
+                            "finish_threshold": fin_thr, "sub_threshold": sub_thr,
+                            "w_hist": w_hist, "w_group": w_group, "w_base": w_base,
+                            "w_subsig": w_subsig,
+                            "sub_boost_k": sub_boost_k,
+                            "method_bias_decision": bias_dec,
+                            "method_bias_ko_tko": bias_ko,
+                            "method_bias_submission": bias_sub,
+                            "alpha_stage1": a1, "alpha_stage2": a2,
+                            "alpha_direct": a_dir, "beta_direct": b_dir,
+                            "alpha_ovr": a_ovr,
+                            "alpha_simple": a_simple,
+                            "val_metric": score, "val_baseline": baseline,
                         }
-                        best_comp = comp_tr
-                        best_meta = meta_trained
-
                 if best_cfg is None:
                     best_cfg = {
-                        "sub_weight_mult": METHOD_DEFAULT_SUBMISSION_CLASS_WEIGHT,
-                        "sub_oversample_ratio": METHOD_DEFAULT_SUBMISSION_OVERSAMPLE_RATIO,
-                        "meta_c": 0.8,
-                        "val_metric": float("nan"),
-                        "val_baseline": float("nan"),
-                        "val_stacked_score": float("nan"),
-                        "val_direct_score": float("nan"),
-                        "val_stacked_acc_wc": float("nan"),
-                        "val_direct_acc_wc": float("nan"),
-                        "direct_dec_recall": float("nan"),
-                        "rates": {},
-                        "direct_rates": {},
+                        "key": (0.0, 0.0, 0.0), "t_dec": 1.0, "t_fin": 1.0,
+                        "bias_finish": 0.0, "bias_sub": 0.0,
+                        "finish_threshold": 0.50, "sub_threshold": 0.50,
+                        "w_hist": 0.15, "w_group": 0.08, "w_base": 0.08, "w_subsig": 0.10,
+                        "sub_boost_k": 0.6,
+                        "method_bias_decision": 0.10,
+                        "method_bias_ko_tko": -0.10,
+                        "method_bias_submission": 0.00,
+                        "alpha_stage1": 0.75, "alpha_stage2": 0.75,
+                        "alpha_direct": 0.85, "beta_direct": 0.70,
+                        "alpha_ovr": 0.85,
+                        "alpha_simple": 0.80,
+                        "val_metric": float("nan"), "val_baseline": float("nan"),
                     }
-                    best_comp = _fit_components(
-                        X_m_tr_imp, y_method_dev.iloc[tr_idx].reset_index(drop=True),
-                        seed=RANDOM_SEED + 3300,
-                        sub_weight_mult=METHOD_DEFAULT_SUBMISSION_CLASS_WEIGHT,
-                        sub_oversample_ratio=METHOD_DEFAULT_SUBMISSION_OVERSAMPLE_RATIO,
-                        use_catboost_direct=False,
-                    )
-                    best_meta = _fit_meta_oof(
-                        X_m_tr_imp.reset_index(drop=True), X_m_tr.reset_index(drop=True),
-                        y_method_dev.iloc[tr_idx].reset_index(drop=True),
-                        cfg_seed=RANDOM_SEED + 8800,
-                        cfg_sw=METHOD_DEFAULT_SUBMISSION_CLASS_WEIGHT,
-                        cfg_ratio=METHOD_DEFAULT_SUBMISSION_OVERSAMPLE_RATIO,
-                        cfg_c=0.8,
-                        n_splits_override=3,
-                        use_catboost_direct=False,
-                    )
 
-                # Refit stack on full train+val (dev) with strict OOF meta for holdout.
-                comp_dev = _fit_components(
-                    pd.concat([X_m_tr_imp, X_m_va_imp], ignore_index=True),
-                    y_method_dev.reset_index(drop=True),
-                    seed=RANDOM_SEED + 9900,
-                    sub_weight_mult=best_cfg["sub_weight_mult"],
-                    sub_oversample_ratio=best_cfg["sub_oversample_ratio"],
-                    use_catboost_direct=True,
-                )
-                X_dev_imp_all = pd.concat([X_m_tr_imp, X_m_va_imp], ignore_index=True)
-                X_dev_raw_all = pd.concat([X_m_tr, X_m_va], ignore_index=True)
-                meta_dev_model = _fit_meta_oof(
-                    X_dev_imp_all, X_dev_raw_all, y_method_dev.reset_index(drop=True),
-                    cfg_seed=RANDOM_SEED + 12000,
-                    cfg_sw=best_cfg["sub_weight_mult"],
-                    cfg_ratio=best_cfg["sub_oversample_ratio"],
-                    cfg_c=best_cfg["meta_c"],
-                    n_splits_override=5,
-                    use_catboost_direct=True,
-                )
-                if meta_dev_model is None:
-                    meta_dev_model = best_meta
+                # Hard reset: keep only stable components that generalized better.
+                if METHOD_HARD_RESET:
+                    best_cfg["alpha_direct"] = 1.0
+                    best_cfg["alpha_ovr"] = 1.0
+                    best_cfg["alpha_simple"] = 1.0
+
+                # Meta calibrator over blended probabilities + priors.
+                meta_model = None
+                meta_eta = 0.0
+                try:
+                    ml_tr_df = _stage_probs(
+                        X_m_tr_imp,
+                        temp_dec=best_cfg["t_dec"], temp_fin=best_cfg["t_fin"],
+                        alpha1=best_cfg["alpha_stage1"], alpha2=best_cfg["alpha_stage2"],
+                        bias_finish=best_cfg["bias_finish"], bias_sub=best_cfg["bias_sub"],
+                        alpha_direct=best_cfg["alpha_direct"], beta_direct=best_cfg["beta_direct"],
+                        alpha_ovr=best_cfg["alpha_ovr"],
+                        finish_thr=best_cfg["finish_threshold"], sub_thr=best_cfg["sub_threshold"],
+                        alpha_simple=best_cfg["alpha_simple"],
+                    )
+                    ml_va_df = _stage_probs(
+                        X_m_va_imp,
+                        temp_dec=best_cfg["t_dec"], temp_fin=best_cfg["t_fin"],
+                        alpha1=best_cfg["alpha_stage1"], alpha2=best_cfg["alpha_stage2"],
+                        bias_finish=best_cfg["bias_finish"], bias_sub=best_cfg["bias_sub"],
+                        alpha_direct=best_cfg["alpha_direct"], beta_direct=best_cfg["beta_direct"],
+                        alpha_ovr=best_cfg["alpha_ovr"],
+                        finish_thr=best_cfg["finish_threshold"], sub_thr=best_cfg["sub_threshold"],
+                        alpha_simple=best_cfg["alpha_simple"],
+                    )
+                    ml_tr_arr = ml_tr_df[["Decision", "KO/TKO", "Submission"]].to_numpy(dtype=float)
+                    ml_va_arr = ml_va_df[["Decision", "KO/TKO", "Submission"]].to_numpy(dtype=float)
+                    bp_arr_tr = np.tile(
+                        np.array([[base_prior["Decision"], base_prior["KO/TKO"], base_prior["Submission"]]], dtype=float),
+                        (len(ml_tr_arr), 1),
+                    )
+                    bp_arr_va = np.tile(
+                        np.array([[base_prior["Decision"], base_prior["KO/TKO"], base_prior["Submission"]]], dtype=float),
+                        (len(ml_va_arr), 1),
+                    )
+                    w_hist_b = float(best_cfg["w_hist"])
+                    w_group_b = float(best_cfg["w_group"])
+                    w_base_b = float(best_cfg.get("w_base", 0.0))
+                    w_subsig_b = float(best_cfg.get("w_subsig", 0.0))
+                    w_ml_b = max(0.0, 1.0 - w_hist_b - w_group_b - w_base_b - w_subsig_b)
+                    blend_tr = np.clip(
+                        w_ml_b * ml_tr_arr + w_hist_b * hist_arr_tr + w_group_b * grp_arr_tr + w_base_b * bp_arr_tr + w_subsig_b * sub_arr_tr,
+                        MIN_METHOD_PROB, 1.0
+                    )
+                    blend_va = np.clip(
+                        w_ml_b * ml_va_arr + w_hist_b * hist_arr + w_group_b * grp_arr + w_base_b * bp_arr_va + w_subsig_b * sub_arr,
+                        MIN_METHOD_PROB, 1.0
+                    )
+                    blend_tr = blend_tr / np.sum(blend_tr, axis=1, keepdims=True)
+                    blend_va = blend_va / np.sum(blend_va, axis=1, keepdims=True)
+                    method_bias_vec = np.array([
+                        float(best_cfg.get("method_bias_decision", 0.0)),
+                        float(best_cfg.get("method_bias_ko_tko", 0.0)),
+                        float(best_cfg.get("method_bias_submission", 0.0)),
+                    ], dtype=float)
+                    blend_tr = _apply_method_logit_bias_arr(blend_tr, method_bias_vec)
+                    blend_va = _apply_method_logit_bias_arr(blend_va, method_bias_vec)
+                    sub_boost_k = float(best_cfg.get("sub_boost_k", 0.0))
+                    blend_tr = _apply_submission_signal_boost_arr(blend_tr, sub_arr_tr[:, 2], sub_boost_k)
+                    blend_va = _apply_submission_signal_boost_arr(blend_va, sub_arr[:, 2], sub_boost_k)
+                    blend_tr = blend_tr / np.sum(blend_tr, axis=1, keepdims=True)
+                    blend_va = blend_va / np.sum(blend_va, axis=1, keepdims=True)
+
+                    X_meta_tr = np.hstack([blend_tr, hist_arr_tr, grp_arr_tr, bp_arr_tr, np.log(np.clip(blend_tr, 1e-6, 1.0))])
+                    X_meta_va = np.hstack([blend_va, hist_arr, grp_arr, bp_arr_va, np.log(np.clip(blend_va, 1e-6, 1.0))])
+                    y_meta_tr = y_method_dev.iloc[tr_idx]["coarse"].astype(str).values
+                    meta_model = LogisticRegression(
+                        max_iter=6000, C=0.7, solver="lbfgs",
+                        class_weight="balanced", random_state=RANDOM_SEED + 1313,
+                    )
+                    meta_model.fit(X_meta_tr, y_meta_tr)
+                    p_meta = meta_model.predict_proba(X_meta_va)
+                    cls_map = {str(c): i for i, c in enumerate(meta_model.classes_)}
+                    meta_va_arr = np.zeros((len(X_meta_va), 3), dtype=float)
+                    for j, m in enumerate(METHOD_LABELS):
+                        if m in cls_map:
+                            meta_va_arr[:, j] = p_meta[:, cls_map[m]]
+                        else:
+                            meta_va_arr[:, j] = 1.0 / 3.0
+                    meta_va_arr = np.clip(meta_va_arr, MIN_METHOD_PROB, 1.0)
+                    meta_va_arr = meta_va_arr / np.sum(meta_va_arr, axis=1, keepdims=True)
+                    best_meta_key = None
+                    for eta in (0.0, 0.10, 0.20):
+                        arr = np.clip((1.0 - eta) * blend_va + eta * meta_va_arr, MIN_METHOD_PROB, 1.0)
+                        arr = arr / np.sum(arr, axis=1, keepdims=True)
+                        pred_idx = np.argmax(arr, axis=1)
+                        if int(np.sum(winner_correct_va)) > 0:
+                            s = float(np.mean(pred_idx[winner_correct_va] == y_va_idx[winner_correct_va]))
+                        else:
+                            s = float(np.mean(pred_idx == y_va_idx))
+                        chunk_scores = []
+                        for ch in va_chunks:
+                            ch_wc = winner_correct_va[ch]
+                            if int(np.sum(ch_wc)) > 0:
+                                chunk_scores.append(float(np.mean(pred_idx[ch][ch_wc] == y_va_idx[ch][ch_wc])))
+                            else:
+                                chunk_scores.append(float(np.mean(pred_idx[ch] == y_va_idx[ch])))
+                        robust_s = float(np.mean(chunk_scores)) - 0.60 * float(np.std(chunk_scores))
+                        key_m = (robust_s, s, -eta)
+                        if best_meta_key is None or key_m > best_meta_key:
+                            best_meta_key = key_m
+                            meta_eta = float(eta)
+                except Exception:
+                    meta_model = None
+                    meta_eta = 0.0
+
+                if METHOD_HARD_RESET:
+                    meta_model = None
+                    meta_eta = 0.0
 
                 method_bundle = {
-                    "stage1": comp_dev["stage1"],
-                    "stage2": comp_dev["stage2"],
-                    "direct_model": comp_dev["direct_model"],
-                    "direct_classes": comp_dev["direct_classes"],
+                    "stage1": stage1,
+                    "stage2": stage2,
+                    "stage1_rf": stage1_rf,
+                    "stage1_et": stage1_et,
+                    "stage2_rf": stage2_rf,
+                    "stage2_et": stage2_et,
+                    "direct_hgb": direct_hgb,
+                    "direct_rf": direct_rf,
+                    "direct_et": direct_et,
+                    "ovr_models": ovr_models,
+                    "simple_method": simple_method,
+                    "direct_classes": direct_classes,
                     "imputer": method_imputer,
                     "method_columns": method_columns,
+                    "temp_decision": float(best_cfg["t_dec"]),
+                    "temp_finish": float(best_cfg["t_fin"]),
+                    "bias_finish": float(best_cfg["bias_finish"]),
+                    "bias_sub": float(best_cfg["bias_sub"]),
+                    "finish_threshold": float(best_cfg["finish_threshold"]),
+                    "sub_threshold": float(best_cfg["sub_threshold"]),
+                    "alpha_stage1": float(best_cfg["alpha_stage1"]),
+                    "alpha_stage2": float(best_cfg["alpha_stage2"]),
+                    "alpha_direct": float(best_cfg["alpha_direct"]),
+                    "beta_direct": float(best_cfg["beta_direct"]),
+                    "alpha_ovr": float(best_cfg["alpha_ovr"]),
+                    "alpha_simple": float(best_cfg["alpha_simple"]),
+                    "w_hist": float(best_cfg["w_hist"]),
+                    "w_group": float(best_cfg["w_group"]),
+                    "w_base": float(best_cfg["w_base"]),
+                    "w_subsig": float(best_cfg.get("w_subsig", 0.0)),
+                    "sub_boost_k": float(best_cfg.get("sub_boost_k", 0.0)),
+                    "method_bias_decision": float(best_cfg["method_bias_decision"]),
+                    "method_bias_ko_tko": float(best_cfg["method_bias_ko_tko"]),
+                    "method_bias_submission": float(best_cfg["method_bias_submission"]),
                     "base_prior": base_prior,
+                    "meta_model": meta_model,
+                    "meta_eta": float(meta_eta),
                     "group_priors": group_priors,
-                    "meta_model": meta_dev_model,
                     "detail_labels_seen": sorted(pd.Series(y_method_dev["detail"]).unique().tolist()),
-                    "sub_weight_mult": float(best_cfg["sub_weight_mult"]),
-                    "sub_oversample_ratio": float(best_cfg["sub_oversample_ratio"]),
-                    "meta_c": float(best_cfg["meta_c"]),
                 }
-                # Gate uses exactly the same validation winner-correct subset as baseline reporting.
-                pf_val, ps_val, _, direct_val = _component_probs(best_comp, X_m_va_imp)
-                X_meta_val = _build_meta_features(pf_val, ps_val, direct_val, X_m_va)
-                if best_meta is not None:
-                    p_meta_val = best_meta.predict_proba(X_meta_val)
-                    cls_meta_val = getattr(best_meta, "classes_", None)
-                    if cls_meta_val is None and hasattr(best_meta, "named_steps"):
-                        cls_meta_val = getattr(best_meta.named_steps.get("logreg"), "classes_", [])
-                    cls_map_val = {str(c): i for i, c in enumerate(cls_meta_val)}
-                    stacked_val_arr = np.zeros((len(X_meta_val), 3), dtype=float)
-                    for j, m in enumerate(METHOD_LABELS):
-                        stacked_val_arr[:, j] = p_meta_val[:, cls_map_val[m]] if m in cls_map_val else (1.0 / 3.0)
-                else:
-                    stacked_val_arr = np.array(direct_val, dtype=float)
-                stacked_val_arr = np.clip(stacked_val_arr, MIN_METHOD_PROB, 1.0)
-                stacked_val_arr = stacked_val_arr / np.sum(stacked_val_arr, axis=1, keepdims=True)
-                direct_val_arr = np.clip(np.array(direct_val, dtype=float), MIN_METHOD_PROB, 1.0)
-                direct_val_arr = direct_val_arr / np.sum(direct_val_arr, axis=1, keepdims=True)
-                val_direct_pred = np.array([METHOD_LABELS[i] for i in np.argmax(direct_val_arr, axis=1)], dtype=object)
-                val_stacked_pred = np.array([METHOD_LABELS[i] for i in np.argmax(stacked_val_arr, axis=1)], dtype=object)
-                if int(np.sum(winner_correct_va)) > 0:
-                    y_gate = y_va_true[winner_correct_va]
-                    d_gate = val_direct_pred[winner_correct_va]
-                    s_gate = val_stacked_pred[winner_correct_va]
-                else:
-                    y_gate = y_va_true
-                    d_gate = val_direct_pred
-                    s_gate = val_stacked_pred
-                direct_score_gate, _, direct_r_arr_gate, _, _, _ = _score_metrics(y_gate, d_gate, direct_dec_recall_ref=None)
-                direct_dec_ref = float(direct_r_arr_gate[0]) if len(direct_r_arr_gate) > 0 else 0.0
-                stacked_score_gate, _, _, _, _, stacked_rates_gate = _score_metrics(
-                    y_gate, s_gate, direct_dec_recall_ref=direct_dec_ref
-                )
-                direct_acc_wc_gate = float(np.mean(d_gate == y_gate)) if len(y_gate) > 0 else float("nan")
-                stacked_acc_wc_gate = float(np.mean(s_gate == y_gate)) if len(y_gate) > 0 else float("nan")
-                sub_ok = stacked_rates_gate["pred_sub_rate"] <= stacked_rates_gate["true_sub_rate"] + 0.04
-                dec_ok = stacked_rates_gate["pred_dec_rate"] >= stacked_rates_gate["true_dec_rate"] - 0.04
-                stacked_gate_pass = bool(
-                    (best_meta is not None)
-                    and (stacked_score_gate >= direct_score_gate)
-                    and (stacked_acc_wc_gate >= direct_acc_wc_gate)
-                    and sub_ok
-                    and dec_ok
-                )
-                gate_reasons = []
-                if best_meta is None:
-                    gate_reasons.append("meta model unavailable")
-                if stacked_score_gate < direct_score_gate:
-                    gate_reasons.append("stacked score below direct score")
-                if stacked_acc_wc_gate < direct_acc_wc_gate:
-                    gate_reasons.append("stacked method_acc_wc below direct")
-                if not sub_ok:
-                    gate_reasons.append("stacked submission rate too high vs actual")
-                if not dec_ok:
-                    gate_reasons.append("stacked decision rate too low vs actual")
-                gate_reason = "PASS all checks" if stacked_gate_pass else "; ".join(gate_reasons)
-                use_stacked_for_production = stacked_gate_pass
-                method_bundle["use_stacked_for_production"] = use_stacked_for_production
-                method_bundle["meta_feature_names"] = [
-                    "p_direct_decision", "p_direct_ko_tko", "p_direct_submission",
-                    "p_stage1_finish", "p_stage2_submission",
-                    "winner_confidence", "rounds_indicator", "title_indicator",
-                    "direct_max_probability", "direct_entropy",
-                    "stage_direct_finish_disagreement", "stage2_direct_submission_disagreement",
-                ]
 
                 self._stat("Method classes (training)", ", ".join(method_bundle["detail_labels_seen"]))
-                self._stat("Validation method score (0.60 macroF1 + 0.20 SubR + 0.20 KOR)", f"{best_cfg['val_stacked_score']:.1%}")
-                self._stat("Validation direct score (same objective)", f"{best_cfg['val_direct_score']:.1%}")
-                self._stat("Validation method acc | winner correct", f"{best_cfg['val_metric']:.1%}")
+                if METHOD_HARD_RESET:
+                    self._stat("Method stack mode", "hard-reset (stable components only)")
+                self._stat("Validation metric target (method | winner correct)", f"{best_cfg['val_metric']:.1%}")
                 self._stat("Validation majority baseline (same subset)", f"{best_cfg['val_baseline']:.1%}")
-                self._stat("Meta model trained on strict OOF", "yes")
-                self._stat("In-sample stacking leakage introduced", "no")
-                self._stat("Submission class weight (chosen)", f"{best_cfg['sub_weight_mult']:.2f}")
-                self._stat("Submission oversample ratio (chosen)", f"{best_cfg['sub_oversample_ratio']:.2f}")
-                self._stat("Direct score used by gate", f"{direct_score_gate:.1%}")
-                self._stat("Stacked score used by gate", f"{stacked_score_gate:.1%}")
-                self._stat("Direct method_acc_wc used by gate", f"{direct_acc_wc_gate:.1%}")
-                self._stat("Stacked method_acc_wc used by gate", f"{stacked_acc_wc_gate:.1%}")
-                self._stat("Meta validation gate", "PASS" if stacked_gate_pass else "FAIL")
-                self._stat("Meta validation gate reason", gate_reason)
-                self._stat("Final production method predictor", "stacked meta-model" if use_stacked_for_production else "direct 3-class baseline")
-                self._stat("Method tuning trials (fast/accurate)", tuning_trials)
-                self._stat("Validation macro_f1", f"{best_cfg.get('macro_f1', float('nan')):.1%}")
-                self._stat("Validation KO recall", f"{best_cfg.get('ko_recall', float('nan')):.1%}")
-                self._stat("Validation Submission recall", f"{best_cfg.get('submission_recall', float('nan')):.1%}")
-                self._stat("Validation actual Submission rate", f"{stacked_rates_gate.get('true_sub_rate', float('nan')):.1%}")
-                self._stat("Validation predicted Submission rate", f"{stacked_rates_gate.get('pred_sub_rate', float('nan')):.1%}")
-                self._stat("Validation actual Decision rate", f"{stacked_rates_gate.get('true_dec_rate', float('nan')):.1%}")
-                self._stat("Validation predicted Decision rate", f"{stacked_rates_gate.get('pred_dec_rate', float('nan')):.1%}")
-                if meta_dev_model is not None:
-                    try:
-                        coef_model = meta_dev_model.named_steps.get("logreg") if hasattr(meta_dev_model, "named_steps") else meta_dev_model
-                        coef_abs = np.max(np.abs(np.asarray(coef_model.coef_, dtype=float)), axis=0)
-                        feat_names = method_bundle.get("meta_feature_names", [f"f{i}" for i in range(len(coef_abs))])
-                        self._log("")
-                        self._log("Meta Coefficient Magnitudes (abs max across classes)")
-                        order = np.argsort(coef_abs)[::-1]
-                        for idx_cf in order:
-                            if idx_cf < len(feat_names):
-                                self._log(f"{feat_names[idx_cf]}: {coef_abs[idx_cf]:.4f}")
-                    except Exception:
-                        self._log("Meta Coefficient Magnitudes: unavailable")
 
                 # Holdout evaluation with winner-model predicted winners.
                 X_test_oriented_pred = _oriented_method_matrix(X_test_full, y_pred_red)
@@ -4633,142 +4695,215 @@ class UFCSuperModelPipeline:
                 X_test_oriented_pred_imp = pd.DataFrame(
                     method_imputer.transform(X_test_oriented_pred), columns=method_columns
                 )
-                pf_t, ps_t, _, direct_t = _component_probs(comp_dev, X_test_oriented_pred_imp)
+                # Stage-only diagnostics.
                 y_finish_true = (y_method_test["finish_bin"].astype(str).values == "Finish").astype(int)
-                stage1_pred = (pf_t >= 0.5).astype(int)
+                p_finish_hist_t = method_bundle["stage1"].predict_proba(X_test_oriented_pred_imp)[:, 1]
+                p_finish_rf_t = method_bundle["stage1_rf"].predict_proba(X_test_oriented_pred_imp)[:, 1]
+                p_finish_et_t = method_bundle["stage1_et"].predict_proba(X_test_oriented_pred_imp)[:, 1]
+                p_finish_tree_t = 0.55 * p_finish_rf_t + 0.45 * p_finish_et_t
+                p_finish_raw_t = (
+                    float(method_bundle.get("alpha_stage1", 0.75)) * p_finish_hist_t
+                    + (1.0 - float(method_bundle.get("alpha_stage1", 0.75))) * p_finish_tree_t
+                )
+                logit_finish_t = np.log(
+                    np.clip(p_finish_raw_t, 1e-6, 1 - 1e-6)
+                    / np.clip(1.0 - p_finish_raw_t, 1e-6, 1 - 1e-6)
+                )
+                p_finish_stage_t = 1.0 / (
+                    1.0 + np.exp(
+                        -(
+                            logit_finish_t / max(0.35, float(method_bundle.get("temp_decision", 1.0)))
+                            + float(method_bundle.get("bias_finish", 0.0))
+                        )
+                    )
+                )
+                p_finish_stage_t = _apply_binary_threshold_warp(
+                    p_finish_stage_t, float(method_bundle.get("finish_threshold", 0.50))
+                )
+                stage1_pred = (p_finish_stage_t >= 0.5).astype(int)
                 stage1_acc = float(np.mean(stage1_pred == y_finish_true))
                 stage1_auc = float("nan")
                 try:
                     if len(np.unique(y_finish_true)) > 1:
-                        stage1_auc = float(roc_auc_score(y_finish_true, pf_t))
+                        stage1_auc = float(roc_auc_score(y_finish_true, p_finish_stage_t))
                 except Exception:
                     stage1_auc = float("nan")
-                n_true_finishes = int(np.sum(y_finish_true == 1))
-                stage2_acc_true_finishes = float("nan")
-                if n_true_finishes > 0:
-                    y_sub_true = (
-                        y_method_test.iloc[np.where(y_finish_true == 1)[0]]["finish_subtype"].astype(str).values == "Submission"
-                    ).astype(int)
-                    stage2_acc_true_finishes = float(np.mean((ps_t[y_finish_true == 1] >= 0.5).astype(int) == y_sub_true))
 
+                stage2_acc_true_finishes = float("nan")
+                n_true_finishes = int(np.sum(y_finish_true == 1))
+                if n_true_finishes > 0:
+                    finish_idx_true = np.where(y_finish_true == 1)[0]
+                    X_test_fin_true = X_test_oriented_pred_imp.iloc[finish_idx_true].reset_index(drop=True)
+                    y_sub_true = (
+                        y_method_test.iloc[finish_idx_true]["finish_subtype"].astype(str).values == "Submission"
+                    ).astype(int)
+                    p_sub_hist_t = method_bundle["stage2"].predict_proba(X_test_fin_true)[:, 1]
+                    p_sub_rf_t = method_bundle["stage2_rf"].predict_proba(X_test_fin_true)[:, 1]
+                    p_sub_et_t = method_bundle["stage2_et"].predict_proba(X_test_fin_true)[:, 1]
+                    p_sub_tree_t = 0.55 * p_sub_rf_t + 0.45 * p_sub_et_t
+                    p_sub_raw_t = (
+                        float(method_bundle.get("alpha_stage2", 0.75)) * p_sub_hist_t
+                        + (1.0 - float(method_bundle.get("alpha_stage2", 0.75))) * p_sub_tree_t
+                    )
+                    logit_sub_t = np.log(
+                        np.clip(p_sub_raw_t, 1e-6, 1 - 1e-6)
+                        / np.clip(1.0 - p_sub_raw_t, 1e-6, 1 - 1e-6)
+                    )
+                    p_sub_stage_t = 1.0 / (
+                        1.0 + np.exp(
+                            -(
+                                logit_sub_t / max(0.35, float(method_bundle.get("temp_finish", 1.0)))
+                                + float(method_bundle.get("bias_sub", 0.0))
+                            )
+                        )
+                    )
+                    p_sub_stage_t = _apply_binary_threshold_warp(
+                        p_sub_stage_t, float(method_bundle.get("sub_threshold", 0.50))
+                    )
+                    stage2_pred = (p_sub_stage_t >= 0.5).astype(int)
+                    stage2_acc_true_finishes = float(np.mean(stage2_pred == y_sub_true))
+                ml_test = _stage_probs(
+                    X_test_oriented_pred_imp,
+                    temp_dec=method_bundle["temp_decision"],
+                    temp_fin=method_bundle["temp_finish"],
+                    alpha1=method_bundle["alpha_stage1"],
+                    alpha2=method_bundle["alpha_stage2"],
+                    bias_finish=method_bundle["bias_finish"],
+                    bias_sub=method_bundle["bias_sub"],
+                    alpha_direct=method_bundle["alpha_direct"],
+                    beta_direct=method_bundle["beta_direct"],
+                    alpha_ovr=method_bundle.get("alpha_ovr", 0.85),
+                    finish_thr=method_bundle.get("finish_threshold", 0.50),
+                    sub_thr=method_bundle.get("sub_threshold", 0.50),
+                    alpha_simple=method_bundle.get("alpha_simple", 0.80),
+                )
                 y_method_np = y_method_test["coarse"].astype(str).values
                 winner_correct = (y_pred_red == y_true_red)
+                final_probs = []
                 test_meta_reset = meta_test.reset_index(drop=True)
-                hist_test = _history_prior_array(X_test_oriented_pred)
-                grp_test = np.zeros((len(test_meta_reset), 3), dtype=float)
-                for i in range(len(test_meta_reset)):
-                    wc = str(test_meta_reset.iloc[i]["weight_class"])
-                    gd = str(test_meta_reset.iloc[i]["gender"]).lower()
-                    gp = group_priors.get((wc, gd), group_priors[("ALL", "all")])
-                    grp_test[i, 0] = float(gp["Decision"])
-                    grp_test[i, 1] = float(gp["KO/TKO"])
-                    grp_test[i, 2] = float(gp["Submission"])
-                X_meta_test = _build_meta_features(pf_t, ps_t, direct_t, X_test_oriented_pred)
-                stacked_probs_arr = np.array(direct_t, dtype=float)
-                if meta_dev_model is not None:
-                    p_meta_t = meta_dev_model.predict_proba(X_meta_test)
-                    cls_meta_t = getattr(meta_dev_model, "classes_", None)
-                    if cls_meta_t is None and hasattr(meta_dev_model, "named_steps"):
-                        cls_meta_t = getattr(meta_dev_model.named_steps.get("logreg"), "classes_", [])
-                    cls_map_t = {str(c): i for i, c in enumerate(cls_meta_t)}
-                    stacked_probs_arr = np.zeros((len(X_meta_test), 3), dtype=float)
-                    for j, m in enumerate(METHOD_LABELS):
-                        stacked_probs_arr[:, j] = p_meta_t[:, cls_map_t[m]] if m in cls_map_t else (1.0 / 3.0)
-                stacked_probs_arr = np.clip(stacked_probs_arr, MIN_METHOD_PROB, 1.0)
-                stacked_probs_arr = stacked_probs_arr / np.sum(stacked_probs_arr, axis=1, keepdims=True)
-                direct_probs_arr = np.clip(np.array(direct_t, dtype=float), MIN_METHOD_PROB, 1.0)
-                direct_probs_arr = direct_probs_arr / np.sum(direct_probs_arr, axis=1, keepdims=True)
-                final_probs_arr = stacked_probs_arr if use_stacked_for_production else direct_probs_arr
-                method_pred_predwinner = np.array([METHOD_LABELS[i] for i in np.argmax(final_probs_arr, axis=1)], dtype=object)
+                for i in range(len(ml_test)):
+                    gp = group_priors.get(
+                        (str(test_meta_reset.iloc[i]["weight_class"]), str(test_meta_reset.iloc[i]["gender"]).lower()),
+                        group_priors[("ALL", "all")],
+                    )
+                    d_dec = float(X_test_oriented_pred.reset_index(drop=True).iloc[i].get("d_dec_win_pct", 0.0))
+                    d_ko = float(X_test_oriented_pred.reset_index(drop=True).iloc[i].get("d_ko_win_pct", 0.0))
+                    d_sub = float(X_test_oriented_pred.reset_index(drop=True).iloc[i].get("d_sub_win_pct", 0.0))
+                    hp = _normalize_method_probs({
+                        "Decision": 0.50 + 0.35 * d_dec,
+                        "KO/TKO": 0.32 + 0.35 * d_ko,
+                        "Submission": 0.18 + 0.35 * d_sub,
+                    })
+                    sub_prior_arr = _sub_attempt_prior_array(X_test_oriented_pred.reset_index(drop=True).iloc[[i]])[0]
+                    sp = _normalize_method_probs({
+                        "Decision": float(sub_prior_arr[0]),
+                        "KO/TKO": float(sub_prior_arr[1]),
+                        "Submission": float(sub_prior_arr[2]),
+                    })
+                    w_hist = method_bundle["w_hist"]
+                    w_group = method_bundle["w_group"]
+                    w_base = method_bundle.get("w_base", 0.0)
+                    w_subsig = method_bundle.get("w_subsig", 0.0)
+                    w_ml = 1.0 - w_hist - w_group - w_base - w_subsig
+                    bp = method_bundle.get("base_prior", group_priors.get(("ALL", "all"), {"Decision": 1 / 3, "KO/TKO": 1 / 3, "Submission": 1 / 3}))
+                    row = {
+                        m: (
+                            w_ml * float(ml_test.iloc[i][m])
+                            + w_hist * float(hp[m])
+                            + w_group * float(gp[m])
+                            + w_base * float(bp[m])
+                            + w_subsig * float(sp[m])
+                        )
+                        for m in METHOD_LABELS
+                    }
+                    blended_row = _normalize_method_probs(row)
+                    method_bias_map = {
+                        "Decision": float(method_bundle.get("method_bias_decision", 0.0)),
+                        "KO/TKO": float(method_bundle.get("method_bias_ko_tko", 0.0)),
+                        "Submission": float(method_bundle.get("method_bias_submission", 0.0)),
+                    }
+                    blended_row = _apply_method_logit_bias_map(blended_row, method_bias_map)
+                    blended_row = _apply_submission_signal_boost_map(
+                        blended_row, float(sp["Submission"]), float(method_bundle.get("sub_boost_k", 0.0))
+                    )
+                    meta_model = method_bundle.get("meta_model")
+                    meta_eta = float(method_bundle.get("meta_eta", 0.0))
+                    if meta_model is not None and meta_eta > 0.0:
+                        arr_blend = np.array([[blended_row["Decision"], blended_row["KO/TKO"], blended_row["Submission"]]], dtype=float)
+                        arr_hist = np.array([[hp["Decision"], hp["KO/TKO"], hp["Submission"]]], dtype=float)
+                        arr_grp = np.array([[gp["Decision"], gp["KO/TKO"], gp["Submission"]]], dtype=float)
+                        arr_bp = np.array([[bp["Decision"], bp["KO/TKO"], bp["Submission"]]], dtype=float)
+                        X_meta = np.hstack([arr_blend, arr_hist, arr_grp, arr_bp, np.log(np.clip(arr_blend, 1e-6, 1.0))])
+                        pm = meta_model.predict_proba(X_meta)[0]
+                        cls_map = {str(c): i for i, c in enumerate(meta_model.classes_)}
+                        raw = {}
+                        for m in METHOD_LABELS:
+                            raw[m] = float(pm[cls_map[m]]) if m in cls_map else (1.0 / 3.0)
+                        p_meta = _normalize_method_probs(raw)
+                        blended_row = _normalize_method_probs({
+                            m: (1.0 - meta_eta) * blended_row[m] + meta_eta * p_meta[m]
+                            for m in METHOD_LABELS
+                        })
+                    final_probs.append(blended_row)
+                method_pred_predwinner = np.array(
+                    [max(METHOD_LABELS, key=lambda m: p[m]) for p in final_probs], dtype=object
+                )
                 method_acc_predicted_winner = float(np.mean(method_pred_predwinner == y_method_np))
                 finish_score = float("nan")
-                method_holdout_acc_oracle = float("nan")
                 if int(np.sum(winner_correct)) > 0:
-                    method_acc_when_winner_correct = float(np.mean(method_pred_predwinner[winner_correct] == y_method_np[winner_correct]))
+                    method_acc_when_winner_correct = float(
+                        np.mean(method_pred_predwinner[winner_correct] == y_method_np[winner_correct])
+                    )
                     subset = y_method_np[winner_correct]
                     counts = pd.Series(subset).value_counts()
                     method_majority_baseline_when_winner_correct = float(counts.max() / len(subset))
+                method_holdout_acc_oracle = float("nan")
 
                 self._section("Method Evaluation (Conditioned on Winner Pick)")
                 self._stat("Stage1 acc (Finish vs Decision)", f"{stage1_acc:.1%}")
                 self._stat("Stage1 AUC (Finish vs Decision)", "n/a" if not np.isfinite(stage1_auc) else f"{stage1_auc:.3f}")
-                self._stat("Stage2 acc (KO/Sub | true finishes)", "n/a" if not np.isfinite(stage2_acc_true_finishes) else f"{stage2_acc_true_finishes:.1%}")
+                self._stat(
+                    "Stage2 acc (KO/Sub | true finishes)",
+                    "n/a" if not np.isfinite(stage2_acc_true_finishes) else f"{stage2_acc_true_finishes:.1%}",
+                )
                 self._stat("Stage2 sample size (true finishes)", n_true_finishes)
                 self._stat("Method acc (predicted winner conditioned)", f"{method_acc_predicted_winner:.1%}")
                 self._stat("Method acc | winner pick correct", f"{method_acc_when_winner_correct:.1%}")
                 self._stat("Majority baseline | winner pick correct", f"{method_majority_baseline_when_winner_correct:.1%}")
-
-                # Real baselines (validation + holdout) and full multiclass diagnostics.
-                val_hist_pred = np.array([METHOD_LABELS[i] for i in np.argmax(hist_arr, axis=1)], dtype=object)
-                val_grp_pred = np.array([METHOD_LABELS[i] for i in np.argmax(grp_arr, axis=1)], dtype=object)
-                val_final_pred = np.array(val_stacked_pred, dtype=object)
-                val_subset = y_va_true[winner_correct_va] if int(np.sum(winner_correct_va)) > 0 else np.array([], dtype=object)
-                val_majority_acc = float(pd.Series(val_subset).value_counts().max() / len(val_subset)) if len(val_subset) > 0 else float("nan")
-                self._log("")
-                self._log("Validation Baselines (Method | winner pick correct)")
-                self._log(f"Majority baseline: {val_majority_acc:.1%}" if np.isfinite(val_majority_acc) else "Majority baseline: n/a")
-                self._log(f"History-prior-only baseline: {float(np.mean(val_hist_pred[winner_correct_va] == y_va_true[winner_correct_va])):.1%}" if int(np.sum(winner_correct_va)) > 0 else "History-prior-only baseline: n/a")
-                self._log(f"Group-prior-only baseline: {float(np.mean(val_grp_pred[winner_correct_va] == y_va_true[winner_correct_va])):.1%}" if int(np.sum(winner_correct_va)) > 0 else "Group-prior-only baseline: n/a")
-                self._log(f"Plain direct multiclass baseline: {float(np.mean(val_direct_pred[winner_correct_va] == y_va_true[winner_correct_va])):.1%}" if int(np.sum(winner_correct_va)) > 0 else "Plain direct multiclass baseline: n/a")
-                self._log(f"Final stacked method model: {float(np.mean(val_final_pred[winner_correct_va] == y_va_true[winner_correct_va])):.1%}" if int(np.sum(winner_correct_va)) > 0 else "Final stacked method model: n/a")
-                def _dist_line(lbl_arr):
-                    n_lbl = max(1, len(lbl_arr))
-                    d = float(np.sum(lbl_arr == "Decision")) / n_lbl
-                    k = float(np.sum(lbl_arr == "KO/TKO")) / n_lbl
-                    s = float(np.sum(lbl_arr == "Submission")) / n_lbl
-                    return f"Decision={d:.1%}, KO/TKO={k:.1%}, Submission={s:.1%}"
-                if int(np.sum(winner_correct_va)) > 0:
-                    self._log("Validation class distribution (winner-correct subset)")
-                    self._log(f"Actual: {_dist_line(y_va_true[winner_correct_va])}")
-                    self._log(f"Direct: {_dist_line(val_direct_pred[winner_correct_va])}")
-                    self._log(f"Stacked: {_dist_line(val_final_pred[winner_correct_va])}")
-                hold_hist_pred = np.array([METHOD_LABELS[i] for i in np.argmax(hist_test, axis=1)], dtype=object)
-                hold_grp_pred = np.array([METHOD_LABELS[i] for i in np.argmax(grp_test, axis=1)], dtype=object)
-                hold_direct_pred = np.array([METHOD_LABELS[i] for i in np.argmax(direct_t, axis=1)], dtype=object)
-                hold_stacked_pred = np.array([METHOD_LABELS[i] for i in np.argmax(stacked_probs_arr, axis=1)], dtype=object)
-                hold_final_pred = np.array([METHOD_LABELS[i] for i in np.argmax(final_probs_arr, axis=1)], dtype=object)
-                hold_subset = y_method_np[winner_correct] if int(np.sum(winner_correct)) > 0 else np.array([], dtype=object)
-                hold_majority_acc = float(pd.Series(hold_subset).value_counts().max() / len(hold_subset)) if len(hold_subset) > 0 else float("nan")
-                self._log("")
-                self._log("Holdout Baselines (Method | winner pick correct)")
-                self._log(f"Majority baseline: {hold_majority_acc:.1%}" if np.isfinite(hold_majority_acc) else "Majority baseline: n/a")
-                self._log(f"History-prior-only baseline: {float(np.mean(hold_hist_pred[winner_correct] == y_method_np[winner_correct])):.1%}" if int(np.sum(winner_correct)) > 0 else "History-prior-only baseline: n/a")
-                self._log(f"Group-prior-only baseline: {float(np.mean(hold_grp_pred[winner_correct] == y_method_np[winner_correct])):.1%}" if int(np.sum(winner_correct)) > 0 else "Group-prior-only baseline: n/a")
-                self._log(f"Plain direct multiclass baseline: {float(np.mean(hold_direct_pred[winner_correct] == y_method_np[winner_correct])):.1%}" if int(np.sum(winner_correct)) > 0 else "Plain direct multiclass baseline: n/a")
-                self._log(f"Final stacked method model: {float(np.mean(hold_stacked_pred[winner_correct] == y_method_np[winner_correct])):.1%}" if int(np.sum(winner_correct)) > 0 else "Final stacked method model: n/a")
-                self._log(f"Final production model output: {float(np.mean(hold_final_pred[winner_correct] == y_method_np[winner_correct])):.1%}" if int(np.sum(winner_correct)) > 0 else "Final production model output: n/a")
-                if int(np.sum(winner_correct)) > 0:
-                    self._log("Holdout class distribution (winner-correct subset)")
-                    self._log(f"Actual: {_dist_line(y_method_np[winner_correct])}")
-                    self._log(f"Direct: {_dist_line(hold_direct_pred[winner_correct])}")
-                    self._log(f"Stacked: {_dist_line(hold_stacked_pred[winner_correct])}")
-
                 if int(np.sum(winner_correct)) > 0:
                     sub_true = y_method_np[winner_correct]
                     sub_pred = method_pred_predwinner[winner_correct]
-                    sub_prob = final_probs_arr[winner_correct]
-                    p_arr, r_arr, f1_arr, _ = precision_recall_fscore_support(sub_true, sub_pred, labels=METHOD_LABELS, zero_division=0)
+                    p_arr, r_arr, f1_arr, _ = precision_recall_fscore_support(
+                        sub_true, sub_pred, labels=METHOD_LABELS, zero_division=0
+                    )
                     bal_acc = float(balanced_accuracy_score(sub_true, sub_pred))
                     macro_f1 = float(np.mean(f1_arr))
                     ko_recall = float(r_arr[1]) if len(r_arr) > 1 else 0.0
                     sub_recall = float(r_arr[2]) if len(r_arr) > 2 else 0.0
                     ko_sub_macro_f1 = float(np.mean(f1_arr[1:3])) if len(f1_arr) >= 3 else macro_f1
                     finish_score = 0.4 * ko_recall + 0.4 * sub_recall + 0.2 * ko_sub_macro_f1
-                    y_idx_sub = np.array([label_to_idx[str(v)] for v in sub_true], dtype=int)
-                    mc_logloss = float(log_loss(y_idx_sub, sub_prob, labels=[0, 1, 2]))
-                    self._stat("Multiclass log-loss | winner pick correct", f"{mc_logloss:.4f}")
                     self._stat("Balanced accuracy | winner pick correct", f"{bal_acc:.1%}")
                     self._stat("Macro F1 | winner pick correct", f"{macro_f1:.1%}")
-                    self._stat("KO/TKO recall | winner pick correct", f"{ko_recall:.1%}")
-                    self._stat("Submission recall | winner pick correct", f"{sub_recall:.1%}")
                     self._stat("FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1)", f"{finish_score:.1%}")
                     self._log("")
                     self._log("Per-Class Metrics (Method | winner pick correct)")
                     self._log("Class          Precision    Recall      F1")
                     for idx, cls_name in enumerate(METHOD_LABELS):
-                        self._log(f"{cls_name:<14}{p_arr[idx]:10.1%}{r_arr[idx]:10.1%}{f1_arr[idx]:10.1%}")
+                        self._log(
+                            f"{cls_name:<14}{p_arr[idx]:10.1%}{r_arr[idx]:10.1%}{f1_arr[idx]:10.1%}"
+                        )
+                    self._log("")
+                    self._log("Confusion Matrix (Method | winner pick correct)")
+                    self._log("Actual\\Pred     Decision    KO/TKO  Submission")
+                    for actual in METHOD_LABELS:
+                        row_counts = []
+                        for pred in METHOD_LABELS:
+                            c = int(np.sum((sub_true == actual) & (sub_pred == pred)))
+                            row_counts.append(c)
+                        self._log(f"{actual:<14}{row_counts[0]:10d}{row_counts[1]:10d}{row_counts[2]:12d}")
 
                 method_bundle["method_columns"] = method_columns
+
                 _cache_save(
                     "method_stage",
                     method_cache_key,
@@ -4824,8 +4959,193 @@ class UFCSuperModelPipeline:
         method_feat_cols_all = list(full_feature_cols)
         if method_bundle is not None:
             try:
-                method_bundle_all = dict(method_bundle)
-                method_feat_cols_all = list(full_feature_cols)
+                X_all_sw = _swap_features(X_all)
+                X_all_sc = pd.DataFrame(scaler_all.transform(X_all), columns=feature_cols)
+                X_all_sw_sc = pd.DataFrame(scaler_all.transform(X_all_sw), columns=feature_cols)
+                all_meta = {}
+                for name, _ in specs:
+                    p_fwd = _predict_proba(name, final_models[name], X_all_sc if name in NEEDS_SCALE else X_all)
+                    p_rev = _predict_proba(name, final_models[name], X_all_sw_sc if name in NEEDS_SCALE else X_all_sw)
+                    all_meta[name] = _clip_probs((p_fwd + (1.0 - p_rev)) / 2.0)
+                all_meta_df = pd.DataFrame(all_meta)[model_order]
+                all_probs = _combine_probs(all_meta_df, final_combiner)
+                if calibrator is not None:
+                    all_probs = _clip_probs(
+                        calibrator.predict_proba(np.asarray(all_probs).reshape(-1, 1))[:, 1]
+                    )
+                y_pred_all = (np.asarray(all_probs) >= decision_threshold).astype(int)
+
+                X_all_full = pd.DataFrame(full_imputer.fit_transform(X_full[full_feature_cols]), columns=full_feature_cols)
+                X_all_method = _oriented_method_matrix(X_all_full, y_pred_all)
+                X_all_method = _augment_method_features(X_all_method)
+                method_feat_cols_all = list(X_all_method.columns)
+                method_imputer_all = SimpleImputer(strategy="median")
+                X_all_method_imp = pd.DataFrame(
+                    method_imputer_all.fit_transform(X_all_method), columns=method_feat_cols_all
+                )
+
+                y_all_bin = (y_method_df["finish_bin"].values == "Finish").astype(int)
+                p_finish_all = max(1e-6, float(np.mean(y_all_bin)))
+                w_all_t = _time_weights(len(X_all_method_imp), floor=0.45)
+                w_all_stage1 = w_all_t * np.where(
+                    y_all_bin == 1, 0.5 / p_finish_all, 0.5 / max(1e-6, 1.0 - p_finish_all)
+                )
+                stage1_all = HistGradientBoostingClassifier(
+                    loss="log_loss",
+                    max_iter=360, learning_rate=0.045, max_depth=6,
+                    max_leaf_nodes=31, min_samples_leaf=16, l2_regularization=0.8,
+                    random_state=RANDOM_SEED + 808,
+                )
+                stage1_all.fit(X_all_method_imp, y_all_bin, sample_weight=w_all_stage1)
+                stage1_rf_all = RandomForestClassifier(
+                    n_estimators=420, max_depth=10, min_samples_leaf=4,
+                    max_features=0.7, random_state=RANDOM_SEED + 910, n_jobs=-1,
+                    class_weight="balanced_subsample",
+                )
+                stage1_rf_all.fit(X_all_method_imp, y_all_bin)
+                stage1_et_all = ExtraTreesClassifier(
+                    n_estimators=560, max_depth=12, min_samples_leaf=3,
+                    max_features=0.72, random_state=RANDOM_SEED + 914, n_jobs=-1,
+                    class_weight="balanced_subsample",
+                )
+                stage1_et_all.fit(X_all_method_imp, y_all_bin)
+
+                fin_mask_all = (y_method_df["finish_bin"].values == "Finish")
+                if int(np.sum(fin_mask_all)) < 60:
+                    fin_mask_all = np.ones(len(y_method_df), dtype=bool)
+                X2_all = X_all_method_imp.iloc[np.where(fin_mask_all)[0]].reset_index(drop=True)
+                y2_all = (y_method_df.iloc[np.where(fin_mask_all)[0]]["finish_subtype"].values == "Submission").astype(int)
+                p_sub_all = max(1e-6, float(np.mean(y2_all))) if len(y2_all) > 0 else 0.5
+                w2_all = np.where(y2_all == 1, 0.5 / p_sub_all, 0.5 / max(1e-6, 1.0 - p_sub_all))
+                stage2_all = HistGradientBoostingClassifier(
+                    loss="log_loss",
+                    max_iter=320, learning_rate=0.05, max_depth=5,
+                    max_leaf_nodes=31, min_samples_leaf=14, l2_regularization=0.7,
+                    random_state=RANDOM_SEED + 809,
+                )
+                stage2_all.fit(X2_all, y2_all, sample_weight=w2_all)
+                stage2_rf_all = RandomForestClassifier(
+                    n_estimators=360, max_depth=9, min_samples_leaf=3,
+                    max_features=0.7, random_state=RANDOM_SEED + 911, n_jobs=-1,
+                    class_weight="balanced_subsample",
+                )
+                stage2_rf_all.fit(X2_all, y2_all)
+                stage2_et_all = ExtraTreesClassifier(
+                    n_estimators=520, max_depth=11, min_samples_leaf=3,
+                    max_features=0.72, random_state=RANDOM_SEED + 915, n_jobs=-1,
+                    class_weight="balanced_subsample",
+                )
+                stage2_et_all.fit(X2_all, y2_all)
+
+                y_cls_all = y_method_df["coarse"].values
+                cls_counts_all = pd.Series(y_cls_all).value_counts()
+                cls_w_all = {k: (len(y_cls_all) / (len(cls_counts_all) * max(1, v))) for k, v in cls_counts_all.items()}
+                w_cls_all = np.array([cls_w_all.get(lbl, 1.0) for lbl in y_cls_all], dtype=float)
+                w_direct_all = w_all_t * w_cls_all
+                direct_hgb_all = HistGradientBoostingClassifier(
+                    loss="log_loss",
+                    max_iter=300, learning_rate=0.05, max_depth=6,
+                    max_leaf_nodes=31, min_samples_leaf=14, l2_regularization=0.7,
+                    random_state=RANDOM_SEED + 912,
+                )
+                direct_hgb_all.fit(X_all_method_imp, y_cls_all, sample_weight=w_direct_all)
+                direct_rf_all = RandomForestClassifier(
+                    n_estimators=520, max_depth=11, min_samples_leaf=3,
+                    max_features=0.72, random_state=RANDOM_SEED + 913, n_jobs=-1,
+                    class_weight="balanced_subsample",
+                )
+                direct_rf_all.fit(X_all_method_imp, y_cls_all)
+                direct_et_all = ExtraTreesClassifier(
+                    n_estimators=680, max_depth=13, min_samples_leaf=3,
+                    max_features=0.72, random_state=RANDOM_SEED + 916, n_jobs=-1,
+                    class_weight="balanced_subsample",
+                )
+                direct_et_all.fit(X_all_method_imp, y_cls_all)
+                ovr_models_all = {}
+                for j, lbl in enumerate(METHOD_LABELS):
+                    y_ovr_all = (pd.Series(y_cls_all).astype(str).values == lbl).astype(int)
+                    p_pos_all = max(1e-6, float(np.mean(y_ovr_all)))
+                    w_ovr_all = w_all_t * np.where(
+                        y_ovr_all == 1, 0.5 / p_pos_all, 0.5 / max(1e-6, 1.0 - p_pos_all)
+                    )
+                    mdl_all = HistGradientBoostingClassifier(
+                        loss="log_loss",
+                        max_iter=260, learning_rate=0.05, max_depth=5,
+                        max_leaf_nodes=31, min_samples_leaf=14, l2_regularization=0.8,
+                        random_state=RANDOM_SEED + 1500 + j,
+                    )
+                    mdl_all.fit(X_all_method_imp, y_ovr_all, sample_weight=w_ovr_all)
+                    ovr_models_all[lbl] = mdl_all
+                simple_method_all = LogisticRegression(
+                    max_iter=8000, C=0.8, solver="saga", tol=1e-3, n_jobs=-1,
+                    class_weight="balanced", random_state=RANDOM_SEED + 1601,
+                )
+                simple_method_all.fit(X_all_method_imp, pd.Series(y_cls_all).astype(str).values)
+
+                group_priors_all = {}
+                for (wc, gender), grp in row_meta.groupby(["weight_class", "gender"], dropna=False):
+                    idx = grp.index.values
+                    counts = y_method_df.iloc[idx]["coarse"].value_counts()
+                    tot = float(len(idx))
+                    group_priors_all[(str(wc), str(gender).lower())] = _normalize_method_probs({
+                        "Decision": float(counts.get("Decision", 0.0) / max(1.0, tot)),
+                        "KO/TKO": float(counts.get("KO/TKO", 0.0) / max(1.0, tot)),
+                        "Submission": float(counts.get("Submission", 0.0) / max(1.0, tot)),
+                    })
+                all_counts2 = y_method_df["coarse"].value_counts()
+                all_tot2 = float(len(y_method_df))
+                group_priors_all[("ALL", "all")] = _normalize_method_probs({
+                    "Decision": float(all_counts2.get("Decision", 0.0) / max(1.0, all_tot2)),
+                    "KO/TKO": float(all_counts2.get("KO/TKO", 0.0) / max(1.0, all_tot2)),
+                    "Submission": float(all_counts2.get("Submission", 0.0) / max(1.0, all_tot2)),
+                })
+                base_prior_all = _normalize_method_probs({
+                    "Decision": float(all_counts2.get("Decision", 0.0) / max(1.0, all_tot2)),
+                    "KO/TKO": float(all_counts2.get("KO/TKO", 0.0) / max(1.0, all_tot2)),
+                    "Submission": float(all_counts2.get("Submission", 0.0) / max(1.0, all_tot2)),
+                })
+
+                method_bundle_all = {
+                    "stage1": stage1_all,
+                    "stage2": stage2_all,
+                    "stage1_rf": stage1_rf_all,
+                    "stage1_et": stage1_et_all,
+                    "stage2_rf": stage2_rf_all,
+                    "stage2_et": stage2_et_all,
+                    "direct_hgb": direct_hgb_all,
+                    "direct_rf": direct_rf_all,
+                    "direct_et": direct_et_all,
+                    "ovr_models": ovr_models_all,
+                    "simple_method": simple_method_all,
+                    "direct_classes": [str(c) for c in direct_hgb_all.classes_],
+                    "imputer": method_imputer_all,
+                    "method_columns": method_feat_cols_all,
+                    "temp_decision": float(method_bundle.get("temp_decision", 1.0)),
+                    "temp_finish": float(method_bundle.get("temp_finish", 1.0)),
+                    "bias_finish": float(method_bundle.get("bias_finish", 0.0)),
+                    "bias_sub": float(method_bundle.get("bias_sub", 0.0)),
+                    "finish_threshold": float(method_bundle.get("finish_threshold", 0.50)),
+                    "sub_threshold": float(method_bundle.get("sub_threshold", 0.50)),
+                    "alpha_stage1": float(method_bundle.get("alpha_stage1", 0.75)),
+                    "alpha_stage2": float(method_bundle.get("alpha_stage2", 0.75)),
+                    "alpha_direct": float(method_bundle.get("alpha_direct", 0.85)),
+                    "beta_direct": float(method_bundle.get("beta_direct", 0.70)),
+                    "alpha_ovr": float(method_bundle.get("alpha_ovr", 0.85)),
+                    "alpha_simple": float(method_bundle.get("alpha_simple", 0.80)),
+                    "w_hist": float(method_bundle.get("w_hist", 0.25)),
+                    "w_group": float(method_bundle.get("w_group", 0.10)),
+                    "w_base": float(method_bundle.get("w_base", 0.08)),
+                    "w_subsig": float(method_bundle.get("w_subsig", 0.10)),
+                    "sub_boost_k": float(method_bundle.get("sub_boost_k", 0.0)),
+                    "method_bias_decision": float(method_bundle.get("method_bias_decision", 0.0)),
+                    "method_bias_ko_tko": float(method_bundle.get("method_bias_ko_tko", 0.0)),
+                    "method_bias_submission": float(method_bundle.get("method_bias_submission", 0.0)),
+                    "base_prior": base_prior_all,
+                    "meta_model": method_bundle.get("meta_model"),
+                    "meta_eta": float(method_bundle.get("meta_eta", 0.0)),
+                    "group_priors": group_priors_all,
+                    "detail_labels_seen": method_bundle.get("detail_labels_seen", []),
+                }
             except Exception:
                 method_bundle_all = None
 
