@@ -102,7 +102,7 @@ NEEDS_SCALE = {"LogReg", "MLP"}
 ELO_BASE = 1500.0
 ELO_K = 24.0
 OPTUNA_TRIALS = 80
-METHOD_TUNING_TRIALS = 480
+METHOD_TUNING_TRIALS = 800
 METHOD_HARD_RESET = False
 METHOD_ERA_CANDIDATES = [1993, 2005, 2010, 2014, 2016, 2018, 2020, 2021, 2022, 2023, 2024]
 METHOD_AUTO_ERA = True
@@ -121,7 +121,31 @@ WINNER_EXCLUDE_FEATURES = {
     "d_sub_recency_surge", "d_grapple_recency_surge", "d_sub_vs_control_axis",
     "d_recent_ko_loss_rate", "d_r5_def_kd_pm", "d_ko_attack_pressure", "d_ko_def_leak",
     "d_r1f_def_kd_pm", "d_r3_def_kd_pm",
+    # Stage-1 sum features (exact side reconstruction)
+    "dec_win_pct_sum", "finish_resistance_sum", "consistency_sum", "cardio_ratio_sum",
+    "durability_sum", "output_rate_sum", "rd1_intensity_ratio_sum",
+    "strike_exchange_ratio_sum", "sig_str_acc_sum", "late_round_pct_sum",
+    "avg_time_min_sum", "avg_finish_round_sum", "first_round_finish_rate_sum",
+    "damage_efficiency_sum", "body_leg_attrition_sum",
+    # Stage-1 context priors
+    "ctx_finish_prior_2y", "ref_finish_prior",
+    # Stage-1 latent finish-environment features
+    "m_decision_shell_gap", "m_decision_shell_sum", "m_finish_conversion_edge",
+    "m_finish_environment", "m_mutual_finish_instability", "m_decision_absorber",
+    "m_early_finish_window", "m_fast_start_fragility", "m_late_finish_window",
+    "m_attrition_break_window", "m_time_profile_finish_bias",
+    "m_finish_over_shell_ratio", "m_clean_decision_track", "m_finish_speed_pressure",
 }
+# Features that are stage-1-specific (finish vs decision signals) and must be
+# withheld from stage-2 (KO vs Sub), which was calibrated without them.
+STAGE2_EXCLUDE_COLS = frozenset({
+    "m_decision_shell_gap", "m_decision_shell_sum", "m_finish_conversion_edge",
+    "m_finish_environment", "m_mutual_finish_instability", "m_decision_absorber",
+    "m_early_finish_window", "m_fast_start_fragility", "m_late_finish_window",
+    "m_attrition_break_window", "m_time_profile_finish_bias",
+    "m_finish_over_shell_ratio", "m_clean_decision_track", "m_finish_speed_pressure",
+    "ctx_finish_prior_2y", "ref_finish_prior",
+})
 STRICT_FUTURE_MODE = True
 FORCED_START_YEAR = None
 MISSINGNESS_THRESHOLD = 0.35
@@ -583,6 +607,109 @@ def _augment_method_features(X_df):
 
     # Keep ratios bounded and numerically stable for tree/linear blends.
     X["m_sub_ground_efficiency"] = (d_ground_pct * np.maximum(d_sub_att, 0.0)) / (1.0 + np.abs(d_ctrl_pct) + eps)
+
+    # ── Stage-1 side-reconstruction features ─────────────────────────────────
+    # Reconstruct exact winner-side (w) and loser-side (l) values from the
+    # oriented differential d_x and the orientation-invariant sum x_sum:
+    #   x_w = 0.5 * (x_sum + d_x),   x_l = 0.5 * (x_sum - d_x)
+    def _sides(sum_col, diff_col, default=0.0):
+        s = _col(sum_col, default * 2)
+        d = _col(diff_col, 0.0)
+        return 0.5 * (s + d), 0.5 * (s - d)
+
+    dec_w,  dec_l  = _sides("dec_win_pct_sum",          "d_dec_win_pct",           0.0)
+    res_w,  res_l  = _sides("finish_resistance_sum",     "d_finish_resistance",     0.0)
+    cons_w, cons_l = _sides("consistency_sum",           "d_consistency",           0.0)
+    cardio_w, cardio_l = _sides("cardio_ratio_sum",      "d_cardio_ratio",          0.0)
+    dur_w,  dur_l  = _sides("durability_sum",            "d_durability",            0.0)
+    out_w,  out_l  = _sides("output_rate_sum",           "d_output_rate",           0.0)
+    r1_w,   r1_l   = _sides("rd1_intensity_ratio_sum",   "d_rd1_intensity_ratio",   0.0)
+    exch_w, exch_l = _sides("strike_exchange_ratio_sum", "d_strike_exchange_ratio", 0.0)
+    acc_w,  acc_l  = _sides("sig_str_acc_sum",           "d_sig_str_acc",           0.0)
+    late_w, late_l = _sides("late_round_pct_sum",        "d_late_round_pct",        0.0)
+    time_w, time_l = _sides("avg_time_min_sum",          "d_avg_time_min",          0.0)
+    afr_w,  afr_l  = _sides("avg_finish_round_sum",      "d_avg_finish_round",      0.0)
+    fr1_w,  fr1_l  = _sides("first_round_finish_rate_sum", "d_first_round_finish_rate", 0.0)
+    dmg_w,  dmg_l  = _sides("damage_efficiency_sum",    "d_damage_efficiency",      0.0)
+    attr_w_raw, attr_l_raw = _sides("body_leg_attrition_sum", "d_body_leg_attrition", 0.0)
+
+    # Reuse existing KO/Sub attack-vs-leak reconstructions
+    ko_w = np.maximum(ko_attack_vs_leak_w, 0.0)
+    ko_l = np.maximum(ko_attack_vs_leak_l, 0.0)
+    sub_w = np.maximum(sub_attack_vs_leak_w, 0.0)
+    sub_l = np.maximum(sub_attack_vs_leak_l, 0.0)
+
+    # ── Latent stage-1 components ─────────────────────────────────────────────
+    decision_shell_w = (
+        0.34*dec_w + 0.18*cons_w + 0.16*cardio_w + 0.14*res_w + 0.10*dur_w + 0.08*acc_w
+    ) * (0.90 + 0.10*late_w)
+    decision_shell_l = (
+        0.34*dec_l + 0.18*cons_l + 0.16*cardio_l + 0.14*res_l + 0.10*dur_l + 0.08*acc_l
+    ) * (0.90 + 0.10*late_l)
+
+    chaos_w = (
+        np.clip(out_w, 0, 8)
+        * (0.55 + np.clip(exch_w, 0.5, 1.8))
+        * (0.55 + np.clip(r1_w,  0.5, 1.8))
+    )
+    chaos_l = (
+        np.clip(out_l, 0, 8)
+        * (0.55 + np.clip(exch_l, 0.5, 1.8))
+        * (0.55 + np.clip(r1_l,  0.5, 1.8))
+    )
+
+    finish_speed_w = (1.0 / (afr_w + 0.75)) * (0.60 + 0.40*fr1_w)
+    finish_speed_l = (1.0 / (afr_l + 0.75)) * (0.60 + 0.40*fr1_l)
+
+    time_shell_w = time_w * (0.55 + 0.45*dec_w) * (0.70 + 0.30*res_w)
+    time_shell_l = time_l * (0.55 + 0.45*dec_l) * (0.70 + 0.30*res_l)
+
+    attrition_w = attr_w_raw * late_w * cardio_w
+    attrition_l = attr_l_raw * late_l * cardio_l
+
+    finish_total_w = ko_w + 0.92*sub_w + 0.10*dmg_w + 0.18*finish_speed_w
+    finish_total_l = ko_l + 0.92*sub_l + 0.10*dmg_l + 0.18*finish_speed_l
+
+    # ── Final stage-1 features ────────────────────────────────────────────────
+    X["m_decision_shell_gap"]       = decision_shell_w - decision_shell_l
+    X["m_decision_shell_sum"]       = decision_shell_w + decision_shell_l
+    X["m_finish_conversion_edge"]   = finish_total_w - 0.72*decision_shell_l + 0.12*chaos_w
+    X["m_finish_environment"]       = (finish_total_w + finish_total_l) - 0.68*(decision_shell_w + decision_shell_l)
+    X["m_mutual_finish_instability"] = finish_total_w * finish_total_l
+    X["m_decision_absorber"]        = (
+        decision_shell_w + decision_shell_l + time_shell_w + time_shell_l
+        - finish_total_w - finish_total_l - 0.25*(chaos_w + chaos_l)
+    )
+    X["m_early_finish_window"]      = (
+        (chaos_w + chaos_l)
+        * (4.0 - np.minimum(total_rounds, 4.0))
+        * (0.35 + ko_w + ko_l)
+    )
+    X["m_fast_start_fragility"]     = fr1_w*(1.0 - dur_l) + fr1_l*(1.0 - dur_w)
+    X["m_late_finish_window"]       = (
+        np.maximum(total_rounds - 2.0, 1.0)
+        * (
+            sub_w + sub_l
+            + 0.20*(2.0 - cardio_w - cardio_l)
+            + 0.15*(2.0 - decision_shell_w - decision_shell_l)
+            + 0.20*(attrition_w + attrition_l)
+        )
+    )
+    X["m_attrition_break_window"]   = attrition_w*(1.0 - cardio_l) + attrition_l*(1.0 - cardio_w)
+    X["m_time_profile_finish_bias"] = (
+        (finish_total_w + finish_total_l)
+        * (1.0/(1.0 + time_w) + 1.0/(1.0 + time_l))
+    )
+    X["m_finish_over_shell_ratio"]  = (
+        (finish_total_w + finish_total_l + eps)
+        / (decision_shell_w + decision_shell_l + eps)
+    )
+    X["m_clean_decision_track"]     = (
+        (dec_w*cons_w*acc_w + dec_l*cons_l*acc_l)
+        * (0.75 + 0.25*(time_w + time_l))
+    )
+    X["m_finish_speed_pressure"]    = finish_speed_w*(1.0 - res_l) + finish_speed_l*(1.0 - res_w)
+
     return X
 
 
@@ -2051,10 +2178,72 @@ def compute_matchup_features(a_feats, b_feats, is_title=0, total_rounds=3, weigh
     features["ko_attack_pressure_sum"] = a_ko_attack + b_ko_attack
     features["ko_def_leak_sum"] = a_ko_leak + b_ko_leak
 
+    # Stage-1 sum features for exact winner/loser reconstruction after orientation.
+    for _feat, _default in [
+        ("dec_win_pct", 0.0), ("finish_resistance", 0.0), ("consistency", 0.0),
+        ("cardio_ratio", 0.0), ("durability", 0.0), ("output_rate", 0.0),
+        ("rd1_intensity_ratio", 0.0), ("strike_exchange_ratio", 0.0),
+        ("sig_str_acc", 0.0), ("late_round_pct", 0.0), ("avg_time_min", 0.0),
+        ("avg_finish_round", 0.0), ("first_round_finish_rate", 0.0),
+        ("damage_efficiency", 0.0), ("body_leg_attrition", 0.0),
+    ]:
+        _a = _num_or(a_feats.get(_feat), _default)
+        _b = _num_or(b_feats.get(_feat), _default)
+        features[f"{_feat}_sum"] = _a + _b
+
     return features
 
 
 # ─── Training data builder ────────────────────────────────────────────────────
+
+def _precompute_context_finish_priors(df):
+    """Compute per-row finish priors conditioned on (weight_class, gender, total_rounds, is_title).
+
+    ctx_finish_prior_2y: exponentially time-decayed (half-life 730 days) Bayesian
+        estimate of the finish rate for fights of the same type before this date.
+    ref_finish_prior: unweighted Laplace-smoothed count-based version of the same.
+    Both use alpha=20 and p0 = global historical finish rate as the prior mean.
+    """
+    n = len(df)
+    ctx_arr = np.full(n, np.nan, dtype=float)
+    ref_arr = np.full(n, np.nan, dtype=float)
+
+    methods = df["method"].astype(str).str.lower()
+    is_finish = (~methods.str.contains("dec", na=False)).astype(float).values
+    p0 = float(np.mean(is_finish)) if n > 0 else 0.55
+    alpha = 20.0
+
+    wc_col = df["weight_class"].astype(str).values if "weight_class" in df.columns else np.full(n, "", dtype=object)
+    gd_col = df["gender"].astype(str).str.lower().values if "gender" in df.columns else np.full(n, "unknown", dtype=object)
+    rd_col = df["total_rounds"].fillna(3).astype(int).values if "total_rounds" in df.columns else np.full(n, 3, dtype=int)
+    tt_col = df["is_title_bout"].fillna(0).astype(int).values if "is_title_bout" in df.columns else np.zeros(n, dtype=int)
+
+    epoch = df["event_date"].iloc[0]
+    days = ((df["event_date"] - epoch) / pd.Timedelta(days=1)).values.astype(float)
+
+    # Per-context running state: (decayed_finish_sum, decayed_total_weight, finish_count, total_count, last_days)
+    state = {}
+
+    for i in range(n):
+        key = (wc_col[i], gd_col[i], int(rd_col[i]), int(tt_col[i]))
+        cur_d = days[i]
+
+        if key in state:
+            fs, tw, fc, tc, last_d = state[key]
+            decay = 2.0 ** (-(cur_d - last_d) / 730.0)
+            fs *= decay
+            tw *= decay
+        else:
+            fs, tw, fc, tc = 0.0, 0.0, 0, 0
+
+        ctx_arr[i] = (fs + alpha * p0) / (tw + alpha)
+        ref_arr[i] = (fc + alpha * p0) / (tc + alpha)
+
+        # Update state with current fight (weight = 1.0 at this moment)
+        state[key] = (fs + float(is_finish[i]), tw + 1.0, fc + int(is_finish[i]), tc + 1, cur_d)
+
+    return ctx_arr, ref_arr
+
 
 def build_training_data(csv_path, progress_cb=None):
     """Process fights chronologically, build features, return X, y and state."""
@@ -2062,6 +2251,8 @@ def build_training_data(csv_path, progress_cb=None):
     df["event_date"] = pd.to_datetime(df["event_date"], format="%m/%d/%Y")
     df = df.sort_values("event_date").reset_index(drop=True)
     _ensure_fighter_feature_keys(df["event_date"].iloc[0] if len(df) else None)
+
+    ctx_finish_prior_arr, ref_finish_prior_arr = _precompute_context_finish_priors(df)
 
     fighter_history = defaultdict(list)
     glicko_ratings = {}
@@ -2105,6 +2296,8 @@ def build_training_data(csv_path, progress_cb=None):
             weight_class=row.get("weight_class", ""),
         )
         if row["winner"] in ("Red", "Blue"):
+            matchup["ctx_finish_prior_2y"] = float(ctx_finish_prior_arr[idx])
+            matchup["ref_finish_prior"] = float(ref_finish_prior_arr[idx])
             rows_X.append(matchup)
             rows_y.append(1.0 if row["winner"] == "Red" else 0.0)
 
@@ -3259,11 +3452,13 @@ class SuperEnsembleModel:
         p_finish = float(_apply_binary_threshold_warp(p_finish, finish_thr))
         p_finish = float(np.clip(p_finish, 1e-4, 1.0 - 1e-4))
 
-        p_sub_raw = float(stage2.predict_proba(X_imp)[:, 1][0])
+        _s2c = self.method_bundle.get("stage2_cols")
+        X_imp_s2 = X_imp.reindex(columns=_s2c) if _s2c else X_imp
+        p_sub_raw = float(stage2.predict_proba(X_imp_s2)[:, 1][0])
         if stage2_rf is not None:
-            p_sub_rf = float(stage2_rf.predict_proba(X_imp)[:, 1][0])
+            p_sub_rf = float(stage2_rf.predict_proba(X_imp_s2)[:, 1][0])
             if stage2_et is not None:
-                p_sub_et = float(stage2_et.predict_proba(X_imp)[:, 1][0])
+                p_sub_et = float(stage2_et.predict_proba(X_imp_s2)[:, 1][0])
                 p_sub_tree = 0.55 * p_sub_rf + 0.45 * p_sub_et
             else:
                 p_sub_tree = p_sub_rf
@@ -4194,7 +4389,8 @@ class UFCSuperModelPipeline:
                 finish_tr_mask = (y_method_dev.iloc[tr_idx]["finish_bin"].values == "Finish")
                 if int(np.sum(finish_tr_mask)) < 60:
                     finish_tr_mask = np.ones(len(tr_idx), dtype=bool)
-                X2_tr = X_m_tr_imp.iloc[np.where(finish_tr_mask)[0]].reset_index(drop=True)
+                stage2_cols = [c for c in X_m_tr_imp.columns if c not in STAGE2_EXCLUDE_COLS]
+                X2_tr = X_m_tr_imp.iloc[np.where(finish_tr_mask)[0]][stage2_cols].reset_index(drop=True)
                 y2_tr = y_sub_tr[np.where(finish_tr_mask)[0]]
                 p_sub = max(1e-6, float(np.mean(y2_tr))) if len(y2_tr) > 0 else 0.5
                 w2 = np.where(y2_tr == 1, 0.5 / p_sub, 0.5 / max(1e-6, 1.0 - p_sub))
@@ -4280,9 +4476,10 @@ class UFCSuperModelPipeline:
                     p_finish_c = 1.0 / (1.0 + np.exp(-((logit / max(0.35, float(temp_dec))) + float(bias_finish))))
                     p_finish_c = _apply_binary_threshold_warp(p_finish_c, finish_thr)
 
-                    p_sub_hist = stage2.predict_proba(X_imp)[:, 1]
-                    p_sub_rf = stage2_rf.predict_proba(X_imp)[:, 1]
-                    p_sub_et = stage2_et.predict_proba(X_imp)[:, 1]
+                    X_s2 = X_imp[stage2_cols]
+                    p_sub_hist = stage2.predict_proba(X_s2)[:, 1]
+                    p_sub_rf = stage2_rf.predict_proba(X_s2)[:, 1]
+                    p_sub_et = stage2_et.predict_proba(X_s2)[:, 1]
                     p_sub_tree = 0.55 * p_sub_rf + 0.45 * p_sub_et
                     p_sub_raw = alpha2 * p_sub_hist + (1.0 - alpha2) * p_sub_tree
                     logit2 = np.log(np.clip(p_sub_raw, 1e-6, 1 - 1e-6) / np.clip(1.0 - p_sub_raw, 1e-6, 1 - 1e-6))
@@ -4465,6 +4662,7 @@ class UFCSuperModelPipeline:
                         pred_share = pred_share / max(1.0, float(np.sum(pred_share)))
                         true_share = np.bincount(y_va_idx, minlength=len(METHOD_LABELS)).astype(float)
                         true_share = true_share / max(1.0, float(np.sum(true_share)))
+                        finish_score_tune = 0.0
                     else:
                         y_sub_idx = y_va_idx[winner_correct_va]
                         pred_sub_idx = pred_idx[winner_correct_va]
@@ -4476,11 +4674,22 @@ class UFCSuperModelPipeline:
                             if int(np.sum(mask_cls)) > 0:
                                 recalls.append(float(np.mean(pred_sub_idx[mask_cls] == cls_i)))
                         macro_recall = float(np.mean(recalls)) if recalls else score
-                        minority_recall = float(np.mean(recalls[1:])) if len(recalls) >= 3 else macro_recall
+                        _ko_r_min = float(recalls[1]) if len(recalls) > 1 else 0.0
+                        _sub_r_min = float(recalls[2]) if len(recalls) > 2 else 0.0
+                        minority_recall = 2.0 * _ko_r_min * _sub_r_min / max(1e-9, _ko_r_min + _sub_r_min)
                         pred_share = np.bincount(pred_sub_idx, minlength=len(METHOD_LABELS)).astype(float)
                         pred_share = pred_share / max(1.0, float(np.sum(pred_share)))
                         true_share = np.bincount(y_sub_idx, minlength=len(METHOD_LABELS)).astype(float)
                         true_share = true_share / max(1.0, float(np.sum(true_share)))
+                        _ko_mask_t = (y_sub_idx == 1)
+                        _sub_mask_t = (y_sub_idx == 2)
+                        _ko_r_t = float(np.mean(pred_sub_idx[_ko_mask_t] == 1)) if int(np.sum(_ko_mask_t)) > 0 else 0.0
+                        _sub_r_t = float(np.mean(pred_sub_idx[_sub_mask_t] == 2)) if int(np.sum(_sub_mask_t)) > 0 else 0.0
+                        _ko_prec_t = float(np.sum((pred_sub_idx == 1) & _ko_mask_t)) / max(1, int(np.sum(pred_sub_idx == 1)))
+                        _sub_prec_t = float(np.sum((pred_sub_idx == 2) & _sub_mask_t)) / max(1, int(np.sum(pred_sub_idx == 2)))
+                        _ko_f1_t = 2.0 * _ko_prec_t * _ko_r_t / max(1e-9, _ko_prec_t + _ko_r_t)
+                        _sub_f1_t = 2.0 * _sub_prec_t * _sub_r_t / max(1e-9, _sub_prec_t + _sub_r_t)
+                        finish_score_tune = 0.4 * _ko_r_t + 0.4 * _sub_r_t + 0.2 * 0.5 * (_ko_f1_t + _sub_f1_t)
                     distribution_shift = float(np.sum(np.abs(pred_share - true_share)))
                     chunk_scores = []
                     for ch in va_chunks:
@@ -4490,7 +4699,13 @@ class UFCSuperModelPipeline:
                         else:
                             chunk_scores.append(float(np.mean(pred_idx[ch] == y_va_idx[ch])))
                     robust_score = float(np.mean(chunk_scores)) - 0.60 * float(np.std(chunk_scores))
-                    objective = robust_score + 0.04 * macro_recall + 0.02 * minority_recall - 0.10 * distribution_shift
+                    _pred_finish_rate = float(pred_share[1] + pred_share[2])
+                    _true_finish_rate = float(true_share[1] + true_share[2])
+                    _finish_underpredict = max(0.0, _true_finish_rate - _pred_finish_rate - 0.08)
+                    _pred_sub_rate = float(pred_share[2])
+                    _true_sub_rate = float(true_share[2])
+                    _sub_underpredict = max(0.0, _true_sub_rate - _pred_sub_rate - 0.04)
+                    objective = robust_score + 0.04 * macro_recall + 0.12 * minority_recall - 0.04 * distribution_shift + 0.08 * finish_score_tune - 0.10 * _finish_underpredict - 0.30 * _sub_underpredict
                     key = (objective, robust_score, score, minority_recall, -distribution_shift, -baseline)
                     if best_cfg is None or key > best_cfg["key"]:
                         best_cfg = {
@@ -4673,6 +4888,7 @@ class UFCSuperModelPipeline:
                     "w_base": float(best_cfg["w_base"]),
                     "w_subsig": float(best_cfg.get("w_subsig", 0.0)),
                     "sub_boost_k": float(best_cfg.get("sub_boost_k", 0.0)),
+                    "stage2_cols": stage2_cols,
                     "method_bias_decision": float(best_cfg["method_bias_decision"]),
                     "method_bias_ko_tko": float(best_cfg["method_bias_ko_tko"]),
                     "method_bias_submission": float(best_cfg["method_bias_submission"]),
@@ -4737,9 +4953,11 @@ class UFCSuperModelPipeline:
                     y_sub_true = (
                         y_method_test.iloc[finish_idx_true]["finish_subtype"].astype(str).values == "Submission"
                     ).astype(int)
-                    p_sub_hist_t = method_bundle["stage2"].predict_proba(X_test_fin_true)[:, 1]
-                    p_sub_rf_t = method_bundle["stage2_rf"].predict_proba(X_test_fin_true)[:, 1]
-                    p_sub_et_t = method_bundle["stage2_et"].predict_proba(X_test_fin_true)[:, 1]
+                    _s2c = method_bundle.get("stage2_cols")
+                    X_test_fin_s2 = X_test_fin_true.reindex(columns=_s2c) if _s2c else X_test_fin_true
+                    p_sub_hist_t = method_bundle["stage2"].predict_proba(X_test_fin_s2)[:, 1]
+                    p_sub_rf_t = method_bundle["stage2_rf"].predict_proba(X_test_fin_s2)[:, 1]
+                    p_sub_et_t = method_bundle["stage2_et"].predict_proba(X_test_fin_s2)[:, 1]
                     p_sub_tree_t = 0.55 * p_sub_rf_t + 0.45 * p_sub_et_t
                     p_sub_raw_t = (
                         float(method_bundle.get("alpha_stage2", 0.75)) * p_sub_hist_t
