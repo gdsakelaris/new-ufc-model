@@ -84,7 +84,7 @@ METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_cham
 # Bump when winner-stage training logic changes.
 WINNER_CACHE_VERSION = "v1"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v4"
+METHOD_CACHE_VERSION = "v5"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"

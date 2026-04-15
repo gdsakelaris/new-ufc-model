@@ -113,12 +113,41 @@ Accuracy by Gender
 ------------------------------------------------------------------------
 Men (n=782): 66.1%
 Women (n=132): 69.7%
-Method cache: HIT (v4) key=ffd194a5bff8 file=method_stage_ffd194a5bff89b44d9a0.pkl
+Method cache: HIT (v5) key=c20c5808625c file=method_stage_c20c5808625c1648b17e.pkl
 
 ========================================================================
 Method Model
 ========================================================================
-Cache: HIT (v4) — method retrain skipped
+Cache: HIT (v5) — method retrain skipped
+Method classes (training): Decision, KO/TKO, Submission
+Validation metric target (method | winner correct): 50.4%
+Validation majority baseline (same subset): 50.0%
+
+========================================================================
+Method Evaluation (Conditioned on Winner Pick)
+========================================================================
+Stage1 acc (Finish vs Decision): 58.8%
+Stage1 AUC (Finish vs Decision): 0.635
+Stage2 acc (KO/Sub | true finishes): 63.8%
+Stage2 sample size (true finishes): 461
+Method acc (predicted winner conditioned): 47.4%
+Method acc | winner pick correct: 51.4%
+Majority baseline | winner pick correct: 49.9%
+Balanced accuracy | winner pick correct: 49.5%
+Macro F1 | winner pick correct: 48.2%
+FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1): 46.1%
+
+Per-Class Metrics (Method | winner pick correct)
+Class          Precision    Recall      F1
+Decision           63.8%     54.6%     58.9%
+KO/TKO             50.0%     50.5%     50.2%
+Submission         30.2%     43.3%     35.6%
+
+Confusion Matrix (Method | winner pick correct)
+Actual\Pred     Decision    KO/TKO  Submission
+Decision             166        79          59
+KO/TKO                65       105          38
+Submission            29        26          42
 
 ========================================================================
 Walk-Forward Diagnostics
@@ -135,3 +164,4 @@ Walk-forward std: 0.0277
 ========================================================================
 Prediction Run Complete
 ========================================================================
+68 matchups predicted. Skipped 6 debutant matchup(s). Saved to UFC_Predictions.xlsx
