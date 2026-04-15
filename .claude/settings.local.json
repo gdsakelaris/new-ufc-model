@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -m py_compile \"c:/Users/gdsak/OneDrive/Desktop/Glicko-2, Etc/UFC_Model.py\")"
-    ]
-  }
-}
