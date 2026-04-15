@@ -2840,8 +2840,8 @@ def _fit_best_calibrator(val_probs, y_val):
         obj_platt, ll_platt, _, _ = _score_eval(p_platt)
         if obj_platt + 1e-4 < best_obj or (abs(obj_platt - best_obj) <= 1e-4 and ll_platt + 1e-4 < best_ll):
             best_name, best_cal, best_obj, best_ll = "platt", platt, obj_platt, ll_platt
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"WARNING: Platt calibration candidate failed ({_e}) — skipped")
 
     try:
         iso = IsotonicRegression(y_min=1e-6, y_max=1 - 1e-6, out_of_bounds="clip")
@@ -2851,8 +2851,8 @@ def _fit_best_calibrator(val_probs, y_val):
         # Require bigger gain for isotonic to avoid overfitting.
         if obj_iso + 2e-4 < best_obj or (abs(obj_iso - best_obj) <= 2e-4 and ll_iso + 2e-4 < best_ll):
             best_name, best_cal, best_obj, best_ll = "isotonic", _IsoWrapper(iso), obj_iso, ll_iso
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"WARNING: Isotonic calibration candidate failed ({_e}) — skipped")
 
     return best_cal, best_name, best_ll
 
@@ -3208,8 +3208,8 @@ def _choose_combiner(meta_train, y_meta_train, meta_val, y_meta_val):
             {"kind": "stacker", "model": hgb_meta, "model_order": order},
             ll_hgb, float(acc_hgb), float(thr_hgb), "stacker_hgb"
         ))
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"WARNING: HGB meta-stacker combiner candidate failed ({_e}) — skipped")
 
     # Primary: log-loss, secondary: accuracy.
     candidates.sort(key=lambda x: (x[1], -x[2], abs(x[3] - 0.5)))
@@ -3254,8 +3254,8 @@ def _pick_best_holdout_combiner(test_meta_df, y_test, base_combiner, allow_aggre
                 "meta_lr_insample",
                 {"kind": "stacker", "model": lr_meta, "model_order": model_order},
             ))
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"WARNING: LR holdout meta-combiner candidate failed ({_e}) — skipped")
         try:
             hgb_meta = HistGradientBoostingClassifier(
                 max_iter=350, learning_rate=0.05, max_depth=4,
@@ -3266,8 +3266,8 @@ def _pick_best_holdout_combiner(test_meta_df, y_test, base_combiner, allow_aggre
                 "meta_hgb_insample",
                 {"kind": "stacker", "model": hgb_meta, "model_order": model_order},
             ))
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"WARNING: HGB holdout meta-combiner candidate failed ({_e}) — skipped")
 
     # Add pairwise weighted blends from strongest single models.
     single_rows = []
@@ -4951,7 +4951,8 @@ class UFCSuperModelPipeline:
                         if best_meta_key is None or key_m > best_meta_key:
                             best_meta_key = key_m
                             meta_eta = float(eta)
-                except Exception:
+                except Exception as _e:
+                    self._stat("WARNING", f"Method meta-calibrator failed ({_e}) — disabled")
                     meta_model = None
                     meta_eta = 0.0
 
@@ -5467,7 +5468,8 @@ class UFCSuperModelPipeline:
                     "group_priors": group_priors_all,
                     "detail_labels_seen": method_bundle.get("detail_labels_seen", []),
                 }
-            except Exception:
+            except Exception as _e:
+                self._stat("WARNING", f"All-data method retrain failed ({_e}) — method predictions disabled")
                 method_bundle_all = None
 
         self.model = SuperEnsembleModel(
