@@ -177,7 +177,7 @@ FEATURE_ROUTING = {
     "striker_vs_grappler_index":   {"winner", "stage2"},
     "d_tdd_vs_td_attack":          {"winner", "stage2"},
     "d_kd_vulnerability":          {"stage2"},
-    "d_finish_resistance":         {"stage1"},
+    # NOTE: d_finish_resistance already exists as a live feature in both models — not routed.
     # --- Batch 4: form / context / priors (§E, §F, §G) ---
     "days_since_last_fight_A":     {"winner"},
     "days_since_last_fight_B":     {"winner"},
@@ -193,8 +193,7 @@ FEATURE_ROUTING = {
     "gender_flag":                 {"winner", "stage1", "stage2"},
     "title_x_cardio":              {"winner"},
     "total_rounds_x_finish_resistance": {"winner", "stage1"},
-    "d_avg_finish_round":          {"stage1"},
-    "d_first_round_finish_rate":   {"stage1"},
+    # NOTE: d_avg_finish_round and d_first_round_finish_rate already exist as live features — not routed.
     "d_decision_rate":             {"stage1"},
 }
 _ROUTING_WINNER_EXCLUDE = {f for f, tags in FEATURE_ROUTING.items() if "winner" not in tags}
