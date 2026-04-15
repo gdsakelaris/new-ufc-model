@@ -82,9 +82,9 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
 METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_champion_cfg.json")
 ###################################################################################################
 # Bump when winner-stage training logic changes.
-WINNER_CACHE_VERSION = "v1"
+WINNER_CACHE_VERSION = "v2"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v5"
+METHOD_CACHE_VERSION = "v6"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -140,7 +140,7 @@ WINNER_EXCLUDE_FEATURES = {
 }
 # Features that are stage-1-specific (finish vs decision signals) and must be
 # withheld from stage-2 (KO vs Sub), which was calibrated without them.
-STAGE2_EXCLUDE_COLS = frozenset({
+STAGE2_EXCLUDE_COLS_BASE = frozenset({
     "m_decision_shell_gap", "m_decision_shell_sum", "m_finish_conversion_edge",
     "m_finish_environment", "m_mutual_finish_instability", "m_decision_absorber",
     "m_early_finish_window", "m_fast_start_fragility", "m_late_finish_window",
@@ -148,6 +148,63 @@ STAGE2_EXCLUDE_COLS = frozenset({
     "m_finish_over_shell_ratio", "m_clean_decision_track", "m_finish_speed_pressure",
     "ctx_finish_prior_2y", "ref_finish_prior",
 })
+###################################################################################################
+# FEATURE_ROUTING — single source of truth for which models see which engineered features.
+# Each key is a feature name; the value is the set of models that should receive it.
+# Allowed tags: "winner", "stage1" (Finish vs Decision), "stage2" (KO vs Sub).
+# Filters are auto-derived below; to change a feature's routing, edit this dict only.
+FEATURE_ROUTING = {
+    # --- Batch 2: within-fight pacing (§A) ---
+    "d_rd1_output_gap":            {"winner", "stage1"},
+    "d_rd1_kd_rate":               {"stage2"},
+    "d_early_td_pressure":         {"winner", "stage2"},
+    "d_cardio_decay_gap":          {"winner", "stage1"},
+    "d_late_round_output":         {"winner", "stage1"},
+    "d_rd3_sub_att_rate":          {"stage2"},
+    "d_rd1_ctrl_share":            {"winner", "stage2"},
+    "rd_variance_A":               {"stage1"},
+    "rd_variance_B":               {"stage1"},
+    # --- Batch 3: physical / style / matchup (§B, §C, §D) ---
+    "d_reach_per_height":          {"winner", "stage1", "stage2"},
+    "d_reach_x_distance_pct":      {"winner", "stage2"},
+    "d_age_x_cardio":              {"winner", "stage1"},
+    "d_age_x_title_rounds":        {"winner"},
+    "d_head_share_x_power":        {"stage2"},
+    "d_leg_kick_pressure":         {"stage1"},
+    "d_clinch_dominance":          {"stage2"},
+    "d_ground_time_x_sub_att":     {"stage2"},
+    "d_stance_x_leg_kicks":        {"stage1"},
+    "striker_vs_grappler_index":   {"winner", "stage2"},
+    "d_tdd_vs_td_attack":          {"winner", "stage2"},
+    "d_kd_vulnerability":          {"stage2"},
+    "d_finish_resistance":         {"stage1"},
+    # --- Batch 4: form / context / priors (§E, §F, §G) ---
+    "days_since_last_fight_A":     {"winner"},
+    "days_since_last_fight_B":     {"winner"},
+    "d_layoff_days":               {"winner"},
+    "d_short_notice_proxy":        {"winner"},
+    "d_recent_damage_absorbed":    {"winner", "stage2"},
+    "d_recent_finish_rate":        {"stage1"},
+    "d_glicko_trend":              {"winner"},
+    "d_win_streak":                {"winner"},
+    "d_loss_streak":               {"winner"},
+    "weight_class_finish_prior":   {"stage1"},
+    "weight_class_x_kd_pm":        {"stage2"},
+    "gender_flag":                 {"winner", "stage1", "stage2"},
+    "title_x_cardio":              {"winner"},
+    "total_rounds_x_finish_resistance": {"winner", "stage1"},
+    "d_avg_finish_round":          {"stage1"},
+    "d_first_round_finish_rate":   {"stage1"},
+    "d_decision_rate":             {"stage1"},
+}
+_ROUTING_WINNER_EXCLUDE = {f for f, tags in FEATURE_ROUTING.items() if "winner" not in tags}
+_ROUTING_STAGE1_EXCLUDE = {f for f, tags in FEATURE_ROUTING.items() if "stage1" not in tags}
+_ROUTING_STAGE2_EXCLUDE = {f for f, tags in FEATURE_ROUTING.items() if "stage2" not in tags}
+# Merge auto-derived sets with the existing manually-curated excludes.
+WINNER_EXCLUDE_FEATURES = WINNER_EXCLUDE_FEATURES | _ROUTING_WINNER_EXCLUDE
+STAGE1_EXCLUDE_COLS = frozenset(_ROUTING_STAGE1_EXCLUDE)
+STAGE2_EXCLUDE_COLS = frozenset(STAGE2_EXCLUDE_COLS_BASE | _ROUTING_STAGE2_EXCLUDE)
+###################################################################################################
 STRICT_FUTURE_MODE = True
 FORCED_START_YEAR = None
 MISSINGNESS_THRESHOLD = 0.35
@@ -3496,11 +3553,13 @@ class SuperEnsembleModel:
         finish_thr = float(self.method_bundle.get("finish_threshold", 0.50))
         sub_thr = float(self.method_bundle.get("sub_threshold", 0.50))
 
-        p_finish_raw = float(stage1.predict_proba(X_imp)[:, 1][0])
+        _s1c = self.method_bundle.get("stage1_cols")
+        X_imp_s1 = X_imp.reindex(columns=_s1c) if _s1c else X_imp
+        p_finish_raw = float(stage1.predict_proba(X_imp_s1)[:, 1][0])
         if stage1_rf is not None:
-            p_finish_rf = float(stage1_rf.predict_proba(X_imp)[:, 1][0])
+            p_finish_rf = float(stage1_rf.predict_proba(X_imp_s1)[:, 1][0])
             if stage1_et is not None:
-                p_finish_et = float(stage1_et.predict_proba(X_imp)[:, 1][0])
+                p_finish_et = float(stage1_et.predict_proba(X_imp_s1)[:, 1][0])
                 p_finish_tree = 0.55 * p_finish_rf + 0.45 * p_finish_et
             else:
                 p_finish_tree = p_finish_rf
@@ -4425,25 +4484,27 @@ class UFCSuperModelPipeline:
                 finish_w = np.where(y_bin_tr == 1, 0.5 / p_finish, 0.5 / max(1e-6, 1.0 - p_finish))
                 w_stage1 = w_time * finish_w
 
+                stage1_cols = [c for c in X_m_tr_imp.columns if c not in STAGE1_EXCLUDE_COLS]
+                X1_tr = X_m_tr_imp[stage1_cols]
                 stage1 = HistGradientBoostingClassifier(
                     loss="log_loss",
                     max_iter=360, learning_rate=0.045, max_depth=6,
                     max_leaf_nodes=31, min_samples_leaf=16, l2_regularization=0.8,
                     random_state=RANDOM_SEED + 808,
                 )
-                stage1.fit(X_m_tr_imp, y_bin_tr, sample_weight=w_stage1)
+                stage1.fit(X1_tr, y_bin_tr, sample_weight=w_stage1)
                 stage1_rf = RandomForestClassifier(
                     n_estimators=420, max_depth=10, min_samples_leaf=4,
                     max_features=0.7, random_state=RANDOM_SEED + 910, n_jobs=-1,
                     class_weight="balanced_subsample",
                 )
-                stage1_rf.fit(X_m_tr_imp, y_bin_tr)
+                stage1_rf.fit(X1_tr, y_bin_tr)
                 stage1_et = ExtraTreesClassifier(
                     n_estimators=560, max_depth=12, min_samples_leaf=3,
                     max_features=0.72, random_state=RANDOM_SEED + 914, n_jobs=-1,
                     class_weight="balanced_subsample",
                 )
-                stage1_et.fit(X_m_tr_imp, y_bin_tr)
+                stage1_et.fit(X1_tr, y_bin_tr)
 
                 finish_tr_mask = (y_method_dev.iloc[tr_idx]["finish_bin"].values == "Finish")
                 if int(np.sum(finish_tr_mask)) < 60:
@@ -4526,9 +4587,10 @@ class UFCSuperModelPipeline:
                     bias_finish=0.0, bias_sub=0.0, alpha_direct=0.85, beta_direct=0.70,
                     alpha_ovr=0.85, finish_thr=0.50, sub_thr=0.50, alpha_simple=0.80
                 ):
-                    p_finish_hist = stage1.predict_proba(X_imp)[:, 1]
-                    p_finish_rf = stage1_rf.predict_proba(X_imp)[:, 1]
-                    p_finish_et = stage1_et.predict_proba(X_imp)[:, 1]
+                    X_s1 = X_imp[stage1_cols]
+                    p_finish_hist = stage1.predict_proba(X_s1)[:, 1]
+                    p_finish_rf = stage1_rf.predict_proba(X_s1)[:, 1]
+                    p_finish_et = stage1_et.predict_proba(X_s1)[:, 1]
                     p_finish_tree = 0.55 * p_finish_rf + 0.45 * p_finish_et
                     p_finish_raw = alpha1 * p_finish_hist + (1.0 - alpha1) * p_finish_tree
                     logit = np.log(np.clip(p_finish_raw, 1e-6, 1 - 1e-6) / np.clip(1.0 - p_finish_raw, 1e-6, 1 - 1e-6))
@@ -5049,6 +5111,7 @@ class UFCSuperModelPipeline:
                     "w_base": float(best_cfg["w_base"]),
                     "w_subsig": float(best_cfg.get("w_subsig", 0.0)),
                     "sub_boost_k": float(best_cfg.get("sub_boost_k", 0.0)),
+                    "stage1_cols": stage1_cols,
                     "stage2_cols": stage2_cols,
                     "method_bias_decision": float(best_cfg["method_bias_decision"]),
                     "method_bias_ko_tko": float(best_cfg["method_bias_ko_tko"]),
@@ -5074,9 +5137,11 @@ class UFCSuperModelPipeline:
                 )
                 # Stage-only diagnostics.
                 y_finish_true = (y_method_test["finish_bin"].astype(str).values == "Finish").astype(int)
-                p_finish_hist_t = method_bundle["stage1"].predict_proba(X_test_oriented_pred_imp)[:, 1]
-                p_finish_rf_t = method_bundle["stage1_rf"].predict_proba(X_test_oriented_pred_imp)[:, 1]
-                p_finish_et_t = method_bundle["stage1_et"].predict_proba(X_test_oriented_pred_imp)[:, 1]
+                _s1c_t = method_bundle.get("stage1_cols")
+                X_test_s1 = X_test_oriented_pred_imp.reindex(columns=_s1c_t) if _s1c_t else X_test_oriented_pred_imp
+                p_finish_hist_t = method_bundle["stage1"].predict_proba(X_test_s1)[:, 1]
+                p_finish_rf_t = method_bundle["stage1_rf"].predict_proba(X_test_s1)[:, 1]
+                p_finish_et_t = method_bundle["stage1_et"].predict_proba(X_test_s1)[:, 1]
                 p_finish_tree_t = 0.55 * p_finish_rf_t + 0.45 * p_finish_et_t
                 p_finish_raw_t = (
                     float(method_bundle.get("alpha_stage1", 0.75)) * p_finish_hist_t
