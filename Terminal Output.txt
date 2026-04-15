@@ -1,0 +1,137 @@
+========================================================================
+Data Build
+========================================================================
+Building chronological leak-safe training matrix...
+  Building features... fight 1/9077
+  Building features... fight 501/9077
+  Building features... fight 1001/9077
+  Building features... fight 1501/9077
+  Building features... fight 2001/9077
+  Building features... fight 2501/9077
+  Building features... fight 3001/9077
+  Building features... fight 3501/9077
+  Building features... fight 4001/9077
+  Building features... fight 4501/9077
+  Building features... fight 5001/9077
+  Building features... fight 5501/9077
+  Building features... fight 6001/9077
+  Building features... fight 6501/9077
+  Building features... fight 7001/9077
+  Building features... fight 7501/9077
+  Building features... fight 8001/9077
+  Building features... fight 8501/9077
+  Building features... fight 9001/9077
+  Built 9012 training samples with 313 features.
+
+========================================================================
+Era Selection
+========================================================================
+Selected start year: 2018
+Rows kept: 4574
+Validation proxy acc: 60.3%
+
+========================================================================
+Split Contract
+========================================================================
+Train rows: 2974
+Validation rows: 686
+Holdout test rows: 914
+Feature count: 351
+Winner feature count: 302
+Winner cache: HIT (v1) key=879cdde7a99c file=winner_stage_879cdde7a99cacb8de85.pkl
+
+========================================================================
+Optuna Tuning
+========================================================================
+Cache: HIT (v1) — Optuna skipped [key=879cdde7a99c]
+
+========================================================================
+Model Setup
+========================================================================
+Base models: LightGBM, LightGBM_S2, LightGBM_Tuned, XGBoost, XGBoost_S2, XGBoost_Tuned, CatBoost, CatBoost_S2, CatBoost_Tuned, HistGBM, HistGBM_Wide, RandForest, RandForest_Deep, ExtraTrees, ExtraTrees_Deep, AdaBoost
+
+========================================================================
+OOF Stacking
+========================================================================
+Cache: HIT (v1) — OOF skipped [key=879cdde7a99c]
+
+========================================================================
+Combiner Selection
+========================================================================
+Selected combiner: weighted
+Validation log-loss: 0.6427
+Validation accuracy: 63.8%
+Validation threshold: 0.508
+
+========================================================================
+Calibration
+========================================================================
+Selected method: none
+Validation log-loss: 0.6598
+Strict future mode: ON
+Calibration used for picks: no
+Validation accuracy (picked): 63.6%
+Validation tuned threshold: 0.498 (acc=60.4%)
+Decision threshold: 0.499
+
+========================================================================
+Holdout Evaluation
+========================================================================
+Raw log-loss: 0.6195
+Calibrated log-loss: 0.6195
+Brier score: 0.2151
+Accuracy: 66.63%
+ECE: 0.0337
+Calibration curve RMSE: 0.0557
+Accuracy threshold: 0.499
+
+========================================================================
+Winner Diagnostics
+========================================================================
+Confusion Matrix (Winner: Red=positive)
+               Pred Blue   Pred Red
+Actual Blue         209        196
+Actual Red          109        400
+
+Accuracy by Weight Class
+------------------------------------------------------------------------
+Women's Strawweight (n=57): 68.4%
+Women's Flyweight (n=41): 65.9%
+Women's Bantamweight (n=33): 78.8%
+Women's Featherweight (n=1): 0.0%
+Flyweight (n=74): 59.5%
+Bantamweight (n=103): 58.3%
+Featherweight (n=115): 70.4%
+Lightweight (n=115): 66.1%
+Welterweight (n=104): 76.9%
+Middleweight (n=127): 65.4%
+Light Heavyweight (n=71): 59.2%
+Heavyweight (n=60): 68.3%
+Catch Weight (n=13): 76.9%
+
+Accuracy by Gender
+------------------------------------------------------------------------
+Men (n=782): 66.1%
+Women (n=132): 69.7%
+Method cache: HIT (v4) key=ffd194a5bff8 file=method_stage_ffd194a5bff89b44d9a0.pkl
+
+========================================================================
+Method Model
+========================================================================
+Cache: HIT (v4) — method retrain skipped
+
+========================================================================
+Walk-Forward Diagnostics
+========================================================================
+Fold 1 log-loss: 0.6545 (365 fights)
+Fold 2 log-loss: 0.7024 (365 fights)
+Fold 3 log-loss: 0.6734 (365 fights)
+Fold 4 log-loss: 0.6852 (365 fights)
+Fold 5 log-loss: 0.6194 (365 fights)
+Fold 6 log-loss: 0.6416 (365 fights)
+Walk-forward mean log-loss: 0.6628
+Walk-forward std: 0.0277
+
+========================================================================
+Prediction Run Complete
+========================================================================

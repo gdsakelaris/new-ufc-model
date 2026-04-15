@@ -297,6 +297,62 @@ def _replay_winner_cache_logs(pl, W, winner_cache_key):
         pl._stat(f"{gender} (n={int(n_g)})", f"{float(acc_g):.1%}")
 
 
+def _replay_method_cache_logs(pl, M):
+    """Replay method-stage terminal sections from a cache payload (no retrain)."""
+    if M.get("method_classes_training"):
+        pl._stat("Method classes (training)", M["method_classes_training"])
+    if M.get("method_hard_reset"):
+        pl._stat("Method stack mode", "hard-reset (stable components only)")
+    if M.get("val_metric_str"):
+        pl._stat("Validation metric target (method | winner correct)", M["val_metric_str"])
+    if M.get("val_baseline_str"):
+        pl._stat("Validation majority baseline (same subset)", M["val_baseline_str"])
+
+    pl._section("Method Evaluation (Conditioned on Winner Pick)")
+
+    s1_acc = M.get("stage1_acc")
+    s1_auc = M.get("stage1_auc")
+    s2_acc = M.get("stage2_acc_true_finishes")
+    n_fin  = M.get("n_true_finishes", 0)
+    pl._stat("Stage1 acc (Finish vs Decision)", f"{s1_acc:.1%}" if s1_acc is not None else "n/a")
+    pl._stat("Stage1 AUC (Finish vs Decision)", f"{s1_auc:.3f}" if (s1_auc is not None and np.isfinite(s1_auc)) else "n/a")
+    pl._stat("Stage2 acc (KO/Sub | true finishes)", f"{s2_acc:.1%}" if (s2_acc is not None and np.isfinite(s2_acc)) else "n/a")
+    pl._stat("Stage2 sample size (true finishes)", n_fin)
+
+    acc_pred = M.get("method_acc_predicted_winner")
+    acc_wc   = M.get("method_acc_when_winner_correct")
+    maj_base = M.get("method_majority_baseline_when_winner_correct")
+    pl._stat("Method acc (predicted winner conditioned)", f"{acc_pred:.1%}" if acc_pred is not None else "n/a")
+    pl._stat("Method acc | winner pick correct",          f"{acc_wc:.1%}"   if acc_wc   is not None else "n/a")
+    pl._stat("Majority baseline | winner pick correct",   f"{maj_base:.1%}" if maj_base  is not None else "n/a")
+
+    bal_acc     = M.get("bal_acc")
+    macro_f1    = M.get("macro_f1")
+    finish_score = M.get("finish_score")
+    if bal_acc is not None and np.isfinite(bal_acc):
+        pl._stat("Balanced accuracy | winner pick correct", f"{bal_acc:.1%}")
+    if macro_f1 is not None and np.isfinite(macro_f1):
+        pl._stat("Macro F1 | winner pick correct", f"{macro_f1:.1%}")
+    if finish_score is not None and np.isfinite(finish_score):
+        pl._stat("FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1)", f"{finish_score:.1%}")
+
+    per_class = M.get("per_class_metrics", [])
+    if per_class:
+        pl._log("")
+        pl._log("Per-Class Metrics (Method | winner pick correct)")
+        pl._log("Class          Precision    Recall      F1")
+        for cls_name, p, r, f1 in per_class:
+            pl._log(f"{cls_name:<14}{p:10.1%}{r:10.1%}{f1:10.1%}")
+
+    confusion_rows = M.get("confusion_rows", [])
+    if confusion_rows:
+        pl._log("")
+        pl._log("Confusion Matrix (Method | winner pick correct)")
+        pl._log("Actual\\Pred     Decision    KO/TKO  Submission")
+        for actual, row_counts in confusion_rows:
+            pl._log(f"{actual:<14}{row_counts[0]:10d}{row_counts[1]:10d}{row_counts[2]:12d}")
+
+
 def _normalize_method_label(raw_method):
     detail = _normalize_method_detail(raw_method)
     if detail.startswith("Decision"):
@@ -4276,6 +4332,7 @@ class UFCSuperModelPipeline:
             )
             method_holdout_acc_oracle = float(method_payload.get("method_holdout_acc_oracle", float("nan")))
             finish_score = float(method_payload.get("finish_score", float("nan")))
+            _replay_method_cache_logs(self, method_payload)
         if not method_cache_hit:
             self._stat("Method cache", f"MISS ({METHOD_CACHE_VERSION}) — training method stage")
             try:
@@ -5172,6 +5229,13 @@ class UFCSuperModelPipeline:
                 )
                 method_acc_predicted_winner = float(np.mean(method_pred_predwinner == y_method_np))
                 finish_score = float("nan")
+                bal_acc = float("nan")
+                macro_f1 = float("nan")
+                ko_recall = float("nan")
+                sub_recall = float("nan")
+                ko_sub_macro_f1 = float("nan")
+                _per_class_metrics = []
+                _confusion_rows = []
                 if int(np.sum(winner_correct)) > 0:
                     method_acc_when_winner_correct = float(
                         np.mean(method_pred_predwinner[winner_correct] == y_method_np[winner_correct])
@@ -5223,6 +5287,11 @@ class UFCSuperModelPipeline:
                             c = int(np.sum((sub_true == actual) & (sub_pred == pred)))
                             row_counts.append(c)
                         self._log(f"{actual:<14}{row_counts[0]:10d}{row_counts[1]:10d}{row_counts[2]:12d}")
+                        _confusion_rows.append([actual, list(row_counts)])
+                    _per_class_metrics = [
+                        [cls_name, float(p_arr[idx]), float(r_arr[idx]), float(f1_arr[idx])]
+                        for idx, cls_name in enumerate(METHOD_LABELS)
+                    ]
 
                 method_bundle["method_columns"] = method_columns
 
@@ -5241,6 +5310,21 @@ class UFCSuperModelPipeline:
                         ),
                         "method_holdout_acc_oracle": method_holdout_acc_oracle,
                         "finish_score": finish_score,
+                        "stage1_acc": stage1_acc,
+                        "stage1_auc": stage1_auc,
+                        "stage2_acc_true_finishes": stage2_acc_true_finishes,
+                        "n_true_finishes": n_true_finishes,
+                        "bal_acc": bal_acc,
+                        "macro_f1": macro_f1,
+                        "ko_recall": ko_recall,
+                        "sub_recall": sub_recall,
+                        "ko_sub_macro_f1": ko_sub_macro_f1,
+                        "per_class_metrics": _per_class_metrics,
+                        "confusion_rows": _confusion_rows,
+                        "method_classes_training": ", ".join(method_bundle.get("detail_labels_seen", [])),
+                        "val_metric_str": f"{best_cfg['val_metric']:.1%}",
+                        "val_baseline_str": f"{best_cfg['val_baseline']:.1%}",
+                        "method_hard_reset": bool(METHOD_HARD_RESET),
                     },
                 )
                 self._stat(
