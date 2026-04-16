@@ -4797,7 +4797,7 @@ class UFCSuperModelPipeline:
 
                 best_cfg = None
                 rng = np.random.default_rng(RANDOM_SEED + 2026)
-                for _trial in range(int(max(120, METHOD_TUNING_TRIALS))):
+                for _trial in range(int(max(200, METHOD_TUNING_TRIALS))):
                     a1 = float(rng.choice([0.55, 0.70, 0.85]))
                     a2 = float(rng.choice([0.55, 0.70, 0.85]))
                     t_dec = float(rng.choice([0.7, 0.85, 1.0, 1.15, 1.3]))
@@ -4815,9 +4815,9 @@ class UFCSuperModelPipeline:
                     w_base = float(rng.choice([0.00, 0.06, 0.12, 0.18]))
                     w_subsig = float(rng.choice([0.00, 0.06, 0.10, 0.14, 0.18]))
                     sub_boost_k = float(rng.choice([0.0, 0.4, 0.8, 1.2, 1.6]))
-                    bias_dec = float(rng.choice([-0.15, -0.05, 0.00, 0.10, 0.20]))
-                    bias_ko = float(rng.choice([-0.10, 0.00, 0.10, 0.20, 0.30]))
-                    bias_sub = float(rng.choice([-0.20, -0.10, 0.00, 0.10, 0.20]))
+                    bias_dec = float(rng.choice([-0.20, -0.10, 0.00, 0.10, 0.20]))
+                    bias_ko = float(rng.choice([-0.10, 0.00, 0.10, 0.20, 0.30, 0.40]))
+                    bias_sub = float(rng.choice([-0.25, -0.15, -0.05, 0.05, 0.15, 0.25]))
                     if w_hist + w_group + w_base + w_subsig >= 0.78:
                         continue
                     w_ml = 1.0 - w_hist - w_group - w_base - w_subsig
