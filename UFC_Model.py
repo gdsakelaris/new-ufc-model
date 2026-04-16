@@ -155,17 +155,20 @@ STAGE2_EXCLUDE_COLS_BASE = frozenset({
 # Filters are auto-derived below; to change a feature's routing, edit this dict only.
 FEATURE_ROUTING = {
     # --- Batch 2: within-fight pacing (§A) ---
-    "d_rd1_output_gap":            {"winner", "stage1"},
-    "d_rd1_kd_rate":               {"stage2"},
-    "d_early_td_pressure":         {"winner", "stage2"},
-    "d_cardio_decay_gap":          {"winner", "stage1"},
-    "d_late_round_output":         {"winner", "stage1"},
-    "d_rd3_sub_att_rate":          {"stage2"},
+    # NOTE: d_rd1_kd, d_rd1_td_att, d_rd3_sub_att already exist as auto-diffs of
+    # pre-existing rd1_kd / rd1_td_att / rd3_sub_att aggregates — not routed
+    # here (would remove them from winner). User's d_rd1_kd_rate / d_early_td_pressure
+    # / d_rd3_sub_att_rate collapse into those existing columns.
+    "d_rd1_net_sig_str":           {"winner", "stage1"},  # user: d_rd1_output_gap
+    "d_cardio_decay_sig_str":      {"winner", "stage1"},  # user: d_cardio_decay_gap
+    "d_late_sig_str_pm":           {"winner", "stage1"},  # user: d_late_round_output
     "d_rd1_ctrl_share":            {"winner", "stage2"},
-    "rd_variance_A":               {"stage1"},
-    "rd_variance_B":               {"stage1"},
+    "d_rd_variance":               {"stage1"},            # user: rd_variance_A/B
+    # (d_def_rd1_sig_str and d_def_rd1_kd auto-exist and stay in all models.)
     # --- Batch 3: physical / style / matchup (§B, §C, §D) ---
-    "d_reach_per_height":          {"winner", "stage1", "stage2"},
+    # NOTE: d_reach_per_height = d_ape_index (auto-generated, already exists) — not routed.
+    # NOTE: d_kd_vulnerability = d_def_kd_pm (auto-generated, already exists) — not routed.
+    # NOTE: d_finish_resistance already exists as a live feature — not routed.
     "d_reach_x_distance_pct":      {"winner", "stage2"},
     "d_age_x_cardio":              {"winner", "stage1"},
     "d_age_x_title_rounds":        {"winner"},
@@ -174,27 +177,23 @@ FEATURE_ROUTING = {
     "d_clinch_dominance":          {"stage2"},
     "d_ground_time_x_sub_att":     {"stage2"},
     "d_stance_x_leg_kicks":        {"stage1"},
-    "striker_vs_grappler_index":   {"winner", "stage2"},
+    "d_striker_grappler_raw":      {"winner", "stage2"},  # user: striker_vs_grappler_index
     "d_tdd_vs_td_attack":          {"winner", "stage2"},
-    "d_kd_vulnerability":          {"stage2"},
-    # NOTE: d_finish_resistance already exists as a live feature in both models — not routed.
     # --- Batch 4: form / context / priors (§E, §F, §G) ---
-    "days_since_last_fight_A":     {"winner"},
-    "days_since_last_fight_B":     {"winner"},
-    "d_layoff_days":               {"winner"},
-    "d_short_notice_proxy":        {"winner"},
+    # NOTE: days_since_last_fight_A/B → days_inactive + d_activity already exist — not routed.
+    # NOTE: d_layoff_days → d_days_inactive auto-exists — not routed.
+    # NOTE: d_win_streak, d_loss_streak → auto-diffs of existing win_streak/loss_streak — not routed.
+    # NOTE: weight_class_finish_prior → ctx_finish_prior_2y already exists (better) — not routed.
+    # NOTE: d_avg_finish_round and d_first_round_finish_rate already exist as live features — not routed.
+    "d_short_notice":              {"winner"},             # user: d_short_notice_proxy
+    "d_glicko_trend":              {"winner"},
     "d_recent_damage_absorbed":    {"winner", "stage2"},
     "d_recent_finish_rate":        {"stage1"},
-    "d_glicko_trend":              {"winner"},
-    "d_win_streak":                {"winner"},
-    "d_loss_streak":               {"winner"},
-    "weight_class_finish_prior":   {"stage1"},
-    "weight_class_x_kd_pm":        {"stage2"},
-    "gender_flag":                 {"winner", "stage1", "stage2"},
-    "title_x_cardio":              {"winner"},
-    "total_rounds_x_finish_resistance": {"winner", "stage1"},
-    # NOTE: d_avg_finish_round and d_first_round_finish_rate already exist as live features — not routed.
     "d_decision_rate":             {"stage1"},
+    "gender_flag":                 {"winner", "stage1", "stage2"},
+    "d_title_x_cardio":            {"winner"},             # user: title_x_cardio
+    "d_total_rounds_x_finish_resistance": {"winner", "stage1"},
+    "d_weight_class_x_kd_pm":      {"stage2"},             # user: weight_class_x_kd_pm
 }
 _ROUTING_WINNER_EXCLUDE = {f for f, tags in FEATURE_ROUTING.items() if "winner" not in tags}
 _ROUTING_STAGE1_EXCLUDE = {f for f, tags in FEATURE_ROUTING.items() if "stage1" not in tags}
@@ -1144,10 +1143,11 @@ def extract_fight_record(row, prefix, opp, result, opp_glicko_mu=MU_0):
         "stance": row.get(f"{prefix}_stance", ""),
     }
 
-    # Per-round stats
+    # Per-round stats (offense + opponent defensive counterpart)
     for rd in range(1, 6):
         for stat in RD_STATS:
             rec[f"rd{rd}_{stat}"] = g(f"{prefix}_rd{rd}_{stat}")
+            rec[f"opp_rd{rd}_{stat}"] = g(f"{opp}_rd{rd}_{stat}")
 
     return rec
 
@@ -1164,6 +1164,7 @@ def _make_synthetic_fight_record(current_date=None, profile=None):
         "fight_time": 900.0,
         "result": "W",
         "opp_glicko": MU_0,
+        "self_glicko": MU_0,
         "method": "Decision",
         "is_title": 0,
         "finish_round": 3,
@@ -1205,6 +1206,7 @@ def _make_synthetic_fight_record(current_date=None, profile=None):
     for rd in range(1, 6):
         for stat in RD_STATS:
             rec[f"rd{rd}_{stat}"] = 0.0
+            rec[f"opp_rd{rd}_{stat}"] = 0.0
     return rec
 
 
@@ -1506,9 +1508,34 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
     else:
         feats["days_inactive"] = 365
 
+    # ── Short-notice flag (last fight < 45 days ago) ──
+    feats["short_notice"] = float(feats["days_inactive"] < 45)
+
     # ── Glicko-2 ──
     feats["glicko_mu"] = glicko[0]
     feats["glicko_phi"] = glicko[1]
+
+    # ── Glicko trend (current mu minus mu from 5 fights ago) ──
+    if n >= 5:
+        feats["glicko_trend"] = glicko[0] - history[-5].get("self_glicko", glicko[0])
+    elif n >= 1:
+        feats["glicko_trend"] = glicko[0] - history[0].get("self_glicko", glicko[0])
+    else:
+        feats["glicko_trend"] = 0.0
+
+    # ── Recent damage absorbed (sig str taken in last 3 fights) ──
+    recent3 = history[-3:]
+    feats["recent_damage_absorbed"] = _safe_sum(h["opp_sig_str"] for h in recent3)
+
+    # ── Recent finish rate (finishes in last 5 fights) ──
+    recent5 = history[-5:]
+    _finish_count = sum(1 for h in recent5
+                        if h.get("method", "") and "dec" not in h.get("method", "").lower())
+    feats["recent_finish_rate"] = _finish_count / max(len(recent5), 1)
+
+    # ── Decision rate (career) ──
+    _dec_count = sum(1 for h in history if "dec" in h.get("method", "").lower())
+    feats["decision_rate"] = _dec_count / max(n, 1)
 
     # ── Round 1 stats (career averages) ──
     for stat in ["sig_str", "sig_str_att", "kd", "td", "td_att", "sub_att",
@@ -1534,6 +1561,53 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
             vals.extend(h[f"rd{rd}_{stat}"] for h in history
                         if not _isnan(h.get(f"rd{rd}_{stat}")))
         feats[f"champ_{stat}"] = _safe_mean(vals)
+
+    # ── Defensive round aggregates (what the fighter absorbs per round) ──
+    for stat in ["sig_str", "kd"]:
+        vals = [h[f"opp_rd1_{stat}"] for h in history if not _isnan(h.get(f"opp_rd1_{stat}"))]
+        feats[f"def_rd1_{stat}"] = _safe_mean(vals)
+
+    # ── Late-round sig_str per minute (only fights that reached rd4/rd5) ──
+    late_vals = []
+    for h in history:
+        for rd in (4, 5):
+            v = h.get(f"rd{rd}_sig_str")
+            if not _isnan(v) and v is not None:
+                late_vals.append(float(v) / 5.0)  # 5-minute round → per-minute
+    feats["late_sig_str_pm"] = _safe_mean(late_vals) if late_vals else float("nan")
+
+    # ── Round-to-round sig_str variance (consistency vs bursty) ──
+    per_fight_rd_std = []
+    for h in history:
+        rd_vals = []
+        for rd in range(1, 6):
+            v = h.get(f"rd{rd}_sig_str")
+            if not _isnan(v) and v is not None:
+                rd_vals.append(float(v))
+        if len(rd_vals) >= 2:
+            per_fight_rd_std.append(float(np.std(rd_vals)))
+    feats["rd_variance"] = _safe_mean(per_fight_rd_std) if per_fight_rd_std else float("nan")
+
+    # ── Composite pacing aggregates (feed the auto-diff loop in compute_matchup_features) ──
+    # rd1 net sig_str per minute: what the fighter lands minus what they absorb in round 1.
+    _rd1_ss = feats.get("rd1_sig_str")
+    _def_rd1_ss = feats.get("def_rd1_sig_str")
+    if not _isnan(_rd1_ss) and not _isnan(_def_rd1_ss):
+        feats["rd1_net_sig_str"] = (float(_rd1_ss) - float(_def_rd1_ss)) / 5.0
+    else:
+        feats["rd1_net_sig_str"] = float("nan")
+    # Cardio decay: rd1 output minus rd3 output, per minute. Higher = fades more.
+    _rd3_ss = feats.get("rd3_sig_str")
+    if not _isnan(_rd1_ss) and not _isnan(_rd3_ss):
+        feats["cardio_decay_sig_str"] = (float(_rd1_ss) - float(_rd3_ss)) / 5.0
+    else:
+        feats["cardio_decay_sig_str"] = float("nan")
+    # Round-1 control share: fraction of the 5-minute round spent in control position.
+    _rd1_ctrl = feats.get("rd1_ctrl_sec")
+    if not _isnan(_rd1_ctrl):
+        feats["rd1_ctrl_share"] = float(_rd1_ctrl) / 300.0
+    else:
+        feats["rd1_ctrl_share"] = float("nan")
 
     # ── Late vs early ──
     rd1_ss = [h["rd1_sig_str"] for h in history if not _isnan(h.get("rd1_sig_str"))]
@@ -2305,6 +2379,66 @@ def compute_matchup_features(a_feats, b_feats, is_title=0, total_rounds=3, weigh
         _b = _num_or(b_feats.get(_feat), _default)
         features[f"{_feat}_sum"] = _a + _b
 
+    # ── Batch 3: physical / style / matchup interaction features (§B, §C, §D) ──
+    # All use f(A) - f(B) pattern so they flip cleanly under method orientation.
+    # §B — Physical / leverage interactions
+    a_dist_pct = _num_or(a_feats.get("distance_pct"), 0.3)
+    b_dist_pct = _num_or(b_feats.get("distance_pct"), 0.3)
+    features["d_reach_x_distance_pct"] = (
+        _num_or(a_reach, 72.0) * a_dist_pct - _num_or(b_reach, 72.0) * b_dist_pct
+    )
+    a_cdg = _num_or(a_feats.get("cardio_decay_sig_str"), 0.0)
+    b_cdg = _num_or(b_feats.get("cardio_decay_sig_str"), 0.0)
+    a_age_v = _num_or(a_age, 30.0)
+    b_age_v = _num_or(b_age, 30.0)
+    features["d_age_x_cardio"] = (a_age_v * a_cdg) - (b_age_v * b_cdg)
+    features["d_age_x_title_rounds"] = (a_age_v - b_age_v) * float(total_rounds == 5)
+
+    # §C — Style / targeting interactions
+    a_head = _num_or(a_feats.get("head_pct"), 0.3)
+    b_head = _num_or(b_feats.get("head_pct"), 0.3)
+    features["d_head_share_x_power"] = (a_head * a_kd_pm) - (b_head * b_kd_pm)
+
+    a_leg = _num_or(a_feats.get("leg_pct"), 0.15)
+    b_leg = _num_or(b_feats.get("leg_pct"), 0.15)
+    features["d_leg_kick_pressure"] = (a_leg * a_sig_pm) - (b_leg * b_sig_pm)
+
+    a_clinch = _num_or(a_feats.get("clinch_pct"), 0.1)
+    b_clinch = _num_or(b_feats.get("clinch_pct"), 0.1)
+    a_ctrl = _num_or(a_feats.get("ctrl_pct"), 0.0)
+    b_ctrl = _num_or(b_feats.get("ctrl_pct"), 0.0)
+    features["d_clinch_dominance"] = (a_clinch * a_ctrl) - (b_clinch * b_ctrl)
+
+    a_ground = _num_or(a_feats.get("ground_pct"), 0.15)
+    b_ground = _num_or(b_feats.get("ground_pct"), 0.15)
+    a_sub_p15 = _num_or(a_feats.get("sub_att_p15"), 0.0)
+    b_sub_p15 = _num_or(b_feats.get("sub_att_p15"), 0.0)
+    features["d_ground_time_x_sub_att"] = (a_ground * a_sub_p15) - (b_ground * b_sub_p15)
+
+    d_ortho_val = features.get("d_ortho_vs_south", 0.0)
+    d_leg_pct_val = _num_or(a_feats.get("leg_pct"), 0.15) - _num_or(b_feats.get("leg_pct"), 0.15)
+    features["d_stance_x_leg_kicks"] = abs(d_ortho_val) * d_leg_pct_val
+
+    # §D — Matchup compatibility / style clashes
+    features["d_striker_grappler_raw"] = (
+        (a_sig_pm - a_td_p15) - (b_sig_pm - b_td_p15)
+    )
+    a_td_acc = _num_or(a_feats.get("td_acc"), 0.35)
+    b_td_acc = _num_or(b_feats.get("td_acc"), 0.35)
+    features["d_tdd_vs_td_attack"] = (a_td_acc * (1.0 - b_tdd)) - (b_td_acc * (1.0 - a_tdd))
+
+    # ── Batch 4: form / context / priors (§E, §F, §G) ──
+    features["gender_flag"] = 1.0 if weight_class.startswith("Women") else 0.0
+
+    features["d_title_x_cardio"] = float(is_title) * (a_cdg - b_cdg)
+
+    a_fin_resist = _num_or(a_feats.get("finish_resistance"), 0.5)
+    b_fin_resist = _num_or(b_feats.get("finish_resistance"), 0.5)
+    features["d_total_rounds_x_finish_resistance"] = float(total_rounds) * (a_fin_resist - b_fin_resist)
+
+    wc_ord = float(WEIGHT_CLASS_ORDINAL.get(weight_class, 0))
+    features["d_weight_class_x_kd_pm"] = wc_ord * (a_kd_pm - b_kd_pm)
+
     return features
 
 
@@ -2429,7 +2563,9 @@ def build_training_data(csv_path, progress_cb=None):
 
         # Update histories
         fighter_history[r_name].append(extract_fight_record(row, "r", "b", r_res, b_glicko[0]))
+        fighter_history[r_name][-1]["self_glicko"] = r_glicko[0]
         fighter_history[b_name].append(extract_fight_record(row, "b", "r", b_res, r_glicko[0]))
+        fighter_history[b_name][-1]["self_glicko"] = b_glicko[0]
 
         # Track opponent Glicko
         opp_glicko_list[r_name].append(b_glicko[0])
