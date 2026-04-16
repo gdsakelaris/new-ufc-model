@@ -84,7 +84,7 @@ METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_cham
 # Bump when winner-stage training logic changes.
 WINNER_CACHE_VERSION = "v2"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v9"
+METHOD_CACHE_VERSION = "v10"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -4797,15 +4797,15 @@ class UFCSuperModelPipeline:
 
                 best_cfg = None
                 rng = np.random.default_rng(RANDOM_SEED + 2026)
-                for _trial in range(int(max(40, METHOD_TUNING_TRIALS))):
+                for _trial in range(int(max(120, METHOD_TUNING_TRIALS))):
                     a1 = float(rng.choice([0.55, 0.70, 0.85]))
                     a2 = float(rng.choice([0.55, 0.70, 0.85]))
                     t_dec = float(rng.choice([0.7, 0.85, 1.0, 1.15, 1.3]))
                     t_fin = float(rng.choice([0.7, 0.85, 1.0, 1.15, 1.3]))
                     b_fin = float(rng.choice([-0.35, -0.15, 0.0, 0.15, 0.35]))
                     b_sub = float(rng.choice([-0.30, -0.10, 0.0, 0.10, 0.30]))
-                    fin_thr = float(rng.choice([0.42, 0.46, 0.50, 0.54, 0.58]))
-                    sub_thr = float(rng.choice([0.42, 0.46, 0.50, 0.54, 0.58]))
+                    fin_thr = float(rng.choice([0.38, 0.42, 0.46, 0.50, 0.54, 0.58]))
+                    sub_thr = float(rng.choice([0.38, 0.42, 0.46, 0.50, 0.54, 0.58]))
                     a_dir = float(rng.choice([0.90, 0.96, 1.00]))
                     b_dir = float(rng.choice([0.60, 0.75, 0.90]))
                     a_ovr = float(rng.choice([0.90, 0.97, 1.00]))
@@ -4815,9 +4815,9 @@ class UFCSuperModelPipeline:
                     w_base = float(rng.choice([0.00, 0.06, 0.12, 0.18]))
                     w_subsig = float(rng.choice([0.00, 0.06, 0.10, 0.14, 0.18]))
                     sub_boost_k = float(rng.choice([0.0, 0.4, 0.8, 1.2, 1.6]))
-                    bias_dec = float(rng.choice([-0.05, 0.00, 0.10, 0.20, 0.30]))
-                    bias_ko = float(rng.choice([-0.25, -0.15, -0.05, 0.00, 0.05]))
-                    bias_sub = float(rng.choice([-0.20, -0.10, 0.00, 0.05, 0.10]))
+                    bias_dec = float(rng.choice([-0.15, -0.05, 0.00, 0.10, 0.20]))
+                    bias_ko = float(rng.choice([-0.10, 0.00, 0.10, 0.20, 0.30]))
+                    bias_sub = float(rng.choice([-0.20, -0.10, 0.00, 0.10, 0.20]))
                     if w_hist + w_group + w_base + w_subsig >= 0.78:
                         continue
                     w_ml = 1.0 - w_hist - w_group - w_base - w_subsig
@@ -4847,13 +4847,10 @@ class UFCSuperModelPipeline:
                     if int(np.sum(winner_correct_va)) == 0:
                         score = float(np.mean(pred_idx == y_va_idx))
                         baseline = float(pd.Series(y_va_true).value_counts().max() / len(y_va_true))
-                        macro_recall = score
-                        minority_recall = score
-                        pred_share = np.bincount(pred_idx, minlength=len(METHOD_LABELS)).astype(float)
-                        pred_share = pred_share / max(1.0, float(np.sum(pred_share)))
-                        true_share = np.bincount(y_va_idx, minlength=len(METHOD_LABELS)).astype(float)
-                        true_share = true_share / max(1.0, float(np.sum(true_share)))
-                        finish_score_tune = 0.0
+                        _ko_r_min = score
+                        _dec_r_min = score
+                        _sub_r_min = score
+                        macro_f1 = score
                     else:
                         y_sub_idx = y_va_idx[winner_correct_va]
                         pred_sub_idx = pred_idx[winner_correct_va]
@@ -4864,14 +4861,9 @@ class UFCSuperModelPipeline:
                             mask_cls = (y_sub_idx == cls_i)
                             if int(np.sum(mask_cls)) > 0:
                                 recalls.append(float(np.mean(pred_sub_idx[mask_cls] == cls_i)))
-                        macro_recall = float(np.mean(recalls)) if recalls else score
                         _ko_r_min = float(recalls[1]) if len(recalls) > 1 else 0.0
                         _sub_r_min = float(recalls[2]) if len(recalls) > 2 else 0.0
-                        minority_recall = 2.0 * _ko_r_min * _sub_r_min / max(1e-9, _ko_r_min + _sub_r_min)
-                        pred_share = np.bincount(pred_sub_idx, minlength=len(METHOD_LABELS)).astype(float)
-                        pred_share = pred_share / max(1.0, float(np.sum(pred_share)))
-                        true_share = np.bincount(y_sub_idx, minlength=len(METHOD_LABELS)).astype(float)
-                        true_share = true_share / max(1.0, float(np.sum(true_share)))
+                        _dec_r_min = float(recalls[0]) if len(recalls) > 0 else 0.0
                         _ko_mask_t = (y_sub_idx == 1)
                         _sub_mask_t = (y_sub_idx == 2)
                         _ko_r_t = float(np.mean(pred_sub_idx[_ko_mask_t] == 1)) if int(np.sum(_ko_mask_t)) > 0 else 0.0
@@ -4880,24 +4872,16 @@ class UFCSuperModelPipeline:
                         _sub_prec_t = float(np.sum((pred_sub_idx == 2) & _sub_mask_t)) / max(1, int(np.sum(pred_sub_idx == 2)))
                         _ko_f1_t = 2.0 * _ko_prec_t * _ko_r_t / max(1e-9, _ko_prec_t + _ko_r_t)
                         _sub_f1_t = 2.0 * _sub_prec_t * _sub_r_t / max(1e-9, _sub_prec_t + _sub_r_t)
-                        finish_score_tune = 0.4 * _ko_r_t + 0.4 * _sub_r_t + 0.2 * 0.5 * (_ko_f1_t + _sub_f1_t)
-                    distribution_shift = float(np.sum(np.abs(pred_share - true_share)))
-                    chunk_scores = []
-                    for ch in va_chunks:
-                        ch_wc = winner_correct_va[ch]
-                        if int(np.sum(ch_wc)) > 0:
-                            chunk_scores.append(float(np.mean(pred_idx[ch][ch_wc] == y_va_idx[ch][ch_wc])))
-                        else:
-                            chunk_scores.append(float(np.mean(pred_idx[ch] == y_va_idx[ch])))
-                    robust_score = float(np.mean(chunk_scores)) - 0.60 * float(np.std(chunk_scores))
-                    _pred_finish_rate = float(pred_share[1] + pred_share[2])
-                    _true_finish_rate = float(true_share[1] + true_share[2])
-                    _finish_underpredict = max(0.0, _true_finish_rate - _pred_finish_rate - 0.08)
-                    _pred_sub_rate = float(pred_share[2])
-                    _true_sub_rate = float(true_share[2])
-                    _sub_underpredict = max(0.0, _true_sub_rate - _pred_sub_rate - 0.04)
-                    objective = robust_score + 0.15 * macro_recall + 0.40 * minority_recall - 0.04 * distribution_shift + 0.08 * finish_score_tune - 0.10 * _finish_underpredict - 0.18 * _sub_underpredict
-                    key = (objective, robust_score, score, minority_recall, -distribution_shift, -baseline)
+                        _dec_mask_t = (y_sub_idx == 0)
+                        _dec_r_t = float(np.mean(pred_sub_idx[_dec_mask_t] == 0)) if int(np.sum(_dec_mask_t)) > 0 else 0.0
+                        _dec_prec_t = float(np.sum((pred_sub_idx == 0) & _dec_mask_t)) / max(1, int(np.sum(pred_sub_idx == 0)))
+                        _dec_f1_t = 2.0 * _dec_prec_t * _dec_r_t / max(1e-9, _dec_prec_t + _dec_r_t)
+                        macro_f1 = (_dec_f1_t + _ko_f1_t + _sub_f1_t) / 3.0
+                    _dec_shortfall = max(0.0, 0.55 - _dec_r_min)
+                    _ko_shortfall = max(0.0, 0.50 - _ko_r_min)
+                    _sub_shortfall = max(0.0, 0.40 - _sub_r_min)
+                    objective = macro_f1 - 0.50 * (_dec_shortfall + _ko_shortfall + _sub_shortfall)
+                    key = (objective, macro_f1, score, _ko_r_min, _sub_r_min, -baseline)
                     if best_cfg is None or key > best_cfg["key"]:
                         best_cfg = {
                             "key": key, "t_dec": t_dec, "t_fin": t_fin,
