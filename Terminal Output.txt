@@ -120,34 +120,34 @@ Method Model
 ========================================================================
 Method config: No champion on file — saving current best as champion
 Method classes (training): Decision, KO/TKO, Submission
-Validation metric target (method | winner correct): 51.1%
+Validation metric target (method | winner correct): 50.4%
 Validation majority baseline (same subset): 50.0%
 
 ========================================================================
 Method Evaluation (Conditioned on Winner Pick)
 ========================================================================
-Stage1 acc (Finish vs Decision): 57.2%
-Stage1 AUC (Finish vs Decision): 0.618
-Stage2 acc (KO/Sub | true finishes): 65.5%
+Stage1 acc (Finish vs Decision): 57.7%
+Stage1 AUC (Finish vs Decision): 0.614
+Stage2 acc (KO/Sub | true finishes): 64.2%
 Stage2 sample size (true finishes): 461
-Method acc (predicted winner conditioned): 47.3%
-Method acc | winner pick correct: 50.2%
+Method acc (predicted winner conditioned): 47.7%
+Method acc | winner pick correct: 50.5%
 Majority baseline | winner pick correct: 49.4%
-Balanced accuracy | winner pick correct: 48.0%
-Macro F1 | winner pick correct: 47.2%
-FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1): 45.3%
+Balanced accuracy | winner pick correct: 48.9%
+Macro F1 | winner pick correct: 47.9%
+FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1): 47.6%
 
 Per-Class Metrics (Method | winner pick correct)
 Class          Precision    Recall      F1
-Decision           61.0%     52.0%     56.1%
-KO/TKO             47.5%     52.6%     49.9%
-Submission         32.2%     39.4%     35.5%
+Decision           61.3%     50.0%     55.1%
+KO/TKO             47.4%     55.4%     51.1%
+Submission         34.5%     41.4%     37.6%
 
 Confusion Matrix (Method | winner pick correct)
 Actual\Pred     Decision    KO/TKO  Submission
-Decision             158        95          51
-KO/TKO                70       112          31
-Submission            31        29          39
+Decision             152       101          51
+KO/TKO                68       118          27
+Submission            28        30          41
 Method cache: SAVED (v10) key=c23d833fcb3a file=method_stage_c23d833fcb3a31f9decd.pkl
 
 ========================================================================

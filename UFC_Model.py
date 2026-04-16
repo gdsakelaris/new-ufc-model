@@ -4797,7 +4797,7 @@ class UFCSuperModelPipeline:
 
                 best_cfg = None
                 rng = np.random.default_rng(RANDOM_SEED + 2026)
-                for _trial in range(int(max(200, METHOD_TUNING_TRIALS))):
+                for _trial in range(int(max(500, METHOD_TUNING_TRIALS))):
                     a1 = float(rng.choice([0.55, 0.70, 0.85]))
                     a2 = float(rng.choice([0.55, 0.70, 0.85]))
                     t_dec = float(rng.choice([0.7, 0.85, 1.0, 1.15, 1.3]))
