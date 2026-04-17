@@ -10,7 +10,6 @@ What this script does:
 
 Run:
   python UFC_Model.py
-
 Optional CLI:
   python UFC_Model.py --train-only
 """
