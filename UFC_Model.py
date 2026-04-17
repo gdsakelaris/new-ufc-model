@@ -10,6 +10,7 @@ What this script does:
 
 Run:
   python UFC_Model.py
+  
 Optional CLI:
   python UFC_Model.py --train-only
 """
@@ -4920,7 +4921,13 @@ class UFCSuperModelPipeline:
                 # it on the CURRENT validation set. Only replace it if the new
                 # tuning run found something genuinely better.
                 def _eval_cfg_objective(cfg):
-                    """Re-evaluate a config dict on the current val set, return objective."""
+                    """Re-evaluate a config on the val set under the tuning objective.
+
+                    Computes `macro_f1 − 0.50·(dec+ko+sub recall shortfalls)` per val
+                    chunk and reduces as `mean − 0.60·std`, so the champion gate judges
+                    configs on the same criterion the tuner optimized, with a stability
+                    guard against configs that only win on one chunk.
+                    """
                     try:
                         _ml = _stage_probs(
                             X_m_va_imp,
@@ -4949,45 +4956,35 @@ class UFCSuperModelPipeline:
                         _p = _apply_submission_signal_boost_arr(_p, sub_arr[:, 2], cfg["sub_boost_k"])
                         _p = _p / np.sum(_p, axis=1, keepdims=True)
                         _pidx = np.argmax(_p, axis=1)
-                        if int(np.sum(winner_correct_va)) == 0:
-                            _sc = float(np.mean(_pidx == y_va_idx))
-                            _mr = _sc
-                            _minr = _sc
-                            _fs = 0.0
-                            _ps = np.bincount(_pidx, minlength=3).astype(float)
-                            _ps /= max(1.0, _ps.sum())
-                            _ts = np.bincount(y_va_idx, minlength=3).astype(float)
-                            _ts /= max(1.0, _ts.sum())
-                        else:
-                            _ys = y_va_idx[winner_correct_va]
-                            _ps_idx = _pidx[winner_correct_va]
-                            _sc = float(np.mean(_ps_idx == _ys))
-                            _recs = [float(np.mean(_ps_idx[_ys == c] == c)) for c in range(3) if int(np.sum(_ys == c)) > 0]
-                            _mr = float(np.mean(_recs)) if _recs else _sc
-                            _kr = float(_recs[1]) if len(_recs) > 1 else 0.0
-                            _sr = float(_recs[2]) if len(_recs) > 2 else 0.0
-                            _minr = 2.0 * _kr * _sr / max(1e-9, _kr + _sr)
-                            _ps = np.bincount(_ps_idx, minlength=3).astype(float)
-                            _ps /= max(1.0, _ps.sum())
-                            _ts = np.bincount(_ys, minlength=3).astype(float)
-                            _ts /= max(1.0, _ts.sum())
-                            _kp = float(np.sum((_ps_idx == 1) & (_ys == 1))) / max(1, int(np.sum(_ps_idx == 1)))
-                            _sp = float(np.sum((_ps_idx == 2) & (_ys == 2))) / max(1, int(np.sum(_ps_idx == 2)))
-                            _kf1 = 2 * _kp * _kr / max(1e-9, _kp + _kr)
-                            _sf1 = 2 * _sp * _sr / max(1e-9, _sp + _sr)
-                            _fs = 0.4 * _kr + 0.4 * _sr + 0.2 * 0.5 * (_kf1 + _sf1)
-                        _ds = float(np.sum(np.abs(_ps - _ts)))
-                        _cscores = []
-                        for _ch in va_chunks:
-                            _cwc = winner_correct_va[_ch]
-                            if int(np.sum(_cwc)) > 0:
-                                _cscores.append(float(np.mean(_pidx[_ch][_cwc] == y_va_idx[_ch][_cwc])))
-                            else:
-                                _cscores.append(float(np.mean(_pidx[_ch] == y_va_idx[_ch])))
-                        _rs = float(np.mean(_cscores)) - 0.60 * float(np.std(_cscores))
-                        _fup = max(0.0, float(_ts[1]+_ts[2]) - float(_ps[1]+_ps[2]) - 0.08)
-                        _sup = max(0.0, float(_ts[2]) - float(_ps[2]) - 0.04)
-                        return _rs + 0.04*_mr + 0.12*_minr - 0.04*_ds + 0.08*_fs - 0.10*_fup - 0.18*_sup
+
+                        def _chunk_obj(ch):
+                            _cwc = winner_correct_va[ch]
+                            if int(np.sum(_cwc)) == 0:
+                                return float(np.mean(_pidx[ch] == y_va_idx[ch]))
+                            _ys = y_va_idx[ch][_cwc]
+                            _ps_idx = _pidx[ch][_cwc]
+                            _rec = [0.0, 0.0, 0.0]
+                            for c in range(3):
+                                _m = (_ys == c)
+                                if int(np.sum(_m)) > 0:
+                                    _rec[c] = float(np.mean(_ps_idx[_m] == c))
+                            _f1 = [0.0, 0.0, 0.0]
+                            for c in range(3):
+                                _pc_cnt = int(np.sum(_ps_idx == c))
+                                if _pc_cnt == 0:
+                                    continue
+                                _prec = float(np.sum((_ps_idx == c) & (_ys == c))) / _pc_cnt
+                                _denom = _prec + _rec[c]
+                                if _denom > 0:
+                                    _f1[c] = 2.0 * _prec * _rec[c] / _denom
+                            _macro_f1 = float(np.mean(_f1))
+                            _dec_short = max(0.0, 0.55 - _rec[0])
+                            _ko_short = max(0.0, 0.50 - _rec[1])
+                            _sub_short = max(0.0, 0.40 - _rec[2])
+                            return _macro_f1 - 0.50 * (_dec_short + _ko_short + _sub_short)
+
+                        _chunk_objs = [_chunk_obj(ch) for ch in va_chunks]
+                        return float(np.mean(_chunk_objs)) - 0.60 * float(np.std(_chunk_objs))
                     except Exception:
                         return float("-inf")
 
