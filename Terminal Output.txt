@@ -133,28 +133,28 @@ Validation majority baseline (same subset): 50.4%
 ========================================================================
 Method Evaluation (Conditioned on Winner Pick)
 ========================================================================
-Stage1 acc (Finish vs Decision): 56.7%
-Stage1 AUC (Finish vs Decision): 0.622
-Stage2 acc (KO/Sub | true finishes): 64.2%
+Stage1 acc (Finish vs Decision): 58.8%
+Stage1 AUC (Finish vs Decision): 0.638
+Stage2 acc (KO/Sub | true finishes): 68.1%
 Stage2 sample size (true finishes): 461
-Method acc (predicted winner conditioned): 47.4%
-Method acc | winner pick correct: 50.4%
+Method acc (predicted winner conditioned): 47.9%
+Method acc | winner pick correct: 50.9%
 Majority baseline | winner pick correct: 49.8%
-Balanced accuracy | winner pick correct: 48.5%
-Macro F1 | winner pick correct: 47.5%
-FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1): 46.8%
+Balanced accuracy | winner pick correct: 47.7%
+Macro F1 | winner pick correct: 47.2%
+FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1): 44.8%
 
 Per-Class Metrics (Method | winner pick correct)
 Class          Precision    Recall      F1
-Decision           61.4%     50.2%     55.2%
-KO/TKO             48.2%     55.9%     51.8%
-Submission         32.2%     39.4%     35.5%
+Decision           60.3%     52.4%     56.1%
+KO/TKO             49.0%     56.4%     52.4%
+Submission         31.8%     34.3%     33.0%
 
 Confusion Matrix (Method | winner pick correct)
 Actual\Pred     Decision    KO/TKO  Submission
-Decision             154        99          54
-KO/TKO                65       118          28
-Submission            32        28          39
+Decision             161        95          51
+KO/TKO                70       119          22
+Submission            36        29          34
 Method cache: SAVED (v12) key=101ff61fd8e2 file=method_stage_101ff61fd8e2695ed044.pkl
 
 ========================================================================

@@ -84,7 +84,7 @@ METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_cham
 # Bump when winner-stage training logic changes.
 WINNER_CACHE_VERSION = "v3"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v16"
+METHOD_CACHE_VERSION = "v17"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -4986,7 +4986,7 @@ class UFCSuperModelPipeline:
                     sub_boost_k = float(rng.choice([0.0, 0.4, 0.8, 1.2, 1.6]))
                     bias_dec = float(rng.choice([-0.20, -0.10, 0.00, 0.10, 0.20]))
                     bias_ko = float(rng.choice([-0.10, 0.00, 0.10, 0.20, 0.30, 0.40]))
-                    bias_sub = float(rng.choice([-0.25, -0.15, -0.05, 0.05, 0.15, 0.25]))
+                    bias_sub = float(rng.choice([-0.25, -0.15, -0.05, 0.05, 0.15, 0.25, 0.35, 0.45]))
                     if w_hist + w_group + w_base + w_subsig >= 0.78:
                         continue
                     w_ml = 1.0 - w_hist - w_group - w_base - w_subsig
