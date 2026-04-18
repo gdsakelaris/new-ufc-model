@@ -82,7 +82,7 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
 METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_champion_cfg.json")
 ###################################################################################################
 # Bump when winner-stage training logic changes.
-WINNER_CACHE_VERSION = "v2"
+WINNER_CACHE_VERSION = "v3"
 # Bump when method-stage training logic changes.
 METHOD_CACHE_VERSION = "v10"
 ###################################################################################################
@@ -176,6 +176,12 @@ FEATURE_ROUTING = {
     "gender_flag":                 {"winner"},
     "d_title_x_cardio":            {"winner"},
     "d_total_rounds_x_finish_resistance": {"winner"},
+    # --- Context-conditional & stability (winner-only) ---
+    "d_rounds_experience":         {"winner"},
+    "d_rounds_5_exp":              {"winner"},
+    "d_rounds_3_exp":              {"winner"},
+    "d_stability":                 {"winner"},
+    "d_sig_diff_pm_vol":           {"winner"},
 }
 _ROUTING_WINNER_EXCLUDE = {f for f, tags in FEATURE_ROUTING.items() if "winner" not in tags}
 _ROUTING_STAGE1_EXCLUDE = {f for f, tags in FEATURE_ROUTING.items() if "stage1" not in tags}
@@ -1083,6 +1089,7 @@ def extract_fight_record(row, prefix, opp, result, opp_glicko_mu=MU_0):
         "opp_glicko": opp_glicko_mu,
         "method": row.get("method", ""),
         "is_title": g("is_title_bout") or 0,
+        "scheduled_rounds": int(g("total_rounds") or 3),
         "finish_round": g("finish_round") or 0,
         # Offense
         "sig_str": g(f"{prefix}_sig_str") or 0,
@@ -1149,6 +1156,7 @@ def _make_synthetic_fight_record(current_date=None, profile=None):
         "self_glicko": MU_0,
         "method": "Decision",
         "is_title": 0,
+        "scheduled_rounds": 3,
         "finish_round": 3,
         "sig_str": 0.0,
         "sig_str_att": 0.0,
@@ -1493,6 +1501,16 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
     # ── Short-notice flag (last fight < 45 days ago) ──
     feats["short_notice"] = float(feats["days_inactive"] < 45)
 
+    # ── Rounds-scheduled experience (time-weighted) ──
+    feats["rounds_5_exp"] = sum(
+        _time_weight(h["date"], current_date) for h in history
+        if int(h.get("scheduled_rounds", 3)) == 5
+    )
+    feats["rounds_3_exp"] = sum(
+        _time_weight(h["date"], current_date) for h in history
+        if int(h.get("scheduled_rounds", 3)) == 3
+    )
+
     # ── Glicko-2 ──
     feats["glicko_mu"] = glicko[0]
     feats["glicko_phi"] = glicko[1]
@@ -1687,12 +1705,24 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
         feats["std_td_p15"] = float(np.std(per_fight_td))
         feats["std_ctrl_pct"] = float(np.std(per_fight_ctrl))
         feats["std_def_sig_str_pm"] = float(np.std(per_fight_def_sig))
+        # Time-weighted volatility of sig_str differential per minute
+        _w_vol = [_time_weight(h["date"], current_date) for h in history]
+        _sd_pm = []
+        for h in history:
+            _fm = h["fight_time"] / 60.0 if h["fight_time"] > 0 else 1.0
+            _sd_pm.append((h["sig_str"] - h["opp_sig_str"]) / _fm)
+        _wsum = sum(_w_vol) or 1.0
+        _mean_sd = sum(w * d for w, d in zip(_w_vol, _sd_pm)) / _wsum
+        _var_sd = sum(w * (d - _mean_sd) ** 2 for w, d in zip(_w_vol, _sd_pm)) / _wsum
+        _vol_raw = math.sqrt(max(_var_sd, 0.0))
+        feats["sig_diff_pm_vol"] = (_vol_raw * _wsum + 3.0 * 5.0) / (_wsum + 5.0)
     else:
         feats["std_sig_str_pm"] = 0.0
         feats["std_kd_pm"] = 0.0
         feats["std_td_p15"] = 0.0
         feats["std_ctrl_pct"] = 0.0
         feats["std_def_sig_str_pm"] = 0.0
+        feats["sig_diff_pm_vol"] = 3.0
 
     # ── Derived ──
     total_sig = _safe_sum(h["sig_str"] for h in history)
@@ -2373,6 +2403,18 @@ def compute_matchup_features(a_feats, b_feats, is_title=0, total_rounds=3, weigh
     b_fin_resist = _num_or(b_feats.get("finish_resistance"), 0.5)
     features["d_total_rounds_x_finish_resistance"] = float(total_rounds) * (a_fin_resist - b_fin_resist)
 
+    # Context-conditional rounds experience (picks the bucket matching current fight)
+    _cur_rounds = 5 if int(total_rounds) == 5 else 3
+    features["d_rounds_experience"] = (
+        _num_or(a_feats.get(f"rounds_{_cur_rounds}_exp"), 0.0)
+        - _num_or(b_feats.get(f"rounds_{_cur_rounds}_exp"), 0.0)
+    )
+
+    # Stability: flipped so positive = red is the more stable fighter
+    features["d_stability"] = (
+        _num_or(b_feats.get("sig_diff_pm_vol"), 3.0)
+        - _num_or(a_feats.get("sig_diff_pm_vol"), 3.0)
+    )
 
     return features
 
