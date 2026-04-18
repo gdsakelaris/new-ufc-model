@@ -84,7 +84,7 @@ METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_cham
 # Bump when winner-stage training logic changes.
 WINNER_CACHE_VERSION = "v3"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v10"
+METHOD_CACHE_VERSION = "v11"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -106,6 +106,8 @@ ELO_K = 24.0
 OPTUNA_TRIALS = 80
 METHOD_TUNING_TRIALS = 800
 METHOD_HARD_RESET = False
+# Correlation threshold for method-stage feature pruning (|corr| > this → dropped).
+METHOD_CORR_PRUNE_THRESHOLD = 0.95
 METHOD_ERA_CANDIDATES = [1993, 2005, 2010, 2014, 2016, 2018, 2020, 2021, 2022, 2023, 2024]
 METHOD_AUTO_ERA = True
 # Keep winner-model inputs on the stable feature family while allowing richer
@@ -1002,6 +1004,27 @@ def _bayes_shrink(empirical_value, sample_size, prior=0.5, strength=8.0):
         empirical_value = prior
     sample_size = max(float(sample_size or 0.0), 0.0)
     return (empirical_value * sample_size + prior * strength) / (sample_size + strength)
+
+
+def _correlation_prune(X, threshold=0.95):
+    """Drop columns whose |corr| with an earlier-kept column exceeds threshold.
+
+    Column order determines which member of a correlated pair survives — the
+    first-seen column is retained. Returns the list of surviving column names.
+    """
+    cols = list(X.columns)
+    if len(cols) <= 1:
+        return cols
+    corr = np.abs(X.corr().fillna(0.0).to_numpy())
+    np.fill_diagonal(corr, 0.0)
+    keep_mask = [True] * len(cols)
+    for i in range(len(cols)):
+        if not keep_mask[i]:
+            continue
+        for j in range(i + 1, len(cols)):
+            if keep_mask[j] and corr[i, j] > threshold:
+                keep_mask[j] = False
+    return [c for c, k in zip(cols, keep_mask) if k]
 
 
 def _time_weight(fight_date, current_date, half_life_days=730):
@@ -4596,7 +4619,9 @@ class UFCSuperModelPipeline:
                 finish_w = np.where(y_bin_tr == 1, 0.5 / p_finish, 0.5 / max(1e-6, 1.0 - p_finish))
                 w_stage1 = w_time * finish_w
 
-                stage1_cols = [c for c in X_m_tr_imp.columns if c not in STAGE1_EXCLUDE_COLS]
+                stage1_cols_raw = [c for c in X_m_tr_imp.columns if c not in STAGE1_EXCLUDE_COLS]
+                stage1_cols = _correlation_prune(X_m_tr_imp[stage1_cols_raw], threshold=METHOD_CORR_PRUNE_THRESHOLD)
+                self._stat("Stage1 corr-pruned", f"{len(stage1_cols_raw)} → {len(stage1_cols)} (thr={METHOD_CORR_PRUNE_THRESHOLD})")
                 X1_tr = X_m_tr_imp[stage1_cols]
                 stage1 = HistGradientBoostingClassifier(
                     loss="log_loss",
@@ -4621,8 +4646,11 @@ class UFCSuperModelPipeline:
                 finish_tr_mask = (y_method_dev.iloc[tr_idx]["finish_bin"].values == "Finish")
                 if int(np.sum(finish_tr_mask)) < 60:
                     finish_tr_mask = np.ones(len(tr_idx), dtype=bool)
-                stage2_cols = [c for c in X_m_tr_imp.columns if c not in STAGE2_EXCLUDE_COLS]
-                X2_tr = X_m_tr_imp.iloc[np.where(finish_tr_mask)[0]][stage2_cols].reset_index(drop=True)
+                stage2_cols_raw = [c for c in X_m_tr_imp.columns if c not in STAGE2_EXCLUDE_COLS]
+                _X2_for_corr = X_m_tr_imp.iloc[np.where(finish_tr_mask)[0]][stage2_cols_raw].reset_index(drop=True)
+                stage2_cols = _correlation_prune(_X2_for_corr, threshold=METHOD_CORR_PRUNE_THRESHOLD)
+                self._stat("Stage2 corr-pruned", f"{len(stage2_cols_raw)} → {len(stage2_cols)} (thr={METHOD_CORR_PRUNE_THRESHOLD})")
+                X2_tr = _X2_for_corr[stage2_cols]
                 y2_tr = y_sub_tr[np.where(finish_tr_mask)[0]]
                 p_sub = max(1e-6, float(np.mean(y2_tr))) if len(y2_tr) > 0 else 0.5
                 w2 = np.where(y2_tr == 1, 0.5 / p_sub, 0.5 / max(1e-6, 1.0 - p_sub))
