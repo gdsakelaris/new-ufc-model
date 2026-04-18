@@ -84,7 +84,7 @@ METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_cham
 # Bump when winner-stage training logic changes.
 WINNER_CACHE_VERSION = "v3"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v12"
+METHOD_CACHE_VERSION = "v16"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -108,6 +108,8 @@ METHOD_TUNING_TRIALS = 800
 METHOD_HARD_RESET = False
 # Correlation threshold for method-stage feature pruning (|corr| > this → dropped).
 METHOD_CORR_PRUNE_THRESHOLD = 0.95
+# Optuna trials for tuning method-stage HGB base models. 0 = skip and use defaults.
+METHOD_OPTUNA_TRIALS = 80
 METHOD_ERA_CANDIDATES = [1993, 2005, 2010, 2014, 2016, 2018, 2020, 2021, 2022, 2023, 2024]
 METHOD_AUTO_ERA = True
 # Keep winner-model inputs on the stable feature family while allowing richer
@@ -1040,6 +1042,54 @@ def _correlation_prune(X, y=None, threshold=0.95):
         if not any(corr[idx, k] > threshold for k in kept):
             kept.add(idx)
     return [cols[i] for i in range(len(cols)) if i in kept]
+
+
+def _optuna_tune_hgb(X_tr, y_tr, X_va, y_va, sample_weight_tr=None, n_trials=40, seed=0, defaults=None, progress_cb=None, progress_label=""):
+    """Tune a HistGradientBoostingClassifier via Optuna, minimizing validation log loss.
+
+    Returns a dict of best params (passable to HistGradientBoostingClassifier(**params)).
+    Falls back to `defaults` if optuna is unavailable or n_trials <= 0.
+    """
+    if optuna is None or n_trials <= 0 or len(X_va) < 20:
+        return defaults
+
+    def _objective(trial):
+        params = {
+            "loss": "log_loss",
+            "max_iter": trial.suggest_int("max_iter", 160, 500, step=20),
+            "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.12, log=True),
+            "max_depth": trial.suggest_int("max_depth", 4, 10),
+            "max_leaf_nodes": trial.suggest_int("max_leaf_nodes", 15, 63),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 8, 32),
+            "l2_regularization": trial.suggest_float("l2_regularization", 0.1, 2.0, log=True),
+            "random_state": seed,
+        }
+        model = HistGradientBoostingClassifier(**params)
+        if sample_weight_tr is not None:
+            model.fit(X_tr, y_tr, sample_weight=sample_weight_tr)
+        else:
+            model.fit(X_tr, y_tr)
+        p_va = model.predict_proba(X_va)[:, 1]
+        p_va = np.clip(p_va, 1e-6, 1.0 - 1e-6)
+        y_va_arr = np.asarray(y_va, dtype=float)
+        # Class-balanced log loss: weight by inverse class frequency so neither
+        # class dominates the objective (matches the fit-time sample_weight scheme).
+        _p_pos = float(np.mean(y_va_arr)) if len(y_va_arr) > 0 else 0.5
+        _p_pos = max(1e-6, min(1.0 - 1e-6, _p_pos))
+        _w_va = np.where(y_va_arr == 1, 0.5 / _p_pos, 0.5 / (1.0 - _p_pos))
+        _ll_per = y_va_arr * np.log(p_va) + (1.0 - y_va_arr) * np.log(1.0 - p_va)
+        return -float(np.sum(_w_va * _ll_per) / max(np.sum(_w_va), 1e-9))
+
+    def _trial_callback(_study, trial):
+        if progress_cb is not None and progress_label:
+            progress_cb(int(trial.number) + 1, int(n_trials), str(progress_label))
+
+    sampler = optuna.samplers.TPESampler(seed=seed)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
+    study.optimize(_objective, n_trials=n_trials, show_progress_bar=False, callbacks=[_trial_callback])
+    best = dict(study.best_params)
+    best.update({"loss": "log_loss", "random_state": seed})
+    return best
 
 
 def _time_weight(fight_date, current_date, half_life_days=730):
@@ -4638,12 +4688,30 @@ class UFCSuperModelPipeline:
                 stage1_cols = _correlation_prune(X_m_tr_imp[stage1_cols_raw], y=y_bin_tr, threshold=METHOD_CORR_PRUNE_THRESHOLD)
                 self._stat("Stage1 corr-pruned", f"{len(stage1_cols_raw)} → {len(stage1_cols)} (thr={METHOD_CORR_PRUNE_THRESHOLD})")
                 X1_tr = X_m_tr_imp[stage1_cols]
-                stage1 = HistGradientBoostingClassifier(
+                X1_va = X_m_va_imp[stage1_cols]
+                y_bin_va = (y_method_dev.iloc[va_idx]["finish_bin"].values == "Finish").astype(int)
+                _stage1_defaults = dict(
                     loss="log_loss",
                     max_iter=360, learning_rate=0.045, max_depth=6,
                     max_leaf_nodes=31, min_samples_leaf=16, l2_regularization=0.8,
                     random_state=RANDOM_SEED + 808,
                 )
+                if METHOD_OPTUNA_TRIALS > 0 and optuna is not None:
+                    self._reset_terminal_progress(
+                        labels=["Stage1 HGB", "Stage2 HGB"],
+                        default_total=METHOD_OPTUNA_TRIALS,
+                    )
+                _stage1_params = _optuna_tune_hgb(
+                    X1_tr, y_bin_tr, X1_va, y_bin_va,
+                    sample_weight_tr=w_stage1,
+                    n_trials=METHOD_OPTUNA_TRIALS,
+                    seed=RANDOM_SEED + 808,
+                    defaults=_stage1_defaults,
+                    progress_cb=self._progress,
+                    progress_label="Stage1 HGB",
+                )
+                self._stat("Stage1 HGB params", f"lr={_stage1_params.get('learning_rate', 0):.4f}, depth={_stage1_params.get('max_depth', 0)}, leaves={_stage1_params.get('max_leaf_nodes', 0)}, iter={_stage1_params.get('max_iter', 0)}")
+                stage1 = HistGradientBoostingClassifier(**_stage1_params)
                 stage1.fit(X1_tr, y_bin_tr, sample_weight=w_stage1)
                 stage1_rf = RandomForestClassifier(
                     n_estimators=420, max_depth=10, min_samples_leaf=4,
@@ -4670,12 +4738,28 @@ class UFCSuperModelPipeline:
                 p_sub = max(1e-6, float(np.mean(y2_tr))) if len(y2_tr) > 0 else 0.5
                 w2 = np.where(y2_tr == 1, 0.5 / p_sub, 0.5 / max(1e-6, 1.0 - p_sub))
 
-                stage2 = HistGradientBoostingClassifier(
+                # Stage 2 validation set (finishes only)
+                _finish_va_mask = (y_method_dev.iloc[va_idx]["finish_bin"].values == "Finish")
+                _y_sub_va = (y_method_dev.iloc[va_idx]["finish_subtype"].values == "Submission").astype(int)
+                y2_va = _y_sub_va[_finish_va_mask] if int(np.sum(_finish_va_mask)) >= 20 else _y_sub_va
+                X2_va = X_m_va_imp.iloc[np.where(_finish_va_mask)[0] if int(np.sum(_finish_va_mask)) >= 20 else np.arange(len(X_m_va_imp))][stage2_cols].reset_index(drop=True)
+                _stage2_defaults = dict(
                     loss="log_loss",
                     max_iter=320, learning_rate=0.05, max_depth=5,
                     max_leaf_nodes=31, min_samples_leaf=14, l2_regularization=0.7,
                     random_state=RANDOM_SEED + 809,
                 )
+                _stage2_params = _optuna_tune_hgb(
+                    X2_tr, y2_tr, X2_va, y2_va,
+                    sample_weight_tr=w2,
+                    n_trials=METHOD_OPTUNA_TRIALS,
+                    seed=RANDOM_SEED + 809,
+                    defaults=_stage2_defaults,
+                    progress_cb=self._progress,
+                    progress_label="Stage2 HGB",
+                )
+                self._stat("Stage2 HGB params", f"lr={_stage2_params.get('learning_rate', 0):.4f}, depth={_stage2_params.get('max_depth', 0)}, leaves={_stage2_params.get('max_leaf_nodes', 0)}, iter={_stage2_params.get('max_iter', 0)}")
+                stage2 = HistGradientBoostingClassifier(**_stage2_params)
                 stage2.fit(X2_tr, y2_tr, sample_weight=w2)
                 stage2_rf = RandomForestClassifier(
                     n_estimators=360, max_depth=9, min_samples_leaf=3,

@@ -118,44 +118,44 @@ Accuracy by Gender
 ------------------------------------------------------------------------
 Men (n=782): 66.6%
 Women (n=132): 72.7%
-Method cache: MISS (v11) — training method stage
+Method cache: MISS (v12) — training method stage
 
 ========================================================================
 Method Model
 ========================================================================
-Stage1 corr-pruned: 426 → 352 (thr=0.95)
+Stage1 corr-pruned: 426 → 354 (thr=0.95)
 Stage2 corr-pruned: 410 → 337 (thr=0.95)
 Method config: No champion on file — saving current best as champion
 Method classes (training): Decision, KO/TKO, Submission
-Validation metric target (method | winner correct): 48.1%
+Validation metric target (method | winner correct): 48.7%
 Validation majority baseline (same subset): 50.4%
 
 ========================================================================
 Method Evaluation (Conditioned on Winner Pick)
 ========================================================================
-Stage1 acc (Finish vs Decision): 59.2%
-Stage1 AUC (Finish vs Decision): 0.621
-Stage2 acc (KO/Sub | true finishes): 66.2%
+Stage1 acc (Finish vs Decision): 56.7%
+Stage1 AUC (Finish vs Decision): 0.622
+Stage2 acc (KO/Sub | true finishes): 64.2%
 Stage2 sample size (true finishes): 461
-Method acc (predicted winner conditioned): 48.8%
-Method acc | winner pick correct: 51.4%
+Method acc (predicted winner conditioned): 47.4%
+Method acc | winner pick correct: 50.4%
 Majority baseline | winner pick correct: 49.8%
-Balanced accuracy | winner pick correct: 48.3%
+Balanced accuracy | winner pick correct: 48.5%
 Macro F1 | winner pick correct: 47.5%
-FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1): 44.6%
+FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1): 46.8%
 
 Per-Class Metrics (Method | winner pick correct)
 Class          Precision    Recall      F1
-Decision           62.5%     54.4%     58.2%
-KO/TKO             50.4%     54.0%     52.2%
-Submission         29.0%     36.4%     32.3%
+Decision           61.4%     50.2%     55.2%
+KO/TKO             48.2%     55.9%     51.8%
+Submission         32.2%     39.4%     35.5%
 
 Confusion Matrix (Method | winner pick correct)
 Actual\Pred     Decision    KO/TKO  Submission
-Decision             167        80          60
-KO/TKO                69       114          28
-Submission            31        32          36
-Method cache: SAVED (v11) key=737dea59c4f1 file=method_stage_737dea59c4f1db5e9d84.pkl
+Decision             154        99          54
+KO/TKO                65       118          28
+Submission            32        28          39
+Method cache: SAVED (v12) key=101ff61fd8e2 file=method_stage_101ff61fd8e2695ed044.pkl
 
 ========================================================================
 Walk-Forward Diagnostics
