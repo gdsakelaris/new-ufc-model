@@ -84,7 +84,7 @@ METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_cham
 # Bump when winner-stage training logic changes.
 WINNER_CACHE_VERSION = "v3"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v11"
+METHOD_CACHE_VERSION = "v12"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -1006,25 +1006,40 @@ def _bayes_shrink(empirical_value, sample_size, prior=0.5, strength=8.0):
     return (empirical_value * sample_size + prior * strength) / (sample_size + strength)
 
 
-def _correlation_prune(X, threshold=0.95):
-    """Drop columns whose |corr| with an earlier-kept column exceeds threshold.
+def _correlation_prune(X, y=None, threshold=0.95):
+    """Drop columns whose |corr| with an already-kept column exceeds threshold.
 
-    Column order determines which member of a correlated pair survives — the
-    first-seen column is retained. Returns the list of surviving column names.
+    If y is provided, features are processed in descending order of |corr with y|,
+    so the more target-relevant member of each correlated pair survives (smart
+    keep-rule). If y is None, column order determines the tie-break.
+    Returns surviving column names in original column order.
     """
     cols = list(X.columns)
     if len(cols) <= 1:
         return cols
     corr = np.abs(X.corr().fillna(0.0).to_numpy())
     np.fill_diagonal(corr, 0.0)
-    keep_mask = [True] * len(cols)
-    for i in range(len(cols)):
-        if not keep_mask[i]:
-            continue
-        for j in range(i + 1, len(cols)):
-            if keep_mask[j] and corr[i, j] > threshold:
-                keep_mask[j] = False
-    return [c for c, k in zip(cols, keep_mask) if k]
+
+    if y is not None:
+        y_arr = np.asarray(y, dtype=float).reshape(-1)
+        X_arr = X.to_numpy(dtype=float, copy=False)
+        relevance = np.zeros(len(cols))
+        for i in range(len(cols)):
+            xcol = X_arr[:, i]
+            if np.std(xcol) < 1e-12:
+                continue
+            r = np.corrcoef(xcol, y_arr)[0, 1]
+            if not np.isnan(r):
+                relevance[i] = abs(r)
+        order = list(np.argsort(-relevance))
+    else:
+        order = list(range(len(cols)))
+
+    kept = set()
+    for idx in order:
+        if not any(corr[idx, k] > threshold for k in kept):
+            kept.add(idx)
+    return [cols[i] for i in range(len(cols)) if i in kept]
 
 
 def _time_weight(fight_date, current_date, half_life_days=730):
@@ -4620,7 +4635,7 @@ class UFCSuperModelPipeline:
                 w_stage1 = w_time * finish_w
 
                 stage1_cols_raw = [c for c in X_m_tr_imp.columns if c not in STAGE1_EXCLUDE_COLS]
-                stage1_cols = _correlation_prune(X_m_tr_imp[stage1_cols_raw], threshold=METHOD_CORR_PRUNE_THRESHOLD)
+                stage1_cols = _correlation_prune(X_m_tr_imp[stage1_cols_raw], y=y_bin_tr, threshold=METHOD_CORR_PRUNE_THRESHOLD)
                 self._stat("Stage1 corr-pruned", f"{len(stage1_cols_raw)} → {len(stage1_cols)} (thr={METHOD_CORR_PRUNE_THRESHOLD})")
                 X1_tr = X_m_tr_imp[stage1_cols]
                 stage1 = HistGradientBoostingClassifier(
@@ -4648,10 +4663,10 @@ class UFCSuperModelPipeline:
                     finish_tr_mask = np.ones(len(tr_idx), dtype=bool)
                 stage2_cols_raw = [c for c in X_m_tr_imp.columns if c not in STAGE2_EXCLUDE_COLS]
                 _X2_for_corr = X_m_tr_imp.iloc[np.where(finish_tr_mask)[0]][stage2_cols_raw].reset_index(drop=True)
-                stage2_cols = _correlation_prune(_X2_for_corr, threshold=METHOD_CORR_PRUNE_THRESHOLD)
+                y2_tr = y_sub_tr[np.where(finish_tr_mask)[0]]
+                stage2_cols = _correlation_prune(_X2_for_corr, y=y2_tr, threshold=METHOD_CORR_PRUNE_THRESHOLD)
                 self._stat("Stage2 corr-pruned", f"{len(stage2_cols_raw)} → {len(stage2_cols)} (thr={METHOD_CORR_PRUNE_THRESHOLD})")
                 X2_tr = _X2_for_corr[stage2_cols]
-                y2_tr = y_sub_tr[np.where(finish_tr_mask)[0]]
                 p_sub = max(1e-6, float(np.mean(y2_tr))) if len(y2_tr) > 0 else 0.5
                 w2 = np.where(y2_tr == 1, 0.5 / p_sub, 0.5 / max(1e-6, 1.0 - p_sub))
 

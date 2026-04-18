@@ -43,20 +43,12 @@ Winner feature count: 324
 Feature Pruning
 ========================================================================
 Kept features: 320
-Winner cache: MISS (v3) — training winner stage
+Winner cache: HIT (v3) key=0e6e78f79b8b file=winner_stage_0e6e78f79b8b7ec2a1df.pkl
 
 ========================================================================
 Optuna Tuning
 ========================================================================
-LightGBM  [##############################]  80/80  100.0%
-Optuna LightGBM best score: 0.40721
-Optuna LightGBM val acc: 65.7% | val ll: 0.6465 | thr: 0.566
-XGBoost   [##############################]  80/80  100.0%
-Optuna XGBoost best score: 0.40706
-Optuna XGBoost val acc: 65.7% | val ll: 0.6449 | thr: 0.544
-CatBoost  [##############################]  80/80  100.0%
-Optuna CatBoost best score: 0.40693
-Optuna CatBoost val acc: 65.7% | val ll: 0.6436 | thr: 0.550
+Cache: HIT (v3) — Optuna skipped [key=0e6e78f79b8b]
 
 ========================================================================
 Model Setup
@@ -66,11 +58,7 @@ Base models: LightGBM, LightGBM_S2, LightGBM_Tuned, XGBoost, XGBoost_S2, XGBoost
 ========================================================================
 OOF Stacking
 ========================================================================
-OOF fold: 1/5
-OOF fold: 2/5
-OOF fold: 3/5
-OOF fold: 4/5
-OOF fold: 5/5
+Cache: HIT (v3) — OOF skipped [key=0e6e78f79b8b]
 
 ========================================================================
 Combiner Selection
@@ -130,43 +118,44 @@ Accuracy by Gender
 ------------------------------------------------------------------------
 Men (n=782): 66.6%
 Women (n=132): 72.7%
-Winner cache: SAVED (v3) key=0e6e78f79b8b file=winner_stage_0e6e78f79b8b7ec2a1df.pkl
-Method cache: MISS (v10) — training method stage
+Method cache: MISS (v11) — training method stage
 
 ========================================================================
 Method Model
 ========================================================================
+Stage1 corr-pruned: 426 → 352 (thr=0.95)
+Stage2 corr-pruned: 410 → 337 (thr=0.95)
 Method config: No champion on file — saving current best as champion
 Method classes (training): Decision, KO/TKO, Submission
-Validation metric target (method | winner correct): 49.1%
+Validation metric target (method | winner correct): 48.1%
 Validation majority baseline (same subset): 50.4%
 
 ========================================================================
 Method Evaluation (Conditioned on Winner Pick)
 ========================================================================
-Stage1 acc (Finish vs Decision): 54.7%
-Stage1 AUC (Finish vs Decision): 0.618
-Stage2 acc (KO/Sub | true finishes): 66.8%
+Stage1 acc (Finish vs Decision): 59.2%
+Stage1 AUC (Finish vs Decision): 0.621
+Stage2 acc (KO/Sub | true finishes): 66.2%
 Stage2 sample size (true finishes): 461
-Method acc (predicted winner conditioned): 47.0%
-Method acc | winner pick correct: 49.3%
+Method acc (predicted winner conditioned): 48.8%
+Method acc | winner pick correct: 51.4%
 Majority baseline | winner pick correct: 49.8%
-Balanced accuracy | winner pick correct: 47.6%
-Macro F1 | winner pick correct: 46.4%
-FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1): 45.4%
+Balanced accuracy | winner pick correct: 48.3%
+Macro F1 | winner pick correct: 47.5%
+FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1): 44.6%
 
 Per-Class Metrics (Method | winner pick correct)
 Class          Precision    Recall      F1
-Decision           60.9%     50.2%     55.0%
-KO/TKO             48.2%     52.1%     50.1%
-Submission         29.4%     40.4%     34.0%
+Decision           62.5%     54.4%     58.2%
+KO/TKO             50.4%     54.0%     52.2%
+Submission         29.0%     36.4%     32.3%
 
 Confusion Matrix (Method | winner pick correct)
 Actual\Pred     Decision    KO/TKO  Submission
-Decision             154        91          62
-KO/TKO                67       110          34
-Submission            32        27          40
-Method cache: SAVED (v10) key=ee8bdda10d9d file=method_stage_ee8bdda10d9df7aea22f.pkl
+Decision             167        80          60
+KO/TKO                69       114          28
+Submission            31        32          36
+Method cache: SAVED (v11) key=737dea59c4f1 file=method_stage_737dea59c4f1db5e9d84.pkl
 
 ========================================================================
 Walk-Forward Diagnostics
