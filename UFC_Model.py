@@ -82,9 +82,9 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
 METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_champion_cfg.json")
 ###################################################################################################
 # Bump when winner-stage training logic changes.
-WINNER_CACHE_VERSION = "v3"
+WINNER_CACHE_VERSION = "v4"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v20"
+METHOD_CACHE_VERSION = "v21"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -2679,10 +2679,28 @@ def _time_split_indices(n_rows):
     return train_end, val_end
 
 
+# Pair columns that must SWAP (not negate) under corner-swap augmentation.
+# Raw r/b feature pairs that aren't differences need to be exchanged so the
+# swapped row truly represents the same fight from the opposite corner.
+_SWAP_PAIR_COLUMNS = (
+    ("elo_r", "elo_b"),
+    ("div_elo_r", "div_elo_b"),
+)
+
+
+def _apply_pair_swap(X_src, X_dst):
+    for r_col, b_col in _SWAP_PAIR_COLUMNS:
+        if r_col in X_dst.columns and b_col in X_dst.columns:
+            r_vals = X_src[r_col].values.copy()
+            X_dst[r_col] = X_src[b_col].values
+            X_dst[b_col] = r_vals
+
+
 def _augment_swap(X, y):
     d_cols = [c for c in X.columns if c.startswith("d_")]
     X_swap = X.copy()
     X_swap[d_cols] = -X_swap[d_cols]
+    _apply_pair_swap(X, X_swap)
     y_swap = 1.0 - y
     # Interleave to preserve chronology for folds.
     X_aug = pd.concat([X, X_swap], ignore_index=True)
@@ -2705,6 +2723,7 @@ def _swap_features(X):
     X2 = X.copy()
     d_cols = [c for c in X2.columns if c.startswith("d_")]
     X2[d_cols] = -X2[d_cols]
+    _apply_pair_swap(X, X2)
     return X2
 
 

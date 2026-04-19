@@ -11495,6 +11495,15 @@ class UFCPredictor:
             for _fname, _fimp in _perfect_feats:
                 print(f"    {_fname}")
             print_divider()
+
+        print_divider()
+        print(f"  Selected features with importances ({len(_feat_imp)}):")
+        print_divider()
+        _name_w = max((len(_fname) for _fname, _ in _feat_imp), default=0)
+        for _rank, (_fname, _fimp) in enumerate(_feat_imp, 1):
+            print(f"    {_rank:>3}. {_fname:<{_name_w}}  {_fimp:.4f}")
+        print_divider()
+
         print_metric("  Features used:", X_tr_sel.shape[1])
         print()
 
