@@ -82,9 +82,9 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
 METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_champion_cfg.json")
 ###################################################################################################
 # Bump when winner-stage training logic changes.
-WINNER_CACHE_VERSION = "v4"
+WINNER_CACHE_VERSION = "v6"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v24"
+METHOD_CACHE_VERSION = "v26"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -241,6 +241,25 @@ FEATURE_ROUTING = {
     "m_finish_speed_pressure":     {"stage1"},
     "ctx_finish_prior_2y":         {"stage1"},
     "ref_finish_prior":            {"stage1"},
+
+    # ═══════════════════════════════════════════════════════════════════
+    # FINISH-ROUND DISTRIBUTION (method-only)
+    # Conditional-on-finish round distributions inform WHICH kind of
+    # finish (stage 2) and WHETHER the fight finishes at all (stage 1),
+    # but largely duplicate first_round_finish_rate for winner.
+    # ═══════════════════════════════════════════════════════════════════
+    "d_finish_r1_share":           {"stage1", "stage2"},
+    "d_finish_r3_plus_share":      {"stage1", "stage2"},
+    "d_avg_finish_round_w":        {"stage1", "stage2"},
+
+    # ═══════════════════════════════════════════════════════════════════
+    # ELO TRAJECTORY (winner + stage 1)
+    # Rising-vs-falling trend signal independent of raw elo level.
+    # Stage 2 (KO vs Sub) has no clear directional tie to trajectory.
+    # ═══════════════════════════════════════════════════════════════════
+    "r_elo_slope_5":               {"winner", "stage1"},
+    "b_elo_slope_5":               {"winner", "stage1"},
+    "d_elo_slope_5":               {"winner", "stage1"},
 }
 def _feature_allowed(feature_name, model):
     """True if `feature_name` should be fed to `model` ('winner'/'stage1'/'stage2').
@@ -1430,6 +1449,16 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
             "offensive_diversity": 1.0,
             "ewm_sig_str_diff_pm": 0.0,
             "glicko_confidence": 0.0,
+            "dapa_sig_str_pm": 0.0,
+            "dapa_kd_pm": 0.0,
+            "dapa_sub_att_p15": 0.0,
+            "dapa_td_acc": 0.0,
+            "dapa_sig_str_def": 0.55,
+            "sig_str_per_ctrl_sec": 0.0,
+            "td_land_per_sub_att": 0.0,
+            "finish_r1_share": 0.0,
+            "finish_r3_plus_share": 0.0,
+            "avg_finish_round_w": 0.0,
         })
         return feats
 
@@ -2222,6 +2251,77 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
     # ── Glicko confidence (lower phi = more certain rating) ──
     feats["glicko_confidence"] = max(1.0 - (glicko[1] / PHI_0), 0.0)
 
+    # ── Control-to-damage ratios (style discrimination) ──
+    # sig_str_per_ctrl_sec: strikes landed per second of control — separates
+    # damaging ground-and-pounders from position-hugging wrestlers.
+    # td_land_per_sub_att: wrestle-hug ratio vs sub-hunt ratio.
+    _total_ctrl_sec = float(_safe_sum(h.get("ctrl_sec") for h in history) or 0.0)
+    _total_sub_att = float(_safe_sum(h.get("sub_att") for h in history) or 0.0)
+    feats["sig_str_per_ctrl_sec"] = (
+        total_sig_land / _total_ctrl_sec if _total_ctrl_sec > 0 else 0.0
+    )
+    feats["td_land_per_sub_att"] = (
+        total_td_land / _total_sub_att if _total_sub_att > 0 else 0.0
+    )
+
+    # ── Finish-round distribution (conditional on the fighter finishing) ──
+    # How their finishes are spread across rounds — distinct from the aggregate
+    # first_round_finish_rate (which divides by all fights).
+    _finish_rounds = []
+    for h in history:
+        if h.get("result") != "W":
+            continue
+        _method = str(h.get("method", "")).strip()
+        if _method not in ("KO/TKO", "Submission"):
+            continue
+        _fr = int(h.get("finish_round") or 0)
+        if _fr >= 1:
+            _finish_rounds.append(_fr)
+    if _finish_rounds:
+        _nfr = len(_finish_rounds)
+        feats["finish_r1_share"] = float(sum(1 for r in _finish_rounds if r == 1) / _nfr)
+        feats["finish_r3_plus_share"] = float(sum(1 for r in _finish_rounds if r >= 3) / _nfr)
+        feats["avg_finish_round_w"] = float(sum(_finish_rounds) / _nfr)
+    else:
+        feats["finish_r1_share"] = 0.0
+        feats["finish_r3_plus_share"] = 0.0
+        feats["avg_finish_round_w"] = 0.0
+
+    # ── DAPA (Decayed + opponent-Adjusted Performance Average) ──
+    # Exponentially time-weighted per-fight stat rates, scaled by opponent
+    # glicko so stats earned against higher-quality opposition count more.
+    # Mirrors the Old_Model DAPA formulation that showed up in its top-20
+    # stability-selection features (e.g. r_pre_dapa_head_defense).
+    _dapa_alpha = 0.8
+    _dapa_w = np.array([_dapa_alpha ** (n - 1 - i) for i in range(n)], dtype=float)
+    _dapa_w_sum = float(_dapa_w.sum()) or 1.0
+    _dapa_opp = np.array(
+        [_num_or(h.get("opp_glicko"), MU_0) / MU_0 for h in history], dtype=float
+    )
+    _dapa_ft_min = np.array(
+        [max((h["fight_time"] or 0) / 60.0, 0.1) for h in history], dtype=float
+    )
+    _dapa_slpm = np.array([h["sig_str"] or 0 for h in history], dtype=float) / _dapa_ft_min
+    _dapa_kdpm = np.array([h["kd"] or 0 for h in history], dtype=float) / _dapa_ft_min
+    _dapa_subp15 = np.array(
+        [h["sub_att"] or 0 for h in history], dtype=float
+    ) / (_dapa_ft_min / 15.0)
+    _dapa_td_att = np.array([h["td_att"] or 0 for h in history], dtype=float)
+    _dapa_td_land = np.array([h["td"] or 0 for h in history], dtype=float)
+    _dapa_tda = np.where(
+        _dapa_td_att > 0, _dapa_td_land / np.maximum(_dapa_td_att, 1.0), 0.0
+    )
+    # Striking defense proxy: 1 - opp_sig_str_acc from each fight.
+    _dapa_opp_ssa = np.array(
+        [_num_or(h.get("opp_sig_str_acc"), 0.45) for h in history], dtype=float
+    )
+    _dapa_sd = np.clip(1.0 - _dapa_opp_ssa, 0.0, 1.0)
+    feats["dapa_sig_str_pm"] = float(np.sum(_dapa_slpm * _dapa_opp * _dapa_w) / _dapa_w_sum)
+    feats["dapa_kd_pm"] = float(np.sum(_dapa_kdpm * _dapa_opp * _dapa_w) / _dapa_w_sum)
+    feats["dapa_sub_att_p15"] = float(np.sum(_dapa_subp15 * _dapa_opp * _dapa_w) / _dapa_w_sum)
+    feats["dapa_td_acc"] = float(np.sum(_dapa_tda * _dapa_opp * _dapa_w) / _dapa_w_sum)
+    feats["dapa_sig_str_def"] = float(np.sum(_dapa_sd * _dapa_opp * _dapa_w) / _dapa_w_sum)
+
     if _FIGHTER_FEAT_KEYS is None:
         _set_fighter_keys(list(feats.keys()))
 
@@ -2737,6 +2837,8 @@ def _time_split_indices(n_rows):
 _SWAP_PAIR_COLUMNS = (
     ("elo_r", "elo_b"),
     ("div_elo_r", "div_elo_b"),
+    ("r_div_rank", "b_div_rank"),
+    ("r_elo_slope_5", "b_elo_slope_5"),
 )
 
 
@@ -3446,6 +3548,94 @@ def _normalize_division(weight_class, gender):
     return wc
 
 
+def _elo_slope(history, window=5):
+    """OLS slope of the last `window` post-fight elos against fight index.
+
+    Returns 0.0 for fighters with <2 fights or if the window has zero variance.
+    Captures a rising/falling trajectory signal orthogonal to raw elo level.
+    """
+    if not history:
+        return 0.0
+    tail = history[-window:]
+    if len(tail) < 2:
+        return 0.0
+    y = np.asarray(tail, dtype=float)
+    x = np.arange(len(tail), dtype=float)
+    x_mean = float(x.mean())
+    y_mean = float(y.mean())
+    num = float(np.sum((x - x_mean) * (y - y_mean)))
+    den = float(np.sum((x - x_mean) ** 2))
+    if den == 0.0:
+        return 0.0
+    return num / den
+
+
+def _compute_div_ranks_for_pair(r_name, b_name, division, div_ratings, last_fight_date, ref_date):
+    """1-based divisional ranks for (r_name, b_name) among fighters whose last
+    fight was within ACTIVE_DAYS of ref_date. Returns (r_rank, b_rank, active_count).
+    Ranks default to None if the fighter has no division history; the caller can
+    treat that as "unranked." The two subjects are always added to the pool.
+    """
+    try:
+        cutoff = pd.Timestamp(ref_date) - pd.Timedelta(days=ACTIVE_DAYS)
+    except Exception:
+        cutoff = None
+    active = []
+    seen = set()
+    for (fname, fdiv), elo in div_ratings.items():
+        if fdiv != division:
+            continue
+        if fname in seen:
+            continue
+        last = last_fight_date.get(fname)
+        is_active = False
+        if cutoff is not None and last is not None:
+            try:
+                is_active = pd.Timestamp(last) >= cutoff
+            except Exception:
+                is_active = False
+        if fname in (r_name, b_name) or is_active:
+            active.append((fname, float(elo)))
+            seen.add(fname)
+    if r_name not in seen:
+        active.append((r_name, float(div_ratings.get((r_name, division), ELO_BASE))))
+        seen.add(r_name)
+    if b_name not in seen:
+        active.append((b_name, float(div_ratings.get((b_name, division), ELO_BASE))))
+        seen.add(b_name)
+    # Rank by div_elo descending; stable order on ties to keep runs reproducible.
+    active.sort(key=lambda t: (-t[1], t[0]))
+    r_rank = next((i + 1 for i, (fn, _) in enumerate(active) if fn == r_name), None)
+    b_rank = next((i + 1 for i, (fn, _) in enumerate(active) if fn == b_name), None)
+    return r_rank, b_rank, len(active)
+
+
+def _div_rank_feature_row(r_name, b_name, division, div_ratings, last_fight_date, ref_date):
+    """Pack divisional-rank features into a flat dict for the elo feature row."""
+    r_rank, b_rank, active_count = _compute_div_ranks_for_pair(
+        r_name, b_name, division, div_ratings, last_fight_date, ref_date
+    )
+    rank_known = (
+        r_rank is not None and b_rank is not None and active_count >= 5
+    )
+    r_val = float(r_rank) if r_rank is not None else float(active_count + 1)
+    b_val = float(b_rank) if b_rank is not None else float(active_count + 1)
+    # d_div_rank positive = red better (lower rank number).
+    d_div_rank = b_val - r_val
+    r_top5 = 1.0 if r_rank is not None and r_rank <= 5 else 0.0
+    b_top5 = 1.0 if b_rank is not None and b_rank <= 5 else 0.0
+    return {
+        "r_div_rank": r_val,
+        "b_div_rank": b_val,
+        "d_div_rank": d_div_rank,
+        "abs_div_rank_gap": abs(d_div_rank),
+        "both_top5": r_top5 * b_top5,
+        "one_top5": float((r_top5 + b_top5) == 1.0),
+        "rank_unknown": 0.0 if rank_known else 1.0,
+        "div_active_count": float(active_count),
+    }
+
+
 def _build_elo_features_from_csv(csv_path):
     """
     Build chronological pre-fight Elo features aligned to the training rows
@@ -3457,6 +3647,8 @@ def _build_elo_features_from_csv(csv_path):
 
     ratings = defaultdict(lambda: ELO_BASE)
     div_ratings = defaultdict(lambda: ELO_BASE)
+    last_fight_date = {}
+    elo_history = defaultdict(list)  # post-fight elo series per fighter
     rows = []
 
     for _, row in df.iterrows():
@@ -3469,6 +3661,7 @@ def _build_elo_features_from_csv(csv_path):
         if not r_name or not b_name:
             continue
         division = _normalize_division(row.get("weight_class", ""), row.get("gender", ""))
+        event_date = row["event_date"]
 
         r_elo = float(ratings[r_name])
         b_elo = float(ratings[b_name])
@@ -3479,7 +3672,16 @@ def _build_elo_features_from_csv(csv_path):
         b_div_elo = float(div_ratings[(b_name, division)])
         d_div_elo = r_div_elo - b_div_elo
         p_red_div = 1.0 / (1.0 + 10.0 ** (-(d_div_elo / 400.0)))
-        rows.append({
+
+        # ── Divisional rank snapshot (pre-fight state) ──
+        rank_feats = _div_rank_feature_row(
+            r_name, b_name, division, div_ratings, last_fight_date, event_date
+        )
+        # ── Elo trend slopes (pre-fight, last 5 post-fight elos) ──
+        r_slope = _elo_slope(elo_history[r_name], window=5)
+        b_slope = _elo_slope(elo_history[b_name], window=5)
+
+        row_dict = {
             "elo_r": r_elo,
             "elo_b": b_elo,
             "d_elo": d_elo,
@@ -3495,16 +3697,29 @@ def _build_elo_features_from_csv(csv_path):
             "abs_div_elo_gap": abs(d_div_elo),
             "elo_divergence": p_red - p_red_div,
             "elo_agreement": 1.0 - abs(p_red - p_red_div),
-        })
+            "r_elo_slope_5": r_slope,
+            "b_elo_slope_5": b_slope,
+            "d_elo_slope_5": r_slope - b_slope,
+        }
+        row_dict.update(rank_feats)
+        rows.append(row_dict)
 
         score_r = 1.0 if winner == "Red" else 0.0
         score_b = 1.0 - score_r
-        ratings[r_name] = r_elo + ELO_K * (score_r - p_red)
-        ratings[b_name] = b_elo + ELO_K * (score_b - (1.0 - p_red))
+        new_r_elo = r_elo + ELO_K * (score_r - p_red)
+        new_b_elo = b_elo + ELO_K * (score_b - (1.0 - p_red))
+        ratings[r_name] = new_r_elo
+        ratings[b_name] = new_b_elo
         div_ratings[(r_name, division)] = r_div_elo + ELO_K * (score_r - p_red_div)
         div_ratings[(b_name, division)] = b_div_elo + ELO_K * (score_b - (1.0 - p_red_div))
+        # Update post-fight state AFTER the row is built so pre-fight snapshots
+        # don't include the current event.
+        elo_history[r_name].append(new_r_elo)
+        elo_history[b_name].append(new_b_elo)
+        last_fight_date[r_name] = event_date
+        last_fight_date[b_name] = event_date
 
-    return pd.DataFrame(rows), dict(ratings), dict(div_ratings)
+    return pd.DataFrame(rows), dict(ratings), dict(div_ratings), last_fight_date, dict(elo_history)
 
 
 def _training_row_dates_from_csv(csv_path):
@@ -3978,6 +4193,8 @@ class UFCSuperModelPipeline:
         self.fighter_meta = {}
         self.elo_ratings = {}
         self.div_elo_ratings = {}
+        self.last_fight_date = {}
+        self.elo_history = {}
         self.benchmarks = None
         self.method_model = None
         self.method_imputer = None
@@ -4077,15 +4294,19 @@ class UFCSuperModelPipeline:
         row_meta = _training_row_meta_from_csv(self.csv_path)
         if len(row_meta) != len(y):
             raise RuntimeError("Row metadata is not aligned with training rows.")
-        elo_df, elo_ratings, div_elo_ratings = _build_elo_features_from_csv(self.csv_path)
+        elo_df, elo_ratings, div_elo_ratings, last_fight_date, elo_history = _build_elo_features_from_csv(self.csv_path)
         if len(elo_df) == len(X):
             X = pd.concat([X.reset_index(drop=True), elo_df.reset_index(drop=True)], axis=1)
             self.elo_ratings = elo_ratings
             self.div_elo_ratings = div_elo_ratings
+            self.last_fight_date = last_fight_date
+            self.elo_history = elo_history
         else:
             self._log("Warning: Elo feature alignment mismatch. Skipping Elo features.")
             self.elo_ratings = {}
             self.div_elo_ratings = {}
+            self.last_fight_date = {}
+            self.elo_history = {}
         X = _augment_matchup_features(X)
         self.fighter_history = fighter_history
         self.glicko_ratings = glicko_ratings
@@ -6066,6 +6287,14 @@ class UFCSuperModelPipeline:
             "elo_divergence": elo_p - div_p,
             "elo_agreement": 1.0 - abs(elo_p - div_p),
         })
+        matchup.update(_div_rank_feature_row(
+            a_key, b_key, division, self.div_elo_ratings, self.last_fight_date, today,
+        ))
+        _a_slope = _elo_slope(self.elo_history.get(a_key, []), window=5)
+        _b_slope = _elo_slope(self.elo_history.get(b_key, []), window=5)
+        matchup["r_elo_slope_5"] = _a_slope
+        matchup["b_elo_slope_5"] = _b_slope
+        matchup["d_elo_slope_5"] = _a_slope - _b_slope
         matchup_df = _augment_matchup_features(pd.DataFrame([matchup]))
         p_a = self.model.predict_proba_single(matchup_df.iloc[0].to_dict())
         pick_a = p_a >= 0.5
