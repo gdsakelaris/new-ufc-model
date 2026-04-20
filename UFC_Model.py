@@ -84,7 +84,7 @@ METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_cham
 # Bump when winner-stage training logic changes.
 WINNER_CACHE_VERSION = "v4"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v21"
+METHOD_CACHE_VERSION = "v24"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -104,7 +104,9 @@ NEEDS_SCALE = {"LogReg", "MLP"}
 ELO_BASE = 1500.0
 ELO_K = 24.0
 OPTUNA_TRIALS = 80
-METHOD_TUNING_TRIALS = 800
+METHOD_TUNING_TRIALS = 400
+WINNER_MAX_FEATURES = 320
+STAGE2_MAX_FEATURES = 180
 METHOD_HARD_RESET = False
 # Correlation threshold for method-stage feature pruning (|corr| > this → dropped).
 METHOD_CORR_PRUNE_THRESHOLD = 0.95
@@ -112,57 +114,19 @@ METHOD_CORR_PRUNE_THRESHOLD = 0.95
 METHOD_OPTUNA_TRIALS = 80
 METHOD_ERA_CANDIDATES = [1993, 2005, 2010, 2014, 2016, 2018, 2020, 2021, 2022, 2023, 2024]
 METHOD_AUTO_ERA = True
-# Keep winner-model inputs on the stable feature family while allowing richer
-# method-only engineering in the method pipeline.
-WINNER_EXCLUDE_FEATURES = {
-    "sub_entry_pressure_sum", "sub_defensive_leak_sum",
-    "ko_attack_pressure_sum", "ko_def_leak_sum",
-    "d_head_acc", "d_distance_acc", "d_ground_acc", "d_clinch_acc",
-    "d_body_acc", "d_leg_acc", "d_body_leg_attrition",
-    "d_head_hunt_share", "d_distance_share",
-    "d_ground_strike_accuracy", "d_head_hunt_accuracy", "d_distance_strike_accuracy",
-    "d_sub_loss_pct", "d_recent_sub_win_rate",
-    "d_sub_entry_pressure", "d_sub_control_conversion", "d_sub_scramble_threat",
-    "d_sub_defensive_leak", "d_late_sub_pressure",
-    "d_sub_recency_surge", "d_grapple_recency_surge", "d_sub_vs_control_axis",
-    "d_recent_ko_loss_rate", "d_r5_def_kd_pm", "d_ko_attack_pressure", "d_ko_def_leak",
-    "d_r1f_def_kd_pm", "d_r3_def_kd_pm",
-    # Stage-1 sum features (exact side reconstruction)
-    "dec_win_pct_sum", "finish_resistance_sum", "consistency_sum", "cardio_ratio_sum",
-    "durability_sum", "output_rate_sum", "rd1_intensity_ratio_sum",
-    "strike_exchange_ratio_sum", "sig_str_acc_sum", "late_round_pct_sum",
-    "avg_time_min_sum", "avg_finish_round_sum", "first_round_finish_rate_sum",
-    "damage_efficiency_sum", "body_leg_attrition_sum",
-    # Stage-1 context priors
-    "ctx_finish_prior_2y", "ref_finish_prior",
-    # Stage-1 latent finish-environment features
-    "m_decision_shell_gap", "m_decision_shell_sum", "m_finish_conversion_edge",
-    "m_finish_environment", "m_mutual_finish_instability", "m_decision_absorber",
-    "m_early_finish_window", "m_fast_start_fragility", "m_late_finish_window",
-    "m_attrition_break_window", "m_time_profile_finish_bias",
-    "m_finish_over_shell_ratio", "m_clean_decision_track", "m_finish_speed_pressure",
-}
-# Features that are stage-1-specific (finish vs decision signals) and must be
-# withheld from stage-2 (KO vs Sub), which was calibrated without them.
-STAGE2_EXCLUDE_COLS_BASE = frozenset({
-    "m_decision_shell_gap", "m_decision_shell_sum", "m_finish_conversion_edge",
-    "m_finish_environment", "m_mutual_finish_instability", "m_decision_absorber",
-    "m_early_finish_window", "m_fast_start_fragility", "m_late_finish_window",
-    "m_attrition_break_window", "m_time_profile_finish_bias",
-    "m_finish_over_shell_ratio", "m_clean_decision_track", "m_finish_speed_pressure",
-    "ctx_finish_prior_2y", "ref_finish_prior",
-})
 ###################################################################################################
 # FEATURE_ROUTING — single source of truth for which models see which engineered features.
 # Each key is a feature name; the value is the set of models that should receive it.
 # Allowed tags: "winner", "stage1" (Finish vs Decision), "stage2" (KO vs Sub).
+# Features NOT listed here default to all three models.
 # Filters are auto-derived below; to change a feature's routing, edit this dict only.
 FEATURE_ROUTING = {
-    # --- Batch 2: within-fight pacing (§A) ---
-    # NOTE: d_rd1_kd, d_rd1_td_att, d_rd3_sub_att already exist as auto-diffs of
-    # pre-existing rd1_kd / rd1_td_att / rd3_sub_att aggregates — not routed
-    # here (would remove them from winner). User's d_rd1_kd_rate / d_early_td_pressure
-    # / d_rd3_sub_att_rate collapse into those existing columns.
+    # ═══════════════════════════════════════════════════════════════════
+    # WINNER-ONLY
+    # Context/pacing signals that help the winner model but add noise to
+    # the method stages (which are conditional on outcome or on finish).
+    # ═══════════════════════════════════════════════════════════════════
+    # Within-fight pacing (§A)
     "d_def_rd1_sig_str":           {"winner"},
     "d_def_rd1_kd":                {"winner"},
     "d_rd1_net_sig_str":           {"winner"},
@@ -180,24 +144,114 @@ FEATURE_ROUTING = {
     "gender_flag":                 {"winner"},
     "d_title_x_cardio":            {"winner"},
     "d_total_rounds_x_finish_resistance": {"winner"},
-    # --- Context-conditional & stability (winner-only) ---
+    # Context-conditional & stability (winner-only)
     "d_rounds_experience":         {"winner"},
     "d_rounds_5_exp":              {"winner"},
     "d_rounds_3_exp":              {"winner"},
     "d_stability":                 {"winner"},
     "d_sig_diff_pm_vol":           {"winner"},
+
+    # ═══════════════════════════════════════════════════════════════════
+    # WINNER + STAGE 1 (excluded from STAGE 2)
+    # Decision-winning ability is tautologically zero conditional on the
+    # fight ending in a finish, so it carries no KO-vs-Sub signal for
+    # stage 2. Winner still benefits (decision-heavy fighters can win)
+    # and stage 1 benefits (decision ability is the anti-finish signal).
+    # ═══════════════════════════════════════════════════════════════════
+    "d_decision_ability":          {"winner", "stage1"},
+    "d_decision_win_rate":         {"winner", "stage1"},
+    "d_dec_win_pct":               {"winner", "stage1"},
+
+    # ═══════════════════════════════════════════════════════════════════
+    # METHOD-ONLY (stage 1 + stage 2)
+    # Method-specific striking and grappling signals — noisy for winner.
+    # ═══════════════════════════════════════════════════════════════════
+    # Striking-accuracy by zone/position
+    "d_head_acc":                  {"stage1", "stage2"},
+    "d_body_acc":                  {"stage1", "stage2"},
+    "d_leg_acc":                   {"stage1", "stage2"},
+    "d_distance_acc":              {"stage1", "stage2"},
+    "d_clinch_acc":                {"stage1", "stage2"},
+    "d_ground_acc":                {"stage1", "stage2"},
+    "d_body_leg_attrition":        {"stage1", "stage2"},
+    "d_head_hunt_share":           {"stage1", "stage2"},
+    "d_distance_share":            {"stage1", "stage2"},
+    "d_ground_strike_accuracy":    {"stage1", "stage2"},
+    "d_head_hunt_accuracy":        {"stage1", "stage2"},
+    "d_distance_strike_accuracy":  {"stage1", "stage2"},
+    # KO-specific (method-only)
+    "d_recent_ko_loss_rate":       {"stage1", "stage2"},
+    "d_r5_def_kd_pm":              {"stage1", "stage2"},
+    "d_ko_attack_pressure":        {"stage1", "stage2"},
+    "d_ko_def_leak":               {"stage1", "stage2"},
+    "d_r1f_def_kd_pm":             {"stage1", "stage2"},
+    "d_r3_def_kd_pm":              {"stage1", "stage2"},
+    "ko_attack_pressure_sum":      {"stage1", "stage2"},
+    "ko_def_leak_sum":             {"stage1", "stage2"},
+    # Submission-specific (method-only)
+    "d_sub_loss_pct":              {"stage1", "stage2"},
+    "d_recent_sub_win_rate":       {"stage1", "stage2"},
+    "d_sub_entry_pressure":        {"stage1", "stage2"},
+    "d_sub_control_conversion":    {"stage1", "stage2"},
+    "d_sub_scramble_threat":       {"stage1", "stage2"},
+    "d_sub_defensive_leak":        {"stage1", "stage2"},
+    "d_late_sub_pressure":         {"stage1", "stage2"},
+    "d_sub_recency_surge":         {"stage1", "stage2"},
+    "d_grapple_recency_surge":     {"stage1", "stage2"},
+    "d_sub_vs_control_axis":       {"stage1", "stage2"},
+    "sub_entry_pressure_sum":      {"stage1", "stage2"},
+    "sub_defensive_leak_sum":      {"stage1", "stage2"},
+    # Sum features (exact side reconstruction after winner-orientation)
+    "dec_win_pct_sum":             {"stage1", "stage2"},
+    "finish_resistance_sum":       {"stage1", "stage2"},
+    "consistency_sum":             {"stage1", "stage2"},
+    "cardio_ratio_sum":            {"stage1", "stage2"},
+    "durability_sum":              {"stage1", "stage2"},
+    "output_rate_sum":             {"stage1", "stage2"},
+    "rd1_intensity_ratio_sum":     {"stage1", "stage2"},
+    "strike_exchange_ratio_sum":   {"stage1", "stage2"},
+    "sig_str_acc_sum":             {"stage1", "stage2"},
+    "late_round_pct_sum":          {"stage1", "stage2"},
+    "avg_time_min_sum":            {"stage1", "stage2"},
+    "avg_finish_round_sum":        {"stage1", "stage2"},
+    "first_round_finish_rate_sum": {"stage1", "stage2"},
+    "damage_efficiency_sum":       {"stage1", "stage2"},
+    "body_leg_attrition_sum":      {"stage1", "stage2"},
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STAGE 1 ONLY (Finish vs Decision)
+    # Latent finish-environment features calibrated specifically for the
+    # decision-vs-finish split; withheld from winner (noise) and stage 2
+    # (stage 2 operates only on finished fights — shell/environment
+    # features carry no KO-vs-Sub directional information).
+    # ═══════════════════════════════════════════════════════════════════
+    "m_decision_shell_gap":        {"stage1"},
+    "m_decision_shell_sum":        {"stage1"},
+    "m_finish_conversion_edge":    {"stage1"},
+    "m_finish_environment":        {"stage1"},
+    "m_mutual_finish_instability": {"stage1"},
+    "m_decision_absorber":         {"stage1"},
+    "m_early_finish_window":       {"stage1"},
+    "m_fast_start_fragility":      {"stage1"},
+    "m_late_finish_window":        {"stage1"},
+    "m_attrition_break_window":    {"stage1"},
+    "m_time_profile_finish_bias":  {"stage1"},
+    "m_finish_over_shell_ratio":   {"stage1"},
+    "m_clean_decision_track":      {"stage1"},
+    "m_finish_speed_pressure":     {"stage1"},
+    "ctx_finish_prior_2y":         {"stage1"},
+    "ref_finish_prior":            {"stage1"},
 }
-_ROUTING_WINNER_EXCLUDE = {f for f, tags in FEATURE_ROUTING.items() if "winner" not in tags}
-_ROUTING_STAGE1_EXCLUDE = {f for f, tags in FEATURE_ROUTING.items() if "stage1" not in tags}
-_ROUTING_STAGE2_EXCLUDE = {f for f, tags in FEATURE_ROUTING.items() if "stage2" not in tags}
-# Merge auto-derived sets with the existing manually-curated excludes.
-WINNER_EXCLUDE_FEATURES = WINNER_EXCLUDE_FEATURES | _ROUTING_WINNER_EXCLUDE
-STAGE1_EXCLUDE_COLS = frozenset(_ROUTING_STAGE1_EXCLUDE)
-STAGE2_EXCLUDE_COLS = frozenset(STAGE2_EXCLUDE_COLS_BASE | _ROUTING_STAGE2_EXCLUDE)
+def _feature_allowed(feature_name, model):
+    """True if `feature_name` should be fed to `model` ('winner'/'stage1'/'stage2').
+
+    Features absent from FEATURE_ROUTING go to every model by default.
+    """
+    tags = FEATURE_ROUTING.get(feature_name)
+    return tags is None or model in tags
 ###################################################################################################
 STRICT_FUTURE_MODE = True
 FORCED_START_YEAR = None
-MISSINGNESS_THRESHOLD = 0.35
 
 MU_0 = 1500.0
 PHI_0 = 200.0
@@ -548,6 +602,17 @@ def _oriented_method_matrix(X_df, y_red_win):
     for col in X_m.columns:
         if col.startswith("d_"):
             X_m[col] = X_m[col].astype(float).values * sign
+    # Raw r_/b_ pair columns aren't differences, so per-row orientation must
+    # exchange them on blue-winner rows (sign == -1) to stay consistent with
+    # the d_* negation above.
+    blue_mask = (sign == -1)
+    if blue_mask.any():
+        for r_col, b_col in _SWAP_PAIR_COLUMNS:
+            if r_col in X_m.columns and b_col in X_m.columns:
+                r_arr = X_m[r_col].values.copy()
+                b_arr = X_m[b_col].values.copy()
+                X_m[r_col] = np.where(blue_mask, b_arr, r_arr)
+                X_m[b_col] = np.where(blue_mask, r_arr, b_arr)
     return X_m
 
 
@@ -1101,19 +1166,6 @@ def _time_weight(fight_date, current_date, half_life_days=730):
         return 2.0 ** (-max(days, 0) / half_life_days)
     except (TypeError, AttributeError):
         return 1.0
-
-
-def _pick_missing_cols(X, threshold=MISSINGNESS_THRESHOLD):
-    return [c for c in X.columns if float(X[c].isna().mean()) >= threshold]
-
-
-def _add_missingness_indicators(X, missing_cols):
-    X2 = X.copy()
-    for col in missing_cols:
-        if col not in X2.columns:
-            X2[col] = np.nan
-        X2[f"miss_{col}"] = X2[col].isna().astype(float)
-    return X2
 
 
 def _expected_calibration_error(y_true, probs, n_bins=10):
@@ -4123,7 +4175,7 @@ class UFCSuperModelPipeline:
         self._stat("Holdout test rows", len(X_test_raw))
         self._stat("Feature count", X.shape[1])
         full_feature_cols = list(X.columns)
-        feature_cols = [c for c in full_feature_cols if c not in WINNER_EXCLUDE_FEATURES]
+        feature_cols = [c for c in full_feature_cols if _feature_allowed(c, "winner")]
         data_fp = _cache_data_fingerprint(self.csv_path)
         X_full = X[full_feature_cols].reset_index(drop=True)
         X_winner = X[feature_cols].reset_index(drop=True)
@@ -4145,8 +4197,7 @@ class UFCSuperModelPipeline:
         X_test_full = pd.DataFrame(full_imputer.transform(X_test_raw_full), columns=full_feature_cols)
 
         # Lightweight feature pruning to reduce noisy tails.
-        MAX_FEATURES = 320
-        if lgb is not None and len(feature_cols) > MAX_FEATURES:
+        if lgb is not None and len(feature_cols) > WINNER_MAX_FEATURES:
             X_quick_aug, y_quick_aug = _augment_swap(X_train, y_train)
             quick = lgb.LGBMClassifier(
                 n_estimators=250, learning_rate=0.05, max_depth=6,
@@ -4155,7 +4206,7 @@ class UFCSuperModelPipeline:
             quick.fit(X_quick_aug, y_quick_aug)
             imp = np.asarray(quick.feature_importances_, dtype=float)
             order_idx = np.argsort(imp)[::-1]
-            keep_idx = order_idx[:MAX_FEATURES]
+            keep_idx = order_idx[:WINNER_MAX_FEATURES]
             feature_cols = [feature_cols[i] for i in sorted(keep_idx)]
             X_train = X_train[feature_cols]
             X_val = X_val[feature_cols]
@@ -4703,7 +4754,7 @@ class UFCSuperModelPipeline:
                 finish_w = np.where(y_bin_tr == 1, 0.5 / p_finish, 0.5 / max(1e-6, 1.0 - p_finish))
                 w_stage1 = w_time * finish_w
 
-                stage1_cols_raw = [c for c in X_m_tr_imp.columns if c not in STAGE1_EXCLUDE_COLS]
+                stage1_cols_raw = [c for c in X_m_tr_imp.columns if _feature_allowed(c, "stage1")]
                 stage1_cols = _correlation_prune(X_m_tr_imp[stage1_cols_raw], y=y_bin_tr, threshold=METHOD_CORR_PRUNE_THRESHOLD)
                 self._stat("Stage1 corr-pruned", f"{len(stage1_cols_raw)} → {len(stage1_cols)} (thr={METHOD_CORR_PRUNE_THRESHOLD})")
                 X1_tr = X_m_tr_imp[stage1_cols]
@@ -4748,14 +4799,31 @@ class UFCSuperModelPipeline:
                 finish_tr_mask = (y_method_dev.iloc[tr_idx]["finish_bin"].values == "Finish")
                 if int(np.sum(finish_tr_mask)) < 60:
                     finish_tr_mask = np.ones(len(tr_idx), dtype=bool)
-                stage2_cols_raw = [c for c in X_m_tr_imp.columns if c not in STAGE2_EXCLUDE_COLS]
+                stage2_cols_raw = [c for c in X_m_tr_imp.columns if _feature_allowed(c, "stage2")]
                 _X2_for_corr = X_m_tr_imp.iloc[np.where(finish_tr_mask)[0]][stage2_cols_raw].reset_index(drop=True)
                 y2_tr = y_sub_tr[np.where(finish_tr_mask)[0]]
                 stage2_cols = _correlation_prune(_X2_for_corr, y=y2_tr, threshold=METHOD_CORR_PRUNE_THRESHOLD)
                 self._stat("Stage2 corr-pruned", f"{len(stage2_cols_raw)} → {len(stage2_cols)} (thr={METHOD_CORR_PRUNE_THRESHOLD})")
-                X2_tr = _X2_for_corr[stage2_cols]
                 p_sub = max(1e-6, float(np.mean(y2_tr))) if len(y2_tr) > 0 else 0.5
                 w2 = np.where(y2_tr == 1, 0.5 / p_sub, 0.5 / max(1e-6, 1.0 - p_sub))
+                # Top-N importance prune: stage 2 trains on ~1/2 the rows of winner
+                # with comparable feature count, so a tighter budget mitigates
+                # overfitting. Uses the same class-weighted HGB-style signal
+                # LightGBM reports via feature_importances_.
+                if lgb is not None and len(stage2_cols) > STAGE2_MAX_FEATURES:
+                    _quick2 = lgb.LGBMClassifier(
+                        n_estimators=150, learning_rate=0.05, max_depth=5,
+                        random_state=RANDOM_SEED + 777, n_jobs=-1, verbose=-1,
+                    )
+                    try:
+                        _quick2.fit(_X2_for_corr[stage2_cols], y2_tr, sample_weight=w2)
+                    except TypeError:
+                        _quick2.fit(_X2_for_corr[stage2_cols], y2_tr)
+                    _imp2 = np.asarray(_quick2.feature_importances_, dtype=float)
+                    _keep2 = sorted(np.argsort(_imp2)[::-1][:STAGE2_MAX_FEATURES])
+                    stage2_cols = [stage2_cols[i] for i in _keep2]
+                    self._stat("Stage2 top-N pruned", f"kept {len(stage2_cols)}/{STAGE2_MAX_FEATURES}")
+                X2_tr = _X2_for_corr[stage2_cols]
 
                 # Stage 2 validation set (finishes only)
                 _finish_va_mask = (y_method_dev.iloc[va_idx]["finish_bin"].values == "Finish")
@@ -4985,7 +5053,7 @@ class UFCSuperModelPipeline:
 
                 best_cfg = None
                 rng = np.random.default_rng(RANDOM_SEED + 2026)
-                for _trial in range(int(max(500, METHOD_TUNING_TRIALS))):
+                for _trial in range(int(METHOD_TUNING_TRIALS)):
                     a1 = float(rng.choice([0.55, 0.70, 0.85]))
                     a2 = float(rng.choice([0.55, 0.70, 0.85]))
                     t_dec = float(rng.choice([0.7, 0.85, 1.0, 1.15, 1.3]))
