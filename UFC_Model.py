@@ -82,9 +82,9 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
 METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_champion_cfg.json")
 ###################################################################################################
 # Bump when winner-stage training logic changes.
-WINNER_CACHE_VERSION = "v6"
+WINNER_CACHE_VERSION = "v7"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v26"
+METHOD_CACHE_VERSION = "v27"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -2710,6 +2710,149 @@ def _precompute_context_finish_priors(df):
     return ctx_arr, ref_arr
 
 
+# ─── Style-class opponent matchup tracker ────────────────────────────────────
+
+# Per-fighter rate dimensions we bucket opponents into (striker / wrestler /
+# submission-hunter). Each fighter's historical win rate against opponents in
+# the top bucket becomes a new feature axis.
+_STYLE_DIMS = (
+    ("sig_str_pm", "striker"),
+    ("td_p15", "wrestler"),
+    ("sub_att_p15", "sub_hunter"),
+)
+
+
+def _compute_style_quartile_thresholds(df, cutoff):
+    """Fit quartile thresholds on per-fighter career averages from the first
+    `cutoff` rows of df. Returns {dim: (q25, q50, q75)}."""
+    agg = defaultdict(lambda: {"time": 0.0, "sig_str": 0.0, "td": 0.0, "sub_att": 0.0, "fights": 0})
+    cutoff = min(max(cutoff, 0), len(df))
+    for idx in range(cutoff):
+        row = df.iloc[idx]
+        ft = float(row.get("total_fight_time_sec", 0) or 0)
+        for prefix, fname in (("r", row.get("r_name")), ("b", row.get("b_name"))):
+            if not isinstance(fname, str) or not fname:
+                continue
+            a = agg[fname]
+            a["time"] += ft
+            a["sig_str"] += float(row.get(f"{prefix}_sig_str", 0) or 0)
+            a["td"] += float(row.get(f"{prefix}_td", 0) or 0)
+            a["sub_att"] += float(row.get(f"{prefix}_sub_att", 0) or 0)
+            a["fights"] += 1
+    arrays = {"sig_str_pm": [], "td_p15": [], "sub_att_p15": []}
+    for _, a in agg.items():
+        if a["fights"] < 3 or a["time"] <= 0:
+            continue
+        tm = max(a["time"] / 60.0, 0.1)
+        arrays["sig_str_pm"].append(a["sig_str"] / tm)
+        arrays["td_p15"].append((a["td"] / tm) * 15.0)
+        arrays["sub_att_p15"].append((a["sub_att"] / tm) * 15.0)
+    thr = {}
+    for dim, vals in arrays.items():
+        if len(vals) < 10:
+            thr[dim] = (0.33, 0.66, 1.0)  # safe fallback
+        else:
+            q = np.quantile(np.array(vals, dtype=float), [0.25, 0.50, 0.75])
+            thr[dim] = tuple(float(x) for x in q)
+    return thr
+
+
+def _sty_default_record():
+    return [0, 0]
+
+
+def _sty_default_cumul():
+    return {"time": 0.0, "sig_str": 0.0, "td": 0.0, "sub_att": 0.0}
+
+
+class _StyleMatchupTracker:
+    """Running per-fighter win rate against opponents bucketed by style dim.
+
+    Pre-fight reads are leak-safe: `matchup_features` only queries counts
+    accumulated from fights strictly before the call; `update_after_fight`
+    writes must happen AFTER the matchup row is built.
+    """
+    def __init__(self, thresholds):
+        self.thresholds = dict(thresholds)
+        self.cumul = defaultdict(_sty_default_cumul)
+        # records: {(fighter, dim, opp_bucket): [wins, losses]}
+        self.records = defaultdict(_sty_default_record)
+
+    def _stat(self, fname, dim):
+        c = self.cumul.get(fname)
+        if not c or c["time"] <= 0:
+            return 0.0
+        tm = c["time"] / 60.0
+        if dim == "sig_str_pm":
+            return c["sig_str"] / tm
+        if dim == "td_p15":
+            return (c["td"] / tm) * 15.0
+        if dim == "sub_att_p15":
+            return (c["sub_att"] / tm) * 15.0
+        return 0.0
+
+    def _bucket(self, value, dim):
+        thr = self.thresholds.get(dim)
+        if thr is None:
+            return 0
+        if value <= thr[0]:
+            return 0
+        if value <= thr[1]:
+            return 1
+        if value <= thr[2]:
+            return 2
+        return 3
+
+    def _wr(self, fname, dim, opp_bucket):
+        rec = self.records.get((fname, dim, opp_bucket))
+        if not rec:
+            return 0.5
+        total = rec[0] + rec[1]
+        return rec[0] / total if total > 0 else 0.5
+
+    def matchup_features(self, a_name, b_name):
+        """Return dict of r_wr_vs_<short>, b_wr_vs_<short>, d_wr_vs_<short>
+        for each style dim, looked up using pre-fight buckets."""
+        feats = {}
+        for dim, short in _STYLE_DIMS:
+            a_b = self._bucket(self._stat(a_name, dim), dim)
+            b_b = self._bucket(self._stat(b_name, dim), dim)
+            a_wr = self._wr(a_name, dim, b_b)
+            b_wr = self._wr(b_name, dim, a_b)
+            feats[f"r_wr_vs_{short}"] = a_wr
+            feats[f"b_wr_vs_{short}"] = b_wr
+            feats[f"d_wr_vs_{short}"] = a_wr - b_wr
+        return feats
+
+    def update_after_fight(self, a_name, b_name, winner, row):
+        # Snapshot buckets BEFORE cumul update (these reflect pre-fight state
+        # that matched what matchup_features already returned for this row).
+        buckets_by_dim = {}
+        for dim, _ in _STYLE_DIMS:
+            buckets_by_dim[dim] = (
+                self._bucket(self._stat(a_name, dim), dim),
+                self._bucket(self._stat(b_name, dim), dim),
+            )
+        ft = float(row.get("total_fight_time_sec", 0) or 0)
+        self.cumul[a_name]["time"] += ft
+        self.cumul[a_name]["sig_str"] += float(row.get("r_sig_str", 0) or 0)
+        self.cumul[a_name]["td"] += float(row.get("r_td", 0) or 0)
+        self.cumul[a_name]["sub_att"] += float(row.get("r_sub_att", 0) or 0)
+        self.cumul[b_name]["time"] += ft
+        self.cumul[b_name]["sig_str"] += float(row.get("b_sig_str", 0) or 0)
+        self.cumul[b_name]["td"] += float(row.get("b_td", 0) or 0)
+        self.cumul[b_name]["sub_att"] += float(row.get("b_sub_att", 0) or 0)
+        if winner == "Red":
+            a_win = True
+        elif winner == "Blue":
+            a_win = False
+        else:
+            return  # skip draws/NC
+        for dim, (a_b, b_b) in buckets_by_dim.items():
+            self.records[(a_name, dim, b_b)][0 if a_win else 1] += 1
+            self.records[(b_name, dim, a_b)][0 if (not a_win) else 1] += 1
+
+
 def build_training_data(csv_path, progress_cb=None):
     """Process fights chronologically, build features, return X, y and state."""
     df = pd.read_csv(csv_path)
@@ -2718,6 +2861,11 @@ def build_training_data(csv_path, progress_cb=None):
     _ensure_fighter_feature_keys(df["event_date"].iloc[0] if len(df) else None)
 
     ctx_finish_prior_arr, ref_finish_prior_arr = _precompute_context_finish_priors(df)
+
+    # Fit style-dim quartile thresholds from per-fighter averages across the
+    # first 80% of fights, then instantiate the tracker.
+    style_thresholds = _compute_style_quartile_thresholds(df, int(len(df) * 0.80))
+    style_tracker = _StyleMatchupTracker(style_thresholds)
 
     fighter_history = defaultdict(list)
     glicko_ratings = {}
@@ -2760,6 +2908,8 @@ def build_training_data(csv_path, progress_cb=None):
             total_rounds=row.get("total_rounds", 3),
             weight_class=row.get("weight_class", ""),
         )
+        # Style-class matchup win-rate features (leak-safe: reads pre-fight).
+        matchup.update(style_tracker.matchup_features(r_name, b_name))
         if row["winner"] in ("Red", "Blue"):
             matchup["ctx_finish_prior_2y"] = float(ctx_finish_prior_arr[idx])
             matchup["ref_finish_prior"] = float(ref_finish_prior_arr[idx])
@@ -2792,13 +2942,16 @@ def build_training_data(csv_path, progress_cb=None):
         glicko_ratings[r_name] = glicko2_update(r_glicko, [(b_glicko[0], b_glicko[1], r_sc)])
         glicko_ratings[b_name] = glicko2_update(b_glicko, [(r_glicko[0], r_glicko[1], b_sc)])
 
+        # Update style-matchup tracker AFTER the row is built.
+        style_tracker.update_after_fight(r_name, b_name, winner, row)
+
     X = pd.DataFrame(rows_X)
     y = pd.Series(rows_y)
 
     if progress_cb:
         progress_cb(f"  Built {len(X)} training samples with {X.shape[1]} features.")
 
-    return X, y, fighter_history, glicko_ratings, opp_glicko_list
+    return X, y, fighter_history, glicko_ratings, opp_glicko_list, style_tracker
 
 
 def _method_labels_from_csv(csv_path):
@@ -2839,6 +2992,9 @@ _SWAP_PAIR_COLUMNS = (
     ("div_elo_r", "div_elo_b"),
     ("r_div_rank", "b_div_rank"),
     ("r_elo_slope_5", "b_elo_slope_5"),
+    ("r_wr_vs_striker", "b_wr_vs_striker"),
+    ("r_wr_vs_wrestler", "b_wr_vs_wrestler"),
+    ("r_wr_vs_sub_hunter", "b_wr_vs_sub_hunter"),
 )
 
 
@@ -4195,6 +4351,7 @@ class UFCSuperModelPipeline:
         self.div_elo_ratings = {}
         self.last_fight_date = {}
         self.elo_history = {}
+        self.style_tracker = None
         self.benchmarks = None
         self.method_model = None
         self.method_imputer = None
@@ -4285,9 +4442,10 @@ class UFCSuperModelPipeline:
     def train(self):
         self._section("Data Build")
         self._log("Building chronological leak-safe training matrix...")
-        X, y, fighter_history, glicko_ratings, opp_glicko_list = build_training_data(
+        X, y, fighter_history, glicko_ratings, opp_glicko_list, style_tracker = build_training_data(
             self.csv_path, progress_cb=self._log
         )
+        self.style_tracker = style_tracker
         y_method_df = _method_labels_from_csv(self.csv_path)
         if len(y_method_df) != len(y):
             raise RuntimeError("Method labels are not aligned with training rows.")
@@ -4417,23 +4575,50 @@ class UFCSuperModelPipeline:
         X_val_full = pd.DataFrame(full_imputer.transform(X_val_raw_full), columns=full_feature_cols)
         X_test_full = pd.DataFrame(full_imputer.transform(X_test_raw_full), columns=full_feature_cols)
 
-        # Lightweight feature pruning to reduce noisy tails.
+        # Stability selection: rather than a single-pass LightGBM top-N, run K
+        # bootstrap subsamples and keep the features that rank in top-N most
+        # consistently. Less sensitive to which fold happened to see which
+        # features — closer to the Old_Model stability-selection approach.
         if lgb is not None and len(feature_cols) > WINNER_MAX_FEATURES:
             X_quick_aug, y_quick_aug = _augment_swap(X_train, y_train)
-            quick = lgb.LGBMClassifier(
-                n_estimators=250, learning_rate=0.05, max_depth=6,
-                random_state=RANDOM_SEED, n_jobs=-1, verbose=-1,
-            )
-            quick.fit(X_quick_aug, y_quick_aug)
-            imp = np.asarray(quick.feature_importances_, dtype=float)
-            order_idx = np.argsort(imp)[::-1]
-            keep_idx = order_idx[:WINNER_MAX_FEATURES]
-            feature_cols = [feature_cols[i] for i in sorted(keep_idx)]
+            _STAB_RUNS = 15
+            _STAB_SUB_FRAC = 0.75
+            _n_feats = X_quick_aug.shape[1]
+            _counts = np.zeros(_n_feats, dtype=float)
+            _mean_imp = np.zeros(_n_feats, dtype=float)
+            _rng = np.random.default_rng(RANDOM_SEED)
+            _n_rows = len(X_quick_aug)
+            _sub_size = max(int(_n_rows * _STAB_SUB_FRAC), 1)
+            for _k in range(_STAB_RUNS):
+                _idx = _rng.choice(_n_rows, size=_sub_size, replace=False)
+                _X_sub = X_quick_aug.iloc[_idx]
+                _y_sub = y_quick_aug.iloc[_idx]
+                _quick = lgb.LGBMClassifier(
+                    n_estimators=200, learning_rate=0.05, max_depth=6,
+                    random_state=int(_rng.integers(1, 10**9)),
+                    n_jobs=-1, verbose=-1,
+                )
+                _quick.fit(_X_sub, _y_sub)
+                _imp = np.asarray(_quick.feature_importances_, dtype=float)
+                _top = np.argsort(_imp)[::-1][:WINNER_MAX_FEATURES]
+                _counts[_top] += 1
+                # Also track mean importance so ties on selection frequency
+                # are broken by average usefulness.
+                _mean_imp += _imp / _STAB_RUNS
+            # Rank by (selection frequency, mean importance) descending.
+            _composite = _counts + _mean_imp / (max(_mean_imp.max(), 1.0) * 1000.0)
+            _keep = sorted(np.argsort(_composite)[::-1][:WINNER_MAX_FEATURES].tolist())
+            feature_cols = [feature_cols[i] for i in _keep]
             X_train = X_train[feature_cols]
             X_val = X_val[feature_cols]
             X_test = X_test[feature_cols]
-            self._section("Feature Pruning")
+            # Report how stable the selection actually was.
+            _kept_counts = _counts[_keep]
+            _sel_freq = float(_kept_counts.mean()) / _STAB_RUNS
+            self._section("Feature Pruning (Stability Selection)")
             self._stat("Kept features", len(feature_cols))
+            self._stat("Bootstrap runs", _STAB_RUNS)
+            self._stat("Mean selection freq of kept", f"{_sel_freq:.1%}")
 
         feature_cols_fp = hashlib.sha256(",".join(feature_cols).encode("utf-8")).hexdigest()[:12]
         winner_key_extra = "|".join([
@@ -6295,6 +6480,8 @@ class UFCSuperModelPipeline:
         matchup["r_elo_slope_5"] = _a_slope
         matchup["b_elo_slope_5"] = _b_slope
         matchup["d_elo_slope_5"] = _a_slope - _b_slope
+        if self.style_tracker is not None:
+            matchup.update(self.style_tracker.matchup_features(a_key, b_key))
         matchup_df = _augment_matchup_features(pd.DataFrame([matchup]))
         p_a = self.model.predict_proba_single(matchup_df.iloc[0].to_dict())
         pick_a = p_a >= 0.5
