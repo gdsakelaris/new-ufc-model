@@ -82,9 +82,9 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
 METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_champion_cfg.json")
 ###################################################################################################
 # Bump when winner-stage training logic changes.
-WINNER_CACHE_VERSION = "v7"
+WINNER_CACHE_VERSION = "v8"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v27"
+METHOD_CACHE_VERSION = "v28"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -4798,7 +4798,7 @@ class UFCSuperModelPipeline:
             val_probs_raw_branch = _clip_probs(val_probs_raw)
             dev_probs_raw_branch = _clip_probs(dev_probs_raw)
             tuned_thr_raw, tuned_acc_raw = _tune_threshold_robust(dev_probs_raw_branch, y_dev_valid, n_blocks=4)
-            decision_threshold_raw = float(np.clip(0.5 + 0.6 * (tuned_thr_raw - 0.5), 0.48, 0.52))
+            decision_threshold_raw = float(tuned_thr_raw)
             val_acc_raw = _model_accuracy_at_threshold(val_probs_raw_branch, y_meta_val, threshold=decision_threshold_raw)
 
             # Calibrated branch (optional, only keep if it helps).
@@ -4815,7 +4815,7 @@ class UFCSuperModelPipeline:
                     calibrator.predict_proba(np.asarray(dev_probs_raw).reshape(-1, 1))[:, 1]
                 )
                 tuned_thr_cal, tuned_acc_cal = _tune_threshold_robust(dev_probs_cal_branch, y_dev_valid, n_blocks=4)
-                decision_threshold_cal = float(np.clip(0.5 + 0.6 * (tuned_thr_cal - 0.5), 0.48, 0.52))
+                decision_threshold_cal = float(tuned_thr_cal)
                 val_acc_cal = _model_accuracy_at_threshold(
                     val_probs_cal_branch, y_meta_val, threshold=decision_threshold_cal
                 )
@@ -5457,166 +5457,76 @@ class UFCSuperModelPipeline:
                     grp_arr_tr[i, 1] = float(gp["KO/TKO"])
                     grp_arr_tr[i, 2] = float(gp["Submission"])
 
-                best_cfg = None
-                rng = np.random.default_rng(RANDOM_SEED + 2026)
-                for _trial in range(int(METHOD_TUNING_TRIALS)):
-                    a1 = float(rng.choice([0.55, 0.70, 0.85]))
-                    a2 = float(rng.choice([0.55, 0.70, 0.85]))
-                    t_dec = float(rng.choice([0.7, 0.85, 1.0, 1.15, 1.3]))
-                    t_fin = float(rng.choice([0.7, 0.85, 1.0, 1.15, 1.3]))
-                    b_fin = float(rng.choice([-0.35, -0.15, 0.0, 0.15, 0.35]))
-                    b_sub = float(rng.choice([-0.30, -0.10, 0.0, 0.10, 0.30]))
-                    fin_thr = float(rng.choice([0.38, 0.42, 0.46, 0.50, 0.54, 0.58]))
-                    sub_thr = float(rng.choice([0.38, 0.42, 0.46, 0.50, 0.54, 0.58]))
-                    a_dir = float(rng.choice([0.90, 0.96, 1.00]))
-                    b_dir = float(rng.choice([0.60, 0.75, 0.90]))
-                    a_ovr = float(rng.choice([0.90, 0.97, 1.00]))
-                    a_simple = float(rng.choice([0.65, 0.80, 0.95]))
-                    w_hist = float(rng.choice([0.00, 0.08, 0.15, 0.22, 0.30]))
-                    w_group = float(rng.choice([0.00, 0.04, 0.08, 0.12]))
-                    w_base = float(rng.choice([0.00, 0.06, 0.12, 0.18]))
-                    w_subsig = float(rng.choice([0.00, 0.06, 0.10, 0.14, 0.18]))
-                    sub_boost_k = float(rng.choice([0.0, 0.4, 0.8, 1.2, 1.6]))
-                    bias_dec = float(rng.choice([-0.20, -0.10, 0.00, 0.10, 0.20]))
-                    bias_ko = float(rng.choice([-0.10, 0.00, 0.10, 0.20, 0.30, 0.40]))
-                    bias_sub = float(rng.choice([-0.25, -0.15, -0.05, 0.05, 0.15, 0.25, 0.35, 0.45]))
-                    if w_hist + w_group + w_base + w_subsig >= 0.78:
-                        continue
-                    w_ml = 1.0 - w_hist - w_group - w_base - w_subsig
+                # ── Method blend tuning ───────────────────────────────────────
+                # `_score_cfg_method` is the single source of truth for cfg quality:
+                # macro_f1 − 0.50·(dec+ko+sub recall shortfalls) computed per
+                # chronological val chunk, aggregated as mean − 0.60·std. This is
+                # a 3-fold walk-forward CV on the val set; the std penalty rules
+                # out configs that only win on one chunk. The Optuna tuner and
+                # the champion/challenger gate both call this function, so they
+                # optimize the same criterion with the same stability guard.
+                _METHOD_SEARCH_SPACE = {
+                    "alpha_stage1": [0.55, 0.70, 0.85],
+                    "alpha_stage2": [0.55, 0.70, 0.85],
+                    "t_dec": [0.7, 0.85, 1.0, 1.15, 1.3],
+                    "t_fin": [0.7, 0.85, 1.0, 1.15, 1.3],
+                    "bias_finish": [-0.35, -0.15, 0.0, 0.15, 0.35],
+                    "bias_sub": [-0.30, -0.10, 0.0, 0.10, 0.30],
+                    "finish_threshold": [0.38, 0.42, 0.46, 0.50, 0.54, 0.58],
+                    "sub_threshold": [0.38, 0.42, 0.46, 0.50, 0.54, 0.58],
+                    "alpha_direct": [0.90, 0.96, 1.00],
+                    "beta_direct": [0.60, 0.75, 0.90],
+                    "alpha_ovr": [0.90, 0.97, 1.00],
+                    "alpha_simple": [0.65, 0.80, 0.95],
+                    "w_hist": [0.00, 0.08, 0.15, 0.22, 0.30],
+                    "w_group": [0.00, 0.04, 0.08, 0.12],
+                    "w_base": [0.00, 0.06, 0.12, 0.18],
+                    "w_subsig": [0.00, 0.06, 0.10, 0.14, 0.18],
+                    "sub_boost_k": [0.0, 0.4, 0.8, 1.2, 1.6],
+                    "method_bias_decision": [-0.20, -0.10, 0.00, 0.10, 0.20],
+                    "method_bias_ko_tko": [-0.10, 0.00, 0.10, 0.20, 0.30, 0.40],
+                    "method_bias_submission": [-0.25, -0.15, -0.05, 0.05, 0.15, 0.25, 0.35, 0.45],
+                }
 
-                    ml_df = _stage_probs(
-                        X_m_va_imp, temp_dec=t_dec, temp_fin=t_fin,
-                        alpha1=a1, alpha2=a2, bias_finish=b_fin, bias_sub=b_sub,
-                        alpha_direct=a_dir, beta_direct=b_dir, alpha_ovr=a_ovr,
-                        finish_thr=fin_thr, sub_thr=sub_thr, alpha_simple=a_simple
+                def _blend_probs_for_cfg(cfg):
+                    _ml = _stage_probs(
+                        X_m_va_imp,
+                        temp_dec=cfg["t_dec"], temp_fin=cfg["t_fin"],
+                        alpha1=cfg["alpha_stage1"], alpha2=cfg["alpha_stage2"],
+                        bias_finish=cfg["bias_finish"], bias_sub=cfg["bias_sub"],
+                        alpha_direct=cfg["alpha_direct"], beta_direct=cfg["beta_direct"],
+                        alpha_ovr=cfg["alpha_ovr"],
+                        finish_thr=cfg["finish_threshold"], sub_thr=cfg["sub_threshold"],
+                        alpha_simple=cfg["alpha_simple"],
                     )
-                    ml_arr = ml_df[["Decision", "KO/TKO", "Submission"]].to_numpy(dtype=float)
-                    base_arr = np.tile(
+                    _ml_arr = _ml[["Decision", "KO/TKO", "Submission"]].to_numpy(dtype=float)
+                    _base = np.tile(
                         np.array([[base_prior["Decision"], base_prior["KO/TKO"], base_prior["Submission"]]], dtype=float),
-                        (len(ml_arr), 1)
+                        (len(_ml_arr), 1),
                     )
-                    probs_arr = w_ml * ml_arr + w_hist * hist_arr + w_group * grp_arr + w_base * base_arr + w_subsig * sub_arr
-                    probs_arr = np.clip(probs_arr, MIN_METHOD_PROB, 1.0)
-                    probs_arr = probs_arr / np.sum(probs_arr, axis=1, keepdims=True)
-                    probs_arr = _apply_method_logit_bias_arr(
-                        probs_arr,
-                        np.array([bias_dec, bias_ko, bias_sub], dtype=float)
+                    _w_ml = 1.0 - cfg["w_hist"] - cfg["w_group"] - cfg["w_base"] - cfg["w_subsig"]
+                    _p = (_w_ml * _ml_arr + cfg["w_hist"] * hist_arr + cfg["w_group"] * grp_arr
+                          + cfg["w_base"] * _base + cfg["w_subsig"] * sub_arr)
+                    _p = np.clip(_p, MIN_METHOD_PROB, 1.0)
+                    _p = _p / np.sum(_p, axis=1, keepdims=True)
+                    _p = _apply_method_logit_bias_arr(
+                        _p,
+                        np.array([cfg["method_bias_decision"], cfg["method_bias_ko_tko"],
+                                  cfg["method_bias_submission"]], dtype=float),
                     )
-                    probs_arr = _apply_submission_signal_boost_arr(probs_arr, sub_arr[:, 2], sub_boost_k)
-                    probs_arr = probs_arr / np.sum(probs_arr, axis=1, keepdims=True)
-                    pred_idx = np.argmax(probs_arr, axis=1)
+                    _p = _apply_submission_signal_boost_arr(_p, sub_arr[:, 2], cfg["sub_boost_k"])
+                    _p = _p / np.sum(_p, axis=1, keepdims=True)
+                    return _p
 
-                    if int(np.sum(winner_correct_va)) == 0:
-                        score = float(np.mean(pred_idx == y_va_idx))
-                        baseline = float(pd.Series(y_va_true).value_counts().max() / len(y_va_true))
-                        _ko_r_min = score
-                        _dec_r_min = score
-                        _sub_r_min = score
-                        macro_f1 = score
-                    else:
-                        y_sub_idx = y_va_idx[winner_correct_va]
-                        pred_sub_idx = pred_idx[winner_correct_va]
-                        score = float(np.mean(pred_sub_idx == y_sub_idx))
-                        baseline = float(pd.Series(y_va_true[winner_correct_va]).value_counts().max() / len(y_sub_idx))
-                        recalls = []
-                        for cls_i in range(len(METHOD_LABELS)):
-                            mask_cls = (y_sub_idx == cls_i)
-                            if int(np.sum(mask_cls)) > 0:
-                                recalls.append(float(np.mean(pred_sub_idx[mask_cls] == cls_i)))
-                        _ko_r_min = float(recalls[1]) if len(recalls) > 1 else 0.0
-                        _sub_r_min = float(recalls[2]) if len(recalls) > 2 else 0.0
-                        _dec_r_min = float(recalls[0]) if len(recalls) > 0 else 0.0
-                        _ko_mask_t = (y_sub_idx == 1)
-                        _sub_mask_t = (y_sub_idx == 2)
-                        _ko_r_t = float(np.mean(pred_sub_idx[_ko_mask_t] == 1)) if int(np.sum(_ko_mask_t)) > 0 else 0.0
-                        _sub_r_t = float(np.mean(pred_sub_idx[_sub_mask_t] == 2)) if int(np.sum(_sub_mask_t)) > 0 else 0.0
-                        _ko_prec_t = float(np.sum((pred_sub_idx == 1) & _ko_mask_t)) / max(1, int(np.sum(pred_sub_idx == 1)))
-                        _sub_prec_t = float(np.sum((pred_sub_idx == 2) & _sub_mask_t)) / max(1, int(np.sum(pred_sub_idx == 2)))
-                        _ko_f1_t = 2.0 * _ko_prec_t * _ko_r_t / max(1e-9, _ko_prec_t + _ko_r_t)
-                        _sub_f1_t = 2.0 * _sub_prec_t * _sub_r_t / max(1e-9, _sub_prec_t + _sub_r_t)
-                        _dec_mask_t = (y_sub_idx == 0)
-                        _dec_r_t = float(np.mean(pred_sub_idx[_dec_mask_t] == 0)) if int(np.sum(_dec_mask_t)) > 0 else 0.0
-                        _dec_prec_t = float(np.sum((pred_sub_idx == 0) & _dec_mask_t)) / max(1, int(np.sum(pred_sub_idx == 0)))
-                        _dec_f1_t = 2.0 * _dec_prec_t * _dec_r_t / max(1e-9, _dec_prec_t + _dec_r_t)
-                        macro_f1 = (_dec_f1_t + _ko_f1_t + _sub_f1_t) / 3.0
-                    _dec_shortfall = max(0.0, 0.55 - _dec_r_min)
-                    _ko_shortfall = max(0.0, 0.50 - _ko_r_min)
-                    _sub_shortfall = max(0.0, 0.40 - _sub_r_min)
-                    objective = macro_f1 - 0.50 * (_dec_shortfall + _ko_shortfall + _sub_shortfall)
-                    key = (objective, macro_f1, score, _ko_r_min, _sub_r_min, -baseline)
-                    if best_cfg is None or key > best_cfg["key"]:
-                        best_cfg = {
-                            "key": key, "t_dec": t_dec, "t_fin": t_fin,
-                            "bias_finish": b_fin, "bias_sub": b_sub,
-                            "finish_threshold": fin_thr, "sub_threshold": sub_thr,
-                            "w_hist": w_hist, "w_group": w_group, "w_base": w_base,
-                            "w_subsig": w_subsig,
-                            "sub_boost_k": sub_boost_k,
-                            "method_bias_decision": bias_dec,
-                            "method_bias_ko_tko": bias_ko,
-                            "method_bias_submission": bias_sub,
-                            "alpha_stage1": a1, "alpha_stage2": a2,
-                            "alpha_direct": a_dir, "beta_direct": b_dir,
-                            "alpha_ovr": a_ovr,
-                            "alpha_simple": a_simple,
-                            "val_metric": score, "val_baseline": baseline,
-                        }
-                if best_cfg is None:
-                    best_cfg = {
-                        "key": (0.0, 0.0, 0.0), "t_dec": 1.0, "t_fin": 1.0,
-                        "bias_finish": 0.0, "bias_sub": 0.0,
-                        "finish_threshold": 0.50, "sub_threshold": 0.50,
-                        "w_hist": 0.15, "w_group": 0.08, "w_base": 0.08, "w_subsig": 0.10,
-                        "sub_boost_k": 0.6,
-                        "method_bias_decision": 0.10,
-                        "method_bias_ko_tko": -0.10,
-                        "method_bias_submission": 0.00,
-                        "alpha_stage1": 0.75, "alpha_stage2": 0.75,
-                        "alpha_direct": 0.85, "beta_direct": 0.70,
-                        "alpha_ovr": 0.85,
-                        "alpha_simple": 0.80,
-                        "val_metric": float("nan"), "val_baseline": float("nan"),
-                    }
+                def _score_cfg_method(cfg):
+                    """Walk-forward score: mean − 0.60·std of the per-chunk objective.
 
-                # ── Champion / challenger ─────────────────────────────────────
-                # Load the previously saved champion config (if any) and evaluate
-                # it on the CURRENT validation set. Only replace it if the new
-                # tuning run found something genuinely better.
-                def _eval_cfg_objective(cfg):
-                    """Re-evaluate a config on the val set under the tuning objective.
-
-                    Computes `macro_f1 − 0.50·(dec+ko+sub recall shortfalls)` per val
-                    chunk and reduces as `mean − 0.60·std`, so the champion gate judges
-                    configs on the same criterion the tuner optimized, with a stability
-                    guard against configs that only win on one chunk.
+                    Used by both the tuner and the champion gate so they optimize
+                    the exact same criterion. Returns -inf on failure so the
+                    tuner naturally skips broken configs.
                     """
                     try:
-                        _ml = _stage_probs(
-                            X_m_va_imp,
-                            temp_dec=cfg["t_dec"], temp_fin=cfg["t_fin"],
-                            alpha1=cfg["alpha_stage1"], alpha2=cfg["alpha_stage2"],
-                            bias_finish=cfg["bias_finish"], bias_sub=cfg["bias_sub"],
-                            alpha_direct=cfg["alpha_direct"], beta_direct=cfg["beta_direct"],
-                            alpha_ovr=cfg["alpha_ovr"],
-                            finish_thr=cfg["finish_threshold"], sub_thr=cfg["sub_threshold"],
-                            alpha_simple=cfg["alpha_simple"],
-                        )
-                        _ml_arr = _ml[["Decision", "KO/TKO", "Submission"]].to_numpy(dtype=float)
-                        _base = np.tile(
-                            np.array([[base_prior["Decision"], base_prior["KO/TKO"], base_prior["Submission"]]], dtype=float),
-                            (len(_ml_arr), 1)
-                        )
-                        _p = (cfg["w_hist"] * hist_arr + cfg["w_group"] * grp_arr +
-                              cfg["w_base"] * _base + cfg["w_subsig"] * sub_arr +
-                              (1.0 - cfg["w_hist"] - cfg["w_group"] - cfg["w_base"] - cfg["w_subsig"]) * _ml_arr)
-                        _p = np.clip(_p, MIN_METHOD_PROB, 1.0)
-                        _p = _p / np.sum(_p, axis=1, keepdims=True)
-                        _p = _apply_method_logit_bias_arr(
-                            _p, np.array([cfg["method_bias_decision"], cfg["method_bias_ko_tko"],
-                                          cfg["method_bias_submission"]], dtype=float)
-                        )
-                        _p = _apply_submission_signal_boost_arr(_p, sub_arr[:, 2], cfg["sub_boost_k"])
-                        _p = _p / np.sum(_p, axis=1, keepdims=True)
+                        _p = _blend_probs_for_cfg(cfg)
                         _pidx = np.argmax(_p, axis=1)
 
                         def _chunk_obj(ch):
@@ -5650,6 +5560,90 @@ class UFCSuperModelPipeline:
                     except Exception:
                         return float("-inf")
 
+                def _display_metrics_for_cfg(cfg):
+                    """Pick-rate accuracy + majority baseline on full val set (logging only)."""
+                    try:
+                        _p = _blend_probs_for_cfg(cfg)
+                        _pidx = np.argmax(_p, axis=1)
+                        if int(np.sum(winner_correct_va)) == 0:
+                            _score = float(np.mean(_pidx == y_va_idx))
+                            _baseline = float(pd.Series(y_va_true).value_counts().max() / len(y_va_true))
+                        else:
+                            _score = float(np.mean(_pidx[winner_correct_va] == y_va_idx[winner_correct_va]))
+                            _baseline = float(
+                                pd.Series(y_va_true[winner_correct_va]).value_counts().max()
+                                / int(np.sum(winner_correct_va))
+                            )
+                        return _score, _baseline
+                    except Exception:
+                        return float("nan"), float("nan")
+
+                _DEFAULT_BEST_CFG = {
+                    "t_dec": 1.0, "t_fin": 1.0,
+                    "bias_finish": 0.0, "bias_sub": 0.0,
+                    "finish_threshold": 0.50, "sub_threshold": 0.50,
+                    "w_hist": 0.15, "w_group": 0.08, "w_base": 0.08, "w_subsig": 0.10,
+                    "sub_boost_k": 0.6,
+                    "method_bias_decision": 0.10,
+                    "method_bias_ko_tko": -0.10,
+                    "method_bias_submission": 0.00,
+                    "alpha_stage1": 0.75, "alpha_stage2": 0.75,
+                    "alpha_direct": 0.85, "beta_direct": 0.70,
+                    "alpha_ovr": 0.85,
+                    "alpha_simple": 0.80,
+                }
+
+                best_cfg = None
+                if optuna is not None and METHOD_TUNING_TRIALS > 0:
+                    self._reset_terminal_progress(
+                        labels=["Method Blend"], default_total=METHOD_TUNING_TRIALS
+                    )
+
+                    def _method_objective(trial):
+                        cfg = {
+                            k: trial.suggest_categorical(k, v)
+                            for k, v in _METHOD_SEARCH_SPACE.items()
+                        }
+                        if cfg["w_hist"] + cfg["w_group"] + cfg["w_base"] + cfg["w_subsig"] >= 0.78:
+                            raise optuna.TrialPruned()
+                        return _score_cfg_method(cfg)
+
+                    def _method_trial_cb(_study, trial):
+                        self._progress(
+                            int(trial.number) + 1, int(METHOD_TUNING_TRIALS), "Method Blend"
+                        )
+
+                    sampler = optuna.samplers.TPESampler(seed=RANDOM_SEED + 2026)
+                    study = optuna.create_study(direction="maximize", sampler=sampler)
+                    study.optimize(
+                        _method_objective,
+                        n_trials=int(METHOD_TUNING_TRIALS),
+                        show_progress_bar=False,
+                        callbacks=[_method_trial_cb],
+                    )
+                    self._finalize_terminal_progress()
+                    if study.best_trial is not None:
+                        best_cfg = dict(study.best_trial.params)
+                else:
+                    # Random-search fallback (Optuna unavailable).
+                    rng = np.random.default_rng(RANDOM_SEED + 2026)
+                    best_score = float("-inf")
+                    for _trial in range(int(METHOD_TUNING_TRIALS)):
+                        cfg = {k: float(rng.choice(v)) for k, v in _METHOD_SEARCH_SPACE.items()}
+                        if cfg["w_hist"] + cfg["w_group"] + cfg["w_base"] + cfg["w_subsig"] >= 0.78:
+                            continue
+                        score = _score_cfg_method(cfg)
+                        if score > best_score:
+                            best_score = score
+                            best_cfg = cfg
+
+                if best_cfg is None:
+                    best_cfg = dict(_DEFAULT_BEST_CFG)
+
+                # ── Champion / challenger ─────────────────────────────────────
+                # Both candidates are scored by the same `_score_cfg_method` the
+                # tuner optimized, so the gate isn't second-guessing the tuner —
+                # it's defending against tuner noise across runs.
                 try:
                     os.makedirs(os.path.dirname(METHOD_CHAMPION_PATH), exist_ok=True)
                     champion_cfg = None
@@ -5657,11 +5651,11 @@ class UFCSuperModelPipeline:
                         with open(METHOD_CHAMPION_PATH, "r") as _f:
                             champion_cfg = json.load(_f)
                     if champion_cfg is not None:
-                        champ_obj = _eval_cfg_objective(champion_cfg)
-                        new_obj = _eval_cfg_objective(best_cfg)
+                        champ_obj = _score_cfg_method(champion_cfg)
+                        new_obj = _score_cfg_method(best_cfg)
                         if champ_obj >= new_obj:
                             self._stat("Method config", f"Champion retained (champ={champ_obj:.5f} >= new={new_obj:.5f})")
-                            best_cfg = champion_cfg
+                            best_cfg = dict(champion_cfg)
                         else:
                             self._stat("Method config", f"Challenger wins (new={new_obj:.5f} > champ={champ_obj:.5f}) — champion updated")
                             with open(METHOD_CHAMPION_PATH, "w") as _f:
@@ -5674,6 +5668,11 @@ class UFCSuperModelPipeline:
                                        for k, v in best_cfg.items()}, _f, indent=2)
                 except Exception as _e:
                     self._stat("Method config", f"Champion load/save failed ({_e}) — using tuned config")
+
+                # Final-cfg display metrics (full val set, not chunked).
+                _val_metric, _val_baseline = _display_metrics_for_cfg(best_cfg)
+                best_cfg["val_metric"] = _val_metric
+                best_cfg["val_baseline"] = _val_baseline
 
                 # Hard reset: keep only stable components that generalized better.
                 if METHOD_HARD_RESET:
@@ -5825,6 +5824,11 @@ class UFCSuperModelPipeline:
                     "sub_boost_k": float(best_cfg.get("sub_boost_k", 0.0)),
                     "stage1_cols": stage1_cols,
                     "stage2_cols": stage2_cols,
+                    # Optuna-tuned HGB params propagated to the all-data retrain
+                    # so the production model uses the SAME base hyperparameters
+                    # the evaluation reported on, not hardcoded fallbacks.
+                    "stage1_params": dict(_stage1_params),
+                    "stage2_params": dict(_stage2_params),
                     "method_bias_decision": float(best_cfg["method_bias_decision"]),
                     "method_bias_ko_tko": float(best_cfg["method_bias_ko_tko"]),
                     "method_bias_submission": float(best_cfg["method_bias_submission"]),
@@ -6173,12 +6177,18 @@ class UFCSuperModelPipeline:
                 w_all_stage1 = w_all_t * np.where(
                     y_all_bin == 1, 0.5 / p_finish_all, 0.5 / max(1e-6, 1.0 - p_finish_all)
                 )
-                stage1_all = HistGradientBoostingClassifier(
-                    loss="log_loss",
-                    max_iter=360, learning_rate=0.045, max_depth=6,
-                    max_leaf_nodes=31, min_samples_leaf=16, l2_regularization=0.8,
-                    random_state=RANDOM_SEED + 808,
-                )
+                # Use the SAME Optuna-tuned HGB params the eval split reported on,
+                # so the production model matches what was actually evaluated.
+                _stage1_params_all = dict(method_bundle.get("stage1_params") or {})
+                _stage1_params_all.setdefault("loss", "log_loss")
+                _stage1_params_all.setdefault("max_iter", 360)
+                _stage1_params_all.setdefault("learning_rate", 0.045)
+                _stage1_params_all.setdefault("max_depth", 6)
+                _stage1_params_all.setdefault("max_leaf_nodes", 31)
+                _stage1_params_all.setdefault("min_samples_leaf", 16)
+                _stage1_params_all.setdefault("l2_regularization", 0.8)
+                _stage1_params_all.setdefault("random_state", RANDOM_SEED + 808)
+                stage1_all = HistGradientBoostingClassifier(**_stage1_params_all)
                 stage1_all.fit(X_all_method_imp, y_all_bin, sample_weight=w_all_stage1)
                 stage1_rf_all = RandomForestClassifier(
                     n_estimators=420, max_depth=10, min_samples_leaf=4,
@@ -6200,12 +6210,16 @@ class UFCSuperModelPipeline:
                 y2_all = (y_method_df.iloc[np.where(fin_mask_all)[0]]["finish_subtype"].values == "Submission").astype(int)
                 p_sub_all = max(1e-6, float(np.mean(y2_all))) if len(y2_all) > 0 else 0.5
                 w2_all = np.where(y2_all == 1, 0.5 / p_sub_all, 0.5 / max(1e-6, 1.0 - p_sub_all))
-                stage2_all = HistGradientBoostingClassifier(
-                    loss="log_loss",
-                    max_iter=320, learning_rate=0.05, max_depth=5,
-                    max_leaf_nodes=31, min_samples_leaf=14, l2_regularization=0.7,
-                    random_state=RANDOM_SEED + 809,
-                )
+                _stage2_params_all = dict(method_bundle.get("stage2_params") or {})
+                _stage2_params_all.setdefault("loss", "log_loss")
+                _stage2_params_all.setdefault("max_iter", 320)
+                _stage2_params_all.setdefault("learning_rate", 0.05)
+                _stage2_params_all.setdefault("max_depth", 5)
+                _stage2_params_all.setdefault("max_leaf_nodes", 31)
+                _stage2_params_all.setdefault("min_samples_leaf", 14)
+                _stage2_params_all.setdefault("l2_regularization", 0.7)
+                _stage2_params_all.setdefault("random_state", RANDOM_SEED + 809)
+                stage2_all = HistGradientBoostingClassifier(**_stage2_params_all)
                 stage2_all.fit(X2_all, y2_all, sample_weight=w2_all)
                 stage2_rf_all = RandomForestClassifier(
                     n_estimators=360, max_depth=9, min_samples_leaf=3,
@@ -6311,6 +6325,8 @@ class UFCSuperModelPipeline:
                     "sub_threshold": float(method_bundle.get("sub_threshold", 0.50)),
                     "alpha_stage1": float(method_bundle.get("alpha_stage1", 0.75)),
                     "alpha_stage2": float(method_bundle.get("alpha_stage2", 0.75)),
+                    "stage1_params": dict(method_bundle.get("stage1_params") or {}),
+                    "stage2_params": dict(method_bundle.get("stage2_params") or {}),
                     "alpha_direct": float(method_bundle.get("alpha_direct", 0.85)),
                     "beta_direct": float(method_bundle.get("beta_direct", 0.70)),
                     "alpha_ovr": float(method_bundle.get("alpha_ovr", 0.85)),
