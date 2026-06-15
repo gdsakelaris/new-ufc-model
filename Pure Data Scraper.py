@@ -6,6 +6,7 @@ import numpy as np
 from bs4 import BeautifulSoup
 from datetime import datetime
 import re
+import hashlib
 import threading
 import warnings
 
@@ -20,7 +21,15 @@ class UFCScraperApp:
         
         self.output_file = tk.StringVar(value="scraped_data.csv")
         self.is_scraping = False
-        
+
+        # Shared session that holds the anti-bot clearance cookie once solved
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                          'AppleWebKit/537.36 (KHTML, like Gecko) '
+                          'Chrome/124.0 Safari/537.36'
+        })
+
         self.create_widgets()
         
     def create_widgets(self):
@@ -238,9 +247,51 @@ Find URLs at: http://ufcstats.com/statistics/events/completed"""
                 return weight
         return weight_class.strip()
         
+    def _fetch(self, url, timeout=20):
+        """GET a page, transparently solving ufcstats.com's JavaScript
+        proof-of-work anti-bot challenge if it is served instead of content.
+
+        The challenge page brute-forces an integer n such that
+        sha256(nonce + ':' + n) starts with a number of leading hex zeros,
+        then POSTs {nonce, n} to /__c to receive a clearance cookie. We
+        replicate that here; the cookie persists on self.session so the
+        challenge is normally only solved once per scrape run.
+        """
+        response = self.session.get(url, timeout=timeout)
+
+        if 'Checking your browser' not in response.text:
+            return response
+
+        html = response.text
+        nonce_match = re.search(r'nonce\s*=\s*"([0-9a-fA-F]+)"', html)
+        target_match = re.search(r'new Array\((\d+)\s*\+\s*1\)\.join\(', html)
+        if not nonce_match or not target_match:
+            # Unknown challenge variant — return what we have so callers
+            # surface a clear parse error rather than silently looping.
+            return response
+
+        nonce = nonce_match.group(1)
+        zeros = '0' * int(target_match.group(1))
+
+        n = 0
+        while not hashlib.sha256(f'{nonce}:{n}'.encode()).hexdigest().startswith(zeros):
+            n += 1
+
+        from urllib.parse import urlsplit
+        parts = urlsplit(url)
+        base = f'{parts.scheme}://{parts.netloc}'
+        self.session.post(
+            base + '/__c',
+            data={'nonce': nonce, 'n': n},
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            timeout=timeout,
+        )
+
+        return self.session.get(url, timeout=timeout)
+
     def get_event_info(self, event_url):
         try:
-            response = requests.get(event_url)
+            response = self._fetch(event_url)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             
@@ -273,7 +324,7 @@ Find URLs at: http://ufcstats.com/statistics/events/completed"""
             
             if event_data:
                 try:
-                    response = requests.get(url)
+                    response = self._fetch(url)
                     soup = BeautifulSoup(response.text, 'html.parser')
                     
                     for row in soup.find_all('tr', class_='b-fight-details__table-row'):
@@ -294,7 +345,7 @@ Find URLs at: http://ufcstats.com/statistics/events/completed"""
         
     def get_fighter_stats(self, fighter_url):
         try:
-            response = requests.get(fighter_url)
+            response = self._fetch(fighter_url)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             
@@ -350,7 +401,7 @@ Find URLs at: http://ufcstats.com/statistics/events/completed"""
             
     def scrape_fight_details(self, fight_url, event_data):
         try:
-            response = requests.get(fight_url)
+            response = self._fetch(fight_url)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             
@@ -612,7 +663,7 @@ Find URLs at: http://ufcstats.com/statistics/events/completed"""
         fighter_urls = []
         for i, url in enumerate(fight_urls):
             try:
-                response = requests.get(url)
+                response = self._fetch(url)
                 soup = BeautifulSoup(response.text, 'html.parser')
                 for link in soup.find_all('a', class_='b-link b-fight-details__person-link'):
                     fighter_urls.append(link.get('href'))

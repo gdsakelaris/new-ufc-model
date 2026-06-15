@@ -23,6 +23,7 @@ import os
 import pickle
 import random
 import re
+import sys
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
@@ -49,6 +50,17 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from scipy.optimize import minimize as scipy_minimize
+
+# Make stdout/stderr robust to non-ASCII (e.g. the '→' used in pruning logs)
+# regardless of console code page or whether output is piped/redirected. Without
+# this, a cp1252 stdout raises UnicodeEncodeError on a cosmetic print, which the
+# method stage's broad try/except mistakes for a fatal error and silently
+# disables the entire method model.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 try:
     import lightgbm as lgb
@@ -82,9 +94,9 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
 METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_champion_cfg.json")
 ###################################################################################################
 # Bump when winner-stage training logic changes.
-WINNER_CACHE_VERSION = "v8"
+WINNER_CACHE_VERSION = "v19"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v28"
+METHOD_CACHE_VERSION = "v38"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -95,25 +107,118 @@ np.random.seed(RANDOM_SEED)
 random.seed(RANDOM_SEED)
 os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
 
-TRAIN_FRACTION = 0.65
-VAL_FRACTION = 0.15
-TEST_FRACTION = 0.20
-MIN_HOLDOUT_FIGHTS = 500
+# Chronological split is by FIXED fight counts (not fractions) so the validation
+# and holdout windows are the SAME most-recent fights for every era candidate.
+# This makes era start years directly comparable (identical val fights) and keeps
+# the holdout stable run-to-run regardless of which start year wins.
+VAL_FIGHTS = 400          # tuning/selection window: the fights just before holdout
+TEST_FIGHTS = 500         # final untouched holdout = the most-recent fights
+MIN_TRAIN_FIGHTS = 1000   # an era candidate must leave at least this many training fights
+# Era selection prefers the EARLIEST start year whose common-window validation
+# log-loss is within this tolerance of the best — more training data generalizes
+# better unless a later start is clearly superior.
+ERA_LOGLOSS_TOL = 0.004
+# Floor on how far back era selection may reach. Pre-2005 UFC predates the
+# Unified Rules and has materially worse data (e.g. reach missing ~60% of the
+# time vs ~3% afterward), so the data-preferring rule above must not pull the
+# training window into that different-sport era. Lower to 1993 to allow all
+# history; raise (e.g. 2014) to restrict to the most recent stat-tracking era.
+EARLIEST_ERA_START = 2005
 ACTIVE_DAYS = 730
 NEEDS_SCALE = {"LogReg", "MLP"}
 ELO_BASE = 1500.0
 ELO_K = 24.0
+# ─── Margin-of-victory (MOV) adjusted ratings ─────────────────────────────────
+# Feed Glicko/Elo a continuous performance score in [0,1] instead of a hard 1/0,
+# so dominant wins move ratings more than split decisions / late grindy finishes.
+# The RESULT is always ground truth (winner's score > 0.5); decisiveness and the
+# box score only modulate WITHIN the winner's band, never flipping the sign.
+# Set env UFC_MOV_ENABLED=0 to build W/L-only ratings (controlled A/B test).
+MOV_RATINGS_ENABLED = os.environ.get("UFC_MOV_ENABLED", "1") != "0"
+# "full"   = finish-timing + box-score dominance index (the real model).
+# "buckets"= split=0.62 / other decision=0.75 / finish timing-scaled — a
+#            low-overfit A/B baseline. Set env UFC_MOV_MODE=buckets to use it.
+MOV_MODE = os.environ.get("UFC_MOV_MODE", "full")
+MOV_W_KD = 1.0      # knockdowns — strongest single damage signal
+MOV_W_STR = 0.7     # significant strikes landed per minute
+MOV_W_CTRL = 0.5    # control-time fraction
+MOV_W_TD = 0.4      # takedowns landed
+MOV_D_BLEND = 0.5   # weight on the box-score index vs finish-timing / judge consensus
+# ─── Corner-aware correction (asymmetric calibration) ─────────────────────────
+# The winner ensemble is corner-SYMMETRIC (swap-augmented + forward/reverse
+# averaged), so its p_red is a pure "red is the more skilled corner" probability.
+# But UFC's red-corner convention (red = promoted/favored fighter) makes red
+# favorites convert WORSE than their skill implies — the model structurally
+# over-predicts Red. This fits a one-parameter logit-space intercept (b) on
+# leak-safe dev OOF probs + true red labels with recency weights, so it learns
+# the recent red-corner conversion rate and shifts the effective red pick
+# threshold up. INFERENCE ASSUMES THE FIRST FIGHTER IS THE RED CORNER.
+# Tested over 3 runs: the fit returns b≈0 (the symmetric model is already
+# calibrated), and on v19 the residual noise COST 0.6 pts (64.6%→64.0%). So it
+# defaults OFF. Set env UFC_CORNER_CORRECTION=1 to re-enable the A/B.
+CORNER_CORRECTION_ENABLED = os.environ.get("UFC_CORNER_CORRECTION", "0") != "0"
+# Cap |b| (logit space) so a noisy fit window can't flip the model wholesale.
+# 0.6 ⇒ the effective red pick threshold stays within ~[0.35, 0.65] of p_red.
+CORNER_SHIFT_CAP = 0.6
+# Recency-weight floor for the corner fit (oldest dev fight weight vs newest=1.0).
+# Lower ⇒ track the recent (declining) red advantage more aggressively.
+CORNER_FIT_FLOOR = 0.25
 OPTUNA_TRIALS = 80
 METHOD_TUNING_TRIALS = 400
-WINNER_MAX_FEATURES = 320
+WINNER_MAX_FEATURES = 240
+# Winner-stage correlation prune: drop near-duplicate columns (|corr| > this),
+# keeping the more target-relevant member of each correlated pair, BEFORE
+# stability selection. The winner matchup matrix is heavily collinear (many
+# glicko/elo/interaction variants), which inflates ensemble variance; pruning
+# narrows the validation→holdout generalization gap.
+WINNER_CORR_PRUNE_THRESHOLD = 0.95
+# When True, the winner ensemble sees ALL engineered features, including the
+# method-routed ones (striking-zone accuracy, KO/sub composites, *_sum channels,
+# finish-round distributions) that FEATURE_ROUTING normally withholds from it.
+# Motivated by the walk-forward single-model diagnostic (full 409-feature HGB)
+# outscoring the routed winner ensemble on recent folds. Method-stage routing
+# (stage1/stage2) is unaffected. Tested: unrouting was a wash on accuracy and
+# slightly worse on calibration (ECE 0.049→0.063), so it defaults OFF. Set env
+# UFC_WINNER_ALL_FEATURES=1 to re-enable the A/B.
+WINNER_SEES_ALL_FEATURES = os.environ.get("UFC_WINNER_ALL_FEATURES", "0") != "0"
+# Robust winner combiner: when True (default), the OOF combiner is chosen ONLY
+# among simplex blends (weighted / simple average). The LR/HGB stacker
+# meta-learners overfit the ~400-fight validation OOF set and generalize worse on
+# the holdout (v15 weighted 63.8% vs v16–v18 stacker 63.4%). Set env
+# UFC_COMBINER_ROBUST=0 to re-allow stacker candidates.
+WINNER_COMBINER_ROBUST = os.environ.get("UFC_COMBINER_ROBUST", "1") != "0"
+# Decision-threshold regularization. The winner ensemble is corner-swap symmetric,
+# so 0.5 is its neutral operating point. The training/dev red-corner WIN rate
+# (~58-60%) runs well above the most-recent holdout (~53% and declining), so a
+# threshold tuned purely for dev accuracy drifts below 0.5 and over-predicts Red on
+# future fights. This caps how far the decision threshold may deviate from 0.5:
+# 0.0 = always 0.5 (most robust to base-rate drift); raise to re-enable adaptive
+# thresholding (e.g. 0.03 allows [0.47, 0.53]).
+WINNER_THR_MAX_DEV = 0.0
+# Opponent-baseline-adjusted (oba_*) winner features. Default on; set env
+# UFC_OBA_ENABLED=0 to build without them (used for controlled A/B testing).
+OBA_FEATURES_ENABLED = os.environ.get("UFC_OBA_ENABLED", "1") != "0"
 STAGE2_MAX_FEATURES = 180
 METHOD_HARD_RESET = False
+# A freshly tuned method-blend cfg must beat the saved champion's walk-forward
+# objective by at least this margin to replace it. Guards against run-to-run
+# tuner/validation noise while still letting genuine improvements through.
+METHOD_CHAMPION_MARGIN = 0.004
 # Correlation threshold for method-stage feature pruning (|corr| > this → dropped).
 METHOD_CORR_PRUNE_THRESHOLD = 0.95
 # Optuna trials for tuning method-stage HGB base models. 0 = skip and use defaults.
 METHOD_OPTUNA_TRIALS = 80
 METHOD_ERA_CANDIDATES = [1993, 2005, 2010, 2014, 2016, 2018, 2020, 2021, 2022, 2023, 2024]
 METHOD_AUTO_ERA = True
+# Method era selection: a quick multiclass model is scored on a COMMON recent
+# window (same fights for every era), conditioned on winner-pick-correct fights.
+# Among eras within METHOD_ERA_F1_TOL of the best macro-F1, the one with the MOST
+# training data is chosen. (Was "most recent", which repeatedly picked a smaller,
+# lower-F1 window — e.g. 2022/2048 rows over 2018/3911 rows — starving the rare
+# Submission class. Finish-type non-stationarity is already handled by the
+# recency weighting applied during method training, so more examples win.)
+METHOD_VAL_FIGHTS = 250
+METHOD_ERA_F1_TOL = 0.02
 ###################################################################################################
 # FEATURE_ROUTING — single source of truth for which models see which engineered features.
 # Each key is a feature name; the value is the set of models that should receive it.
@@ -144,6 +249,15 @@ FEATURE_ROUTING = {
     "gender_flag":                 {"winner"},
     "d_title_x_cardio":            {"winner"},
     "d_total_rounds_x_finish_resistance": {"winner"},
+    # Opponent-baseline-adjusted skill (stat-specific SOS; see compute_fighter_features).
+    # Winner-only: these are overall-quality signals that add noise to the
+    # outcome-conditional method stages.
+    "d_oba_sig_str_off":           {"winner"},
+    "d_oba_sig_str_def":           {"winner"},
+    "d_oba_td_off":                {"winner"},
+    "d_oba_td_def":                {"winner"},
+    "d_oba_ctrl_off":              {"winner"},
+    "d_oba_ctrl_def":              {"winner"},
     # Context-conditional & stability (winner-only)
     "d_rounds_experience":         {"winner"},
     "d_rounds_5_exp":              {"winner"},
@@ -264,13 +378,21 @@ FEATURE_ROUTING = {
 def _feature_allowed(feature_name, model):
     """True if `feature_name` should be fed to `model` ('winner'/'stage1'/'stage2').
 
-    Features absent from FEATURE_ROUTING go to every model by default.
+    Features absent from FEATURE_ROUTING go to every model by default. When
+    WINNER_SEES_ALL_FEATURES is on, the winner model bypasses routing entirely
+    (it sees everything); stage1/stage2 routing is always honored.
     """
+    if model == "winner" and WINNER_SEES_ALL_FEATURES:
+        return True
     tags = FEATURE_ROUTING.get(feature_name)
     return tags is None or model in tags
 ###################################################################################################
 STRICT_FUTURE_MODE = True
-FORCED_START_YEAR = None
+# Pinned to 2010: the walk-forward's improving-fold trend shows more history still
+# helps, the data-starved deep men's divisions benefit most, and pinning stops the
+# noisy auto-flip (2010↔2014) when a few fights are added. Set to None to re-enable
+# auto era selection.
+FORCED_START_YEAR = 2010
 
 MU_0 = 1500.0
 PHI_0 = 200.0
@@ -396,6 +518,11 @@ def _replay_winner_cache_logs(pl, W, winner_cache_key):
     pl._stat("Validation accuracy (picked)", W.get("val_acc_picked_str", ""))
     pl._stat("Validation tuned threshold", W.get("val_tuned_thr_str", ""))
     pl._stat("Decision threshold", W.get("decision_thr_str", ""))
+    _corner_rows = W.get("corner_rows", [])
+    if _corner_rows:
+        pl._section("Corner Correction")
+        for _lbl, _val in _corner_rows:
+            pl._stat(_lbl, _val)
     pl._section("Holdout Evaluation")
     for label, val in W.get("holdout_eval", []):
         pl._stat(label, val)
@@ -2322,6 +2449,58 @@ def compute_fighter_features(history, glicko, opp_glickos, current_date, fallbac
     feats["dapa_td_acc"] = float(np.sum(_dapa_tda * _dapa_opp * _dapa_w) / _dapa_w_sum)
     feats["dapa_sig_str_def"] = float(np.sum(_dapa_sd * _dapa_opp * _dapa_w) / _dapa_w_sum)
 
+    # ── Opponent-baseline-adjusted performance (stat-specific SOS) ──────────
+    # Credit the fighter for beating each opponent's PRE-FIGHT, stat-specific
+    # baseline — unlike dapa_*, which weights by overall opponent Glicko. Covers
+    # the offense AND defense sides of the three biggest signals (striking,
+    # takedowns, control time). For each past fight (recency-weighted, alpha=0.85;
+    # opponents with no baseline, e.g. debutants, are skipped):
+    #   *_off : my output                 −  what that opponent usually ALLOWS
+    #   *_def : what that opponent usually PRODUCES  −  what they did to me
+    _oba_a = 0.85
+    _oba_acc = {k: [0.0, 0.0] for k in (
+        "sig_off", "sig_def", "td_off", "td_def", "ctrl_off", "ctrl_def")}
+
+    def _oba_add(_key, _val, _w):
+        if not _isnan(_val):
+            _oba_acc[_key][0] += _w * _val
+            _oba_acc[_key][1] += _w
+
+    for _i, _h in enumerate(history):
+        _w = _oba_a ** (n - 1 - _i)
+        _ft = _h.get("fight_time") or 0
+        if _ft <= 0:
+            continue
+        _ftm = _ft / 60.0
+        _ft15 = _ft / 900.0
+        # Striking (per minute): offense vs opp's allowed, defense vs opp's output
+        _opp_allow = _h.get("opp_def_sig_str_pm", float("nan"))
+        _opp_output = _h.get("opp_off_sig_str_pm", float("nan"))
+        _oba_add("sig_off", ((_h.get("sig_str") or 0) / _ftm) - _opp_allow, _w)
+        _oba_add("sig_def", _opp_output - ((_h.get("opp_sig_str") or 0) / _ftm), _w)
+        # Takedowns (per 15 min): offense vs opp's TD-defense, defense vs opp's TD-offense
+        _opp_td_allow = _h.get("opp_td_def_p15", float("nan"))
+        _opp_td_output = _h.get("opp_off_td_p15", float("nan"))
+        _oba_add("td_off", ((_h.get("td") or 0) / _ft15) - _opp_td_allow, _w)
+        _oba_add("td_def", _opp_td_output - ((_h.get("opp_td") or 0) / _ft15), _w)
+        # Control time (fraction of fight): offense vs opp's allowed, defense vs opp's output
+        _opp_ctrl_allow = _h.get("opp_def_ctrl_pct", float("nan"))
+        _opp_ctrl_output = _h.get("opp_off_ctrl_pct", float("nan"))
+        _oba_add("ctrl_off", ((_h.get("ctrl_sec") or 0) / _ft) - _opp_ctrl_allow, _w)
+        _oba_add("ctrl_def", _opp_ctrl_output - ((_h.get("opp_ctrl_sec") or 0) / _ft), _w)
+
+    def _oba_val(_key):
+        _num, _den = _oba_acc[_key]
+        return float(_num / _den) if _den > 0 else 0.0
+
+    if OBA_FEATURES_ENABLED:
+        feats["oba_sig_str_off"] = _oba_val("sig_off")
+        feats["oba_sig_str_def"] = _oba_val("sig_def")
+        feats["oba_td_off"] = _oba_val("td_off")
+        feats["oba_td_def"] = _oba_val("td_def")
+        feats["oba_ctrl_off"] = _oba_val("ctrl_off")
+        feats["oba_ctrl_def"] = _oba_val("ctrl_def")
+
     if _FIGHTER_FEAT_KEYS is None:
         _set_fighter_keys(list(feats.keys()))
 
@@ -2853,12 +3032,131 @@ class _StyleMatchupTracker:
             self.records[(b_name, dim, a_b)][0 if (not a_win) else 1] += 1
 
 
+# ─── Margin-of-victory (MOV) performance scoring ──────────────────────────────
+
+def _compute_mov_scales(df):
+    """Global per-stat spread (std) of the box-score differentials used to
+    z-score the MOV dominance index. These are normalization constants (like
+    feature scaling), not predictive features, so a global scale does not create
+    harmful leakage and keeps runs reproducible.
+    """
+    def _num(col):
+        s = df.get(col)
+        if s is None:
+            return np.zeros(len(df), dtype=float)
+        return pd.to_numeric(s, errors="coerce").to_numpy(dtype=float)
+
+    elapsed = _num("total_fight_time_sec")
+    elapsed_safe = np.where(elapsed > 0, elapsed, np.nan)
+    minutes = elapsed_safe / 60.0
+
+    kd_diff = _num("r_kd") - _num("b_kd")
+    sig_pm_diff = (_num("r_sig_str") - _num("b_sig_str")) / minutes
+    ctrl_frac_diff = (_num("r_ctrl_sec") - _num("b_ctrl_sec")) / elapsed_safe
+    td_diff = _num("r_td") - _num("b_td")
+
+    def _std(arr):
+        s = float(np.nanstd(arr))
+        return s if s > 1e-6 else 1.0
+
+    return {
+        "kd": _std(kd_diff),
+        "sig_pm": _std(sig_pm_diff),
+        "ctrl_frac": _std(ctrl_frac_diff),
+        "td": _std(td_diff),
+    }
+
+
+def _mov_performance_score(row, scales):
+    """Continuous margin-of-victory score for a fight, returned as
+    (s_red, s_blue) summing to 1.0, each in [0, 1].
+
+    The RESULT is ground truth: the winner's score is always > 0.5. Decisiveness
+    (finish timing / judge consensus) and a box-score dominance index only
+    modulate WITHIN the winner's band — they never flip the sign. Draws and
+    non Red/Blue outcomes return (0.5, 0.5).
+    """
+    winner = str(row.get("winner", "")).strip()
+    if winner not in ("Red", "Blue"):
+        return 0.5, 0.5
+
+    method = str(row.get("method", ""))
+    is_finish = _normalize_method_label(method) in ("KO/TKO", "Submission")
+
+    try:
+        total_rounds = int(row.get("total_rounds") or 3)
+    except (TypeError, ValueError):
+        total_rounds = 3
+    scheduled = max(float(total_rounds) * 300.0, 1.0)
+    try:
+        elapsed = float(row.get("total_fight_time_sec") or scheduled)
+    except (TypeError, ValueError):
+        elapsed = scheduled
+    if not np.isfinite(elapsed) or elapsed <= 0:
+        elapsed = scheduled
+    t_frac = min(max(elapsed / scheduled, 0.0), 1.0)
+    finish_dom = 1.0 - t_frac  # earlier finish ⇒ more dominant
+
+    # Judge consensus is the MOV proxy for decisions.
+    m_low = method.lower()
+    if "split" in m_low:
+        consensus = 0.1
+    elif "majority" in m_low:
+        consensus = 0.5
+    else:
+        consensus = 1.0  # unanimous or unspecified decision
+
+    if str(MOV_MODE).lower() == "buckets":
+        if is_finish:
+            s_win = 0.75 + 0.24 * finish_dom
+        elif consensus <= 0.2:
+            s_win = 0.62          # split decision ≈ coin flip
+        else:
+            s_win = 0.75          # unanimous / majority
+        s_win = float(np.clip(s_win, 0.55, 0.99))
+        s_red = s_win if winner == "Red" else 1.0 - s_win
+        return s_red, 1.0 - s_red
+
+    # ── Box-score dominance index D (red-positive), squashed to [-1, 1] ──
+    def _f(col):
+        try:
+            v = float(row.get(col))
+        except (TypeError, ValueError):
+            return 0.0
+        return v if np.isfinite(v) else 0.0
+
+    minutes = max(elapsed / 60.0, 0.1)
+    z_kd = (_f("r_kd") - _f("b_kd")) / scales["kd"]
+    z_str = ((_f("r_sig_str") - _f("b_sig_str")) / minutes) / scales["sig_pm"]
+    z_ctrl = ((_f("r_ctrl_sec") - _f("b_ctrl_sec")) / max(elapsed, 1.0)) / scales["ctrl_frac"]
+    z_td = (_f("r_td") - _f("b_td")) / scales["td"]
+    D = float(np.tanh(
+        MOV_W_KD * z_kd + MOV_W_STR * z_str + MOV_W_CTRL * z_ctrl + MOV_W_TD * z_td
+    ))
+    # Orient to the winner's perspective (positive = winner also dominated stats).
+    D_win = D if winner == "Red" else -D
+
+    if is_finish:
+        # A finish is decisive regardless of prior box score, so stats only ADD.
+        blend = (1.0 - MOV_D_BLEND) * finish_dom + MOV_D_BLEND * max(D_win, 0.0)
+        s_win = 0.75 + 0.24 * float(np.clip(blend, 0.0, 1.0))
+    else:
+        d01 = 0.5 * (D_win + 1.0)  # [-1,1] → [0,1]
+        blend = (1.0 - MOV_D_BLEND) * consensus + MOV_D_BLEND * d01
+        s_win = 0.55 + 0.25 * float(np.clip(blend, 0.0, 1.0))
+
+    s_win = float(np.clip(s_win, 0.51, 0.99))  # winner strictly above 0.5
+    s_red = s_win if winner == "Red" else 1.0 - s_win
+    return s_red, 1.0 - s_red
+
+
 def build_training_data(csv_path, progress_cb=None):
     """Process fights chronologically, build features, return X, y and state."""
     df = pd.read_csv(csv_path)
     df["event_date"] = pd.to_datetime(df["event_date"], format="%m/%d/%Y")
     df = df.sort_values("event_date").reset_index(drop=True)
     _ensure_fighter_feature_keys(df["event_date"].iloc[0] if len(df) else None)
+    mov_scales = _compute_mov_scales(df) if MOV_RATINGS_ENABLED else None
 
     ctx_finish_prior_arr, ref_finish_prior_arr = _precompute_context_finish_priors(df)
 
@@ -2916,23 +3214,47 @@ def build_training_data(csv_path, progress_cb=None):
             rows_X.append(matchup)
             rows_y.append(1.0 if row["winner"] == "Red" else 0.0)
 
-        # Determine result
+        # Determine result. The W/L/D label drives categorical features; the
+        # Glicko SCORE (r_sc/b_sc) is MOV-adjusted (continuous in [0,1]) when
+        # enabled, else the hard 1/0. Only the score feeds glicko2_update.
         winner = row["winner"]
         if winner == "Red":
             r_res, b_res = "W", "L"
-            r_sc, b_sc = 1.0, 0.0
         elif winner == "Blue":
             r_res, b_res = "L", "W"
-            r_sc, b_sc = 0.0, 1.0
         else:
             r_res, b_res = "D", "D"
+        if MOV_RATINGS_ENABLED:
+            r_sc, b_sc = _mov_performance_score(row, mov_scales)
+        elif winner == "Red":
+            r_sc, b_sc = 1.0, 0.0
+        elif winner == "Blue":
+            r_sc, b_sc = 0.0, 1.0
+        else:
             r_sc, b_sc = 0.5, 0.5
 
-        # Update histories
+        # Update histories. Also stamp each record with the OPPONENT's pre-fight
+        # baselines (computed above from the opponent's history, so leak-safe) so
+        # the opponent-baseline-adjusted (oba_*) features can later credit a
+        # fighter for beating each opponent's stat-specific norm.
         fighter_history[r_name].append(extract_fight_record(row, "r", "b", r_res, b_glicko[0]))
-        fighter_history[r_name][-1]["self_glicko"] = r_glicko[0]
+        _rr = fighter_history[r_name][-1]
+        _rr["self_glicko"] = r_glicko[0]
+        _rr["opp_off_sig_str_pm"] = b_feats.get("sig_str_pm", float("nan"))
+        _rr["opp_def_sig_str_pm"] = b_feats.get("def_sig_str_pm", float("nan"))
+        _rr["opp_off_td_p15"] = b_feats.get("td_p15", float("nan"))
+        _rr["opp_td_def_p15"] = b_feats.get("def_td_p15", float("nan"))
+        _rr["opp_off_ctrl_pct"] = b_feats.get("ctrl_pct", float("nan"))
+        _rr["opp_def_ctrl_pct"] = b_feats.get("def_ctrl_pct", float("nan"))
         fighter_history[b_name].append(extract_fight_record(row, "b", "r", b_res, r_glicko[0]))
-        fighter_history[b_name][-1]["self_glicko"] = b_glicko[0]
+        _bb = fighter_history[b_name][-1]
+        _bb["self_glicko"] = b_glicko[0]
+        _bb["opp_off_sig_str_pm"] = r_feats.get("sig_str_pm", float("nan"))
+        _bb["opp_def_sig_str_pm"] = r_feats.get("def_sig_str_pm", float("nan"))
+        _bb["opp_off_td_p15"] = r_feats.get("td_p15", float("nan"))
+        _bb["opp_td_def_p15"] = r_feats.get("def_td_p15", float("nan"))
+        _bb["opp_off_ctrl_pct"] = r_feats.get("ctrl_pct", float("nan"))
+        _bb["opp_def_ctrl_pct"] = r_feats.get("def_ctrl_pct", float("nan"))
 
         # Track opponent Glicko
         opp_glicko_list[r_name].append(b_glicko[0])
@@ -2976,10 +3298,14 @@ def _method_labels_from_csv(csv_path):
 
 
 def _time_split_indices(n_rows):
-    test_size = max(1, int(n_rows * TEST_FRACTION))
-    val_size = max(1, int(n_rows * VAL_FRACTION))
-    train_size = max(1, n_rows - val_size - test_size)
-    train_end = train_size
+    # Fixed-count chronological split: holdout = last TEST_FIGHTS fights,
+    # validation = the VAL_FIGHTS fights immediately before it, training = the
+    # rest. Era filtering changes only the LEFT edge of the data, so the val and
+    # test windows are the SAME fights across every candidate start year. Sizes
+    # are clamped so tiny datasets still yield a non-empty train/val/test.
+    test_size = min(max(1, int(TEST_FIGHTS)), max(1, n_rows - 2))
+    val_size = min(max(1, int(VAL_FIGHTS)), max(1, n_rows - test_size - 1))
+    train_end = max(1, n_rows - val_size - test_size)
     val_end = train_end + val_size
     return train_end, val_end
 
@@ -3004,6 +3330,23 @@ def _apply_pair_swap(X_src, X_dst):
             r_vals = X_src[r_col].values.copy()
             X_dst[r_col] = X_src[b_col].values
             X_dst[b_col] = r_vals
+
+
+def _complete_swap_pairs(cols, available):
+    """Keep corner-swap pairs intact after feature pruning.
+
+    Raw r_/b_ pair columns (elo_r/elo_b, ranks, slopes, wr_vs_*) must travel
+    together so swap-augmentation stays symmetric. If pruning kept one member of
+    a pair, re-add its partner (when available). Preserves the order of
+    `available`.
+    """
+    kept = set(cols)
+    avail = set(available)
+    for r_col, b_col in _SWAP_PAIR_COLUMNS:
+        present = [c for c in (r_col, b_col) if c in avail]
+        if any(c in kept for c in present):
+            kept.update(present)
+    return [c for c in available if c in kept]
 
 
 def _augment_swap(X, y):
@@ -3499,6 +3842,48 @@ def _fit_best_calibrator(val_probs, y_val):
     return best_cal, best_name, best_ll
 
 
+def _fit_corner_intercept(p_red, y_red, weights=None):
+    """Fit a logit-space intercept b so P(red wins) ≈ sigmoid(logit(p_red) + b).
+
+    Pure base-rate / decision-boundary shift: the model's skill ordering and
+    confidence (slope = 1) are preserved; only the red/blue center moves. Fit by
+    weighted MLE on leak-safe dev OOF probs + true red labels so it learns the
+    recent red conversion rate rather than the dev-accuracy-optimal threshold
+    (which over-fits the inflated historical red rate). b < 0 raises the red bar.
+    Returns a float in [-CORNER_SHIFT_CAP, CORNER_SHIFT_CAP]; 0.0 if degenerate.
+    """
+    p = _clip_probs(np.asarray(p_red, dtype=float))
+    y = np.asarray(y_red, dtype=float).reshape(-1)
+    if len(p) < 200 or len(np.unique(y.astype(int))) < 2:
+        return 0.0
+    z = np.log(p / (1.0 - p))
+    if weights is None:
+        w = np.ones_like(y)
+    else:
+        w = np.asarray(weights, dtype=float).reshape(-1)
+    w = w / (float(np.sum(w)) + 1e-12)
+
+    def _nll(b):
+        q = _clip_probs(1.0 / (1.0 + np.exp(-(z + float(b[0])))))
+        return -float(np.sum(w * (y * np.log(q) + (1.0 - y) * np.log(1.0 - q))))
+
+    try:
+        res = scipy_minimize(_nll, x0=np.array([0.0]), method="Nelder-Mead")
+        b = float(res.x[0]) if res.success else 0.0
+    except Exception:
+        b = 0.0
+    return float(np.clip(b, -CORNER_SHIFT_CAP, CORNER_SHIFT_CAP))
+
+
+def _apply_corner_correction(p_red, b):
+    """Shift symmetric p_red by the fitted corner intercept b (logit space)."""
+    p = _clip_probs(np.asarray(p_red, dtype=float))
+    if not b:
+        return p
+    z = np.log(p / (1.0 - p))
+    return _clip_probs(1.0 / (1.0 + np.exp(-(z + float(b)))))
+
+
 def _weighted_blend(pred_df, y_true):
     order = list(pred_df.columns)
     mat = np.column_stack([_clip_probs(pred_df[c].values) for c in order])
@@ -3800,6 +4185,7 @@ def _build_elo_features_from_csv(csv_path):
     df = pd.read_csv(csv_path)
     df["event_date"] = pd.to_datetime(df["event_date"], format="%m/%d/%Y", errors="coerce")
     df = df.sort_values("event_date").reset_index(drop=True)
+    mov_scales = _compute_mov_scales(df) if MOV_RATINGS_ENABLED else None
 
     ratings = defaultdict(lambda: ELO_BASE)
     div_ratings = defaultdict(lambda: ELO_BASE)
@@ -3860,8 +4246,11 @@ def _build_elo_features_from_csv(csv_path):
         row_dict.update(rank_feats)
         rows.append(row_dict)
 
-        score_r = 1.0 if winner == "Red" else 0.0
-        score_b = 1.0 - score_r
+        if MOV_RATINGS_ENABLED:
+            score_r, score_b = _mov_performance_score(row, mov_scales)
+        else:
+            score_r = 1.0 if winner == "Red" else 0.0
+            score_b = 1.0 - score_r
         new_r_elo = r_elo + ELO_K * (score_r - p_red)
         new_b_elo = b_elo + ELO_K * (score_b - (1.0 - p_red))
         ratings[r_name] = new_r_elo
@@ -3909,18 +4298,10 @@ def _training_row_meta_from_csv(csv_path):
     return pd.DataFrame(rows)
 
 
-def _choose_combiner(meta_train, y_meta_train, meta_val, y_meta_val):
+def _choose_combiner(meta_train, y_meta_train, meta_val, y_meta_val, allow_stacker=True):
     order = list(meta_train.columns)
     y_tr = np.asarray(y_meta_train).astype(int)
     y_va = np.asarray(y_meta_val).astype(int)
-
-    stacker = LogisticRegression(
-        max_iter=8000, C=0.2, solver="saga", tol=1e-3, n_jobs=-1, random_state=RANDOM_SEED
-    )
-    stacker.fit(meta_train.values, y_tr)
-    p_stack = _clip_probs(stacker.predict_proba(meta_val.values)[:, 1])
-    ll_stack = float(log_loss(y_va, p_stack))
-    thr_stack, acc_stack = _tune_threshold(p_stack, y_va)
 
     weights = _weighted_blend(meta_train, y_tr)
     weighted = {
@@ -3941,30 +4322,41 @@ def _choose_combiner(meta_train, y_meta_train, meta_val, y_meta_val):
     ll_avg = float(log_loss(y_va, p_avg))
     thr_avg, acc_avg = _tune_threshold(p_avg, y_va)
 
+    # Simplex blends only by default — robust to the small val OOF set.
     candidates = [
-        ({
-            "kind": "stacker",
-            "model": stacker,
-            "model_order": order,
-        }, ll_stack, float(acc_stack), float(thr_stack), "stacker_lr"),
         (weighted, ll_weighted, float(acc_weighted), float(thr_weighted), "weighted"),
         (avg, ll_avg, float(acc_avg), float(thr_avg), "average"),
     ]
-    try:
-        hgb_meta = HistGradientBoostingClassifier(
-            max_iter=220, learning_rate=0.045, max_depth=3, max_leaf_nodes=31,
-            min_samples_leaf=10, random_state=RANDOM_SEED + 606
+    # Stacker meta-learners (LR / HGB over OOF predictions) can fit arbitrary,
+    # unconstrained weights and overfit the ~400-fight validation set, generalizing
+    # worse on the holdout. Gated off in robust mode.
+    if allow_stacker:
+        stacker = LogisticRegression(
+            max_iter=8000, C=0.2, solver="saga", tol=1e-3, n_jobs=-1, random_state=RANDOM_SEED
         )
-        hgb_meta.fit(meta_train.values, y_tr)
-        p_hgb = _clip_probs(hgb_meta.predict_proba(meta_val.values)[:, 1])
-        ll_hgb = float(log_loss(y_va, p_hgb))
-        thr_hgb, acc_hgb = _tune_threshold(p_hgb, y_va)
+        stacker.fit(meta_train.values, y_tr)
+        p_stack = _clip_probs(stacker.predict_proba(meta_val.values)[:, 1])
+        ll_stack = float(log_loss(y_va, p_stack))
+        thr_stack, acc_stack = _tune_threshold(p_stack, y_va)
         candidates.append((
-            {"kind": "stacker", "model": hgb_meta, "model_order": order},
-            ll_hgb, float(acc_hgb), float(thr_hgb), "stacker_hgb"
+            {"kind": "stacker", "model": stacker, "model_order": order},
+            ll_stack, float(acc_stack), float(thr_stack), "stacker_lr",
         ))
-    except Exception as _e:
-        print(f"WARNING: HGB meta-stacker combiner candidate failed ({_e}) — skipped")
+        try:
+            hgb_meta = HistGradientBoostingClassifier(
+                max_iter=220, learning_rate=0.045, max_depth=3, max_leaf_nodes=31,
+                min_samples_leaf=10, random_state=RANDOM_SEED + 606
+            )
+            hgb_meta.fit(meta_train.values, y_tr)
+            p_hgb = _clip_probs(hgb_meta.predict_proba(meta_val.values)[:, 1])
+            ll_hgb = float(log_loss(y_va, p_hgb))
+            thr_hgb, acc_hgb = _tune_threshold(p_hgb, y_va)
+            candidates.append((
+                {"kind": "stacker", "model": hgb_meta, "model_order": order},
+                ll_hgb, float(acc_hgb), float(thr_hgb), "stacker_hgb"
+            ))
+        except Exception as _e:
+            print(f"WARNING: HGB meta-stacker combiner candidate failed ({_e}) — skipped")
 
     # Primary: log-loss, secondary: accuracy.
     candidates.sort(key=lambda x: (x[1], -x[2], abs(x[3] - 0.5)))
@@ -4110,7 +4502,7 @@ class BenchmarkScores:
 class SuperEnsembleModel:
     def __init__(
         self, models, imputer, scaler, feat_cols, combiner,
-        calibrator=None, decision_threshold=0.5,
+        calibrator=None, decision_threshold=0.5, corner_correction=0.0,
         method_bundle=None, method_feat_cols=None,
     ):
         self.models = models
@@ -4121,6 +4513,8 @@ class SuperEnsembleModel:
         self.model_order = list(combiner["model_order"])
         self.calibrator = calibrator
         self.decision_threshold = float(decision_threshold)
+        # Logit-space corner intercept; assumes the FIRST fighter is red corner.
+        self.corner_correction = float(corner_correction or 0.0)
         self.method_bundle = method_bundle or {}
         self.method_feat_cols = list(method_feat_cols or [])
 
@@ -4154,6 +4548,10 @@ class SuperEnsembleModel:
         p = float(_combine_probs(meta, self.combiner)[0])
         if self.calibrator is not None:
             p = float(self.calibrator.predict_proba(np.array([[p]]))[:, 1][0])
+        # Corner-aware shift (first fighter = red corner). Symmetric model → no-op
+        # when corner_correction == 0.0.
+        if self.corner_correction:
+            p = float(_apply_corner_correction(np.array([p]), self.corner_correction)[0])
         return float(np.clip(p, 1e-6, 1 - 1e-6))
 
     def predict_method_probs(
@@ -4163,10 +4561,14 @@ class SuperEnsembleModel:
         if not self.method_bundle or not self.method_feat_cols:
             return {"Decision": 1.0 / 3.0, "KO/TKO": 1.0 / 3.0, "Submission": 1.0 / 3.0}
         X = pd.DataFrame([feat_dict]).reindex(columns=self.method_feat_cols)
-        if not winner_is_a:
-            for col in X.columns:
-                if col.startswith("d_"):
-                    X[col] = -pd.to_numeric(X[col], errors="coerce").fillna(0.0)
+        # Orient features so the picked winner occupies the "positive" corner.
+        # Reuse _oriented_method_matrix (same transform used at training time)
+        # so inference negates d_* AND swaps r_/b_ pair columns — without this,
+        # raw r/b features (elo_r/elo_b, r_wr_vs_*/b_wr_vs_*, etc.) would be in
+        # the wrong corner whenever B is the picked winner. winner_is_a=True is
+        # a no-op pass; winner_is_a=False triggers the same flip+swap training
+        # applied when blue won.
+        X = _oriented_method_matrix(X, [int(bool(winner_is_a))])
         X = _augment_method_features(X)
         X_imp = pd.DataFrame(
             self.method_bundle["imputer"].transform(X),
@@ -4471,66 +4873,148 @@ class UFCSuperModelPipeline:
         self.opp_glicko_list = opp_glicko_list
         self._build_fighter_meta()
 
-        # Strict future mode: choose best training era using validation only.
+        # Strict future mode: choose the best training-era START YEAR by training
+        # a fast but REAL model per candidate and scoring it on a COMMON validation
+        # window — the same most-recent fights for every era (see _time_split_indices,
+        # which uses fixed-count val/test windows). The old selector compared a
+        # Glicko/Elo proxy on each era's own shifted, in-sample-tuned slice, which
+        # is not comparable across eras and ignores the value of more training data;
+        # this version compares like-for-like and breaks ties toward MORE data.
         row_dates = _training_row_dates_from_csv(self.csv_path)
         if len(row_dates) == len(X):
+            era_candidates = [yr for yr in
+                              [1993, 2000, 2005, 2010, 2014, 2016, 2018, 2020, 2021, 2022, 2023, 2024]
+                              if yr >= EARLIEST_ERA_START]
+            _era_min_rows = int(MIN_TRAIN_FIGHTS + VAL_FIGHTS + TEST_FIGHTS)
+
+            era_done = False
             if FORCED_START_YEAR is not None:
                 mask = row_dates >= pd.Timestamp(f"{int(FORCED_START_YEAR)}-01-01")
-                if int(mask.sum()) >= 1200:
+                if int(mask.sum()) >= _era_min_rows:
                     X = X.loc[mask].reset_index(drop=True)
                     y = y.loc[mask].reset_index(drop=True)
                     y_method_df = y_method_df.loc[mask].reset_index(drop=True)
                     row_meta = row_meta.loc[mask].reset_index(drop=True)
+                    # Keep row_dates aligned with the filtered rows — the method
+                    # stage indexes row_dates by the filtered split, so a stale
+                    # full-length row_dates would mis-pair dates with fights.
+                    row_dates = row_dates.loc[mask].reset_index(drop=True)
                     self._section("Era Selection")
                     self._stat("Selected start year", int(FORCED_START_YEAR))
                     self._stat("Rows kept", len(X))
                     self._stat("Selection mode", "forced")
+                    era_done = True
                 else:
                     self._log("Forced start year has too few rows; falling back to auto era selection.")
-            era_candidates = [1993, 2000, 2005, 2010, 2014, 2016, 2018, 2020, 2021, 2022, 2023, 2024]
-            best_year = 1993
-            best_acc = -1.0
-            best_rows = len(X)
-            if FORCED_START_YEAR is None:
-                for yr in era_candidates:
-                    mask = row_dates >= pd.Timestamp(f"{yr}-01-01")
-                    Xc = X.loc[mask].reset_index(drop=True)
-                    yc = y.loc[mask].reset_index(drop=True)
-                    min_rows_for_holdout = int(np.ceil(MIN_HOLDOUT_FIGHTS / max(TEST_FRACTION, 1e-9)))
-                    if len(Xc) < max(1200, min_rows_for_holdout):
-                        continue
-                    tr_end, va_end = _time_split_indices(len(Xc))
-                    yv = yc.iloc[tr_end:va_end].astype(int).reset_index(drop=True)
-                    if len(yv) < 300 or len(np.unique(yv.values)) < 2:
-                        continue
-                    # Fast proxy model for era-selection (validation only).
-                    base_score = None
-                    if "d_glicko_win_prob" in Xc.columns:
-                        pv = _clip_probs((Xc.iloc[tr_end:va_end]["d_glicko_win_prob"].fillna(0.0).values + 0.5))
-                        _, acc = _tune_threshold(pv, yv)
-                        base_score = acc
-                    if "d_elo_win_prob" in Xc.columns:
-                        pv2 = _clip_probs((Xc.iloc[tr_end:va_end]["d_elo_win_prob"].fillna(0.0).values + 0.5))
-                        _, acc2 = _tune_threshold(pv2, yv)
-                        base_score = max(base_score if base_score is not None else -1.0, acc2)
-                    if base_score is None:
-                        continue
-                    if base_score > best_acc + 1e-12 or (
-                        abs(base_score - best_acc) <= 1e-12 and len(Xc) > best_rows
-                    ):
-                        best_year = yr
-                        best_acc = float(base_score)
-                        best_rows = len(Xc)
+
+            if not era_done:
+                # Winner-routed numeric columns drive the era proxy (the real model
+                # never sees method-only features for the winner stage either).
+                era_win_cols = [
+                    c for c in X.columns
+                    if _feature_allowed(c, "winner") and pd.api.types.is_numeric_dtype(X[c])
+                ]
+
+                # Era selection runs on EVERY invocation (it sets train_end/val_end,
+                # which feed the winner cache key), so cache the decision on the data
+                # fingerprint + feature/era config to avoid retraining 12 proxies on
+                # cached runs. It auto-invalidates when the CSV or feature set changes.
+                _era_sig = hashlib.sha256(
+                    ("|".join(sorted(era_win_cols))
+                     + f"|{VAL_FIGHTS}|{TEST_FIGHTS}|{MIN_TRAIN_FIGHTS}|{ERA_LOGLOSS_TOL}"
+                     + f"|{','.join(str(c) for c in era_candidates)}|{RANDOM_SEED}").encode("utf-8")
+                ).hexdigest()[:16]
+                _era_key = _cache_key(
+                    "era_select", _cache_data_fingerprint(self.csv_path), "v1", _era_sig
+                )
+                _era_payload = _cache_load("era_select", _era_key)
+
+                if isinstance(_era_payload, dict) and "best_year" in _era_payload:
+                    best_year = int(_era_payload["best_year"])
+                    era_results = [tuple(r) for r in _era_payload.get("era_results", [])]
+                else:
+                    def _era_val_logloss(Xc, yc):
+                        """Train a fast model on this era's training rows and return its
+                        log-loss on the COMMON (era-independent) validation window."""
+                        tr_end, va_end = _time_split_indices(len(Xc))
+                        if tr_end < MIN_TRAIN_FIGHTS or (va_end - tr_end) < 100:
+                            return None
+                        yv = yc.iloc[tr_end:va_end].astype(int).reset_index(drop=True)
+                        if len(np.unique(yv.values)) < 2:
+                            return None
+                        Xtr = Xc[era_win_cols].iloc[:tr_end].reset_index(drop=True)
+                        ytr = yc.iloc[:tr_end].astype(int).reset_index(drop=True)
+                        Xva = Xc[era_win_cols].iloc[tr_end:va_end].reset_index(drop=True)
+                        _imp = SimpleImputer(strategy="median")
+                        Xtr_i = pd.DataFrame(_imp.fit_transform(Xtr), columns=era_win_cols)
+                        Xva_i = pd.DataFrame(_imp.transform(Xva), columns=era_win_cols)
+                        Xtr_aug, ytr_aug = _augment_swap(Xtr_i, ytr)
+                        try:
+                            if lgb is not None:
+                                _m = lgb.LGBMClassifier(
+                                    n_estimators=250, learning_rate=0.03, num_leaves=31,
+                                    subsample=0.8, colsample_bytree=0.8, min_child_samples=30,
+                                    reg_lambda=1.0, random_state=RANDOM_SEED, n_jobs=-1,
+                                    verbose=-1,
+                                )
+                            else:
+                                _m = HistGradientBoostingClassifier(
+                                    max_iter=300, learning_rate=0.04, max_depth=6,
+                                    max_leaf_nodes=31, min_samples_leaf=25,
+                                    l2_regularization=1.0, random_state=RANDOM_SEED,
+                                )
+                            _m.fit(Xtr_aug, ytr_aug)
+                            # Corner-swap-averaged prediction, matching the real model.
+                            p_fwd = _m.predict_proba(Xva_i)[:, 1]
+                            p_rev = _m.predict_proba(_swap_features(Xva_i))[:, 1]
+                            pv = _clip_probs((p_fwd + (1.0 - p_rev)) / 2.0)
+                            return float(log_loss(yv, pv))
+                        except Exception:
+                            return None
+
+                    era_results = []  # (year, val_logloss, train_rows)
+                    for yr in era_candidates:
+                        mask = row_dates >= pd.Timestamp(f"{yr}-01-01")
+                        Xc = X.loc[mask].reset_index(drop=True)
+                        yc = y.loc[mask].reset_index(drop=True)
+                        if len(Xc) < _era_min_rows:
+                            continue
+                        ll = _era_val_logloss(Xc, yc)
+                        if ll is None:
+                            continue
+                        tr_end, _ = _time_split_indices(len(Xc))
+                        era_results.append((int(yr), float(ll), int(tr_end)))
+
+                    best_year = 1993
+                    if era_results:
+                        best_ll = min(r[1] for r in era_results)
+                        # Earliest start year (most training data) whose log-loss is
+                        # statistically indistinguishable from the best.
+                        within = [r for r in era_results if r[1] <= best_ll + ERA_LOGLOSS_TOL]
+                        best_year = min(r[0] for r in within)
+                    _cache_save(
+                        "era_select", _era_key,
+                        {"best_year": int(best_year), "era_results": era_results},
+                    )
+
+                self._section("Era Selection")
+                for (yr, ll, rows) in era_results:
+                    self._stat(
+                        f"  start {yr}",
+                        f"val log-loss {ll:.4f} | {rows} train rows"
+                        + ("   <= selected" if yr == best_year else ""),
+                    )
                 if best_year > 1993:
                     mask = row_dates >= pd.Timestamp(f"{best_year}-01-01")
                     X = X.loc[mask].reset_index(drop=True)
                     y = y.loc[mask].reset_index(drop=True)
                     y_method_df = y_method_df.loc[mask].reset_index(drop=True)
                     row_meta = row_meta.loc[mask].reset_index(drop=True)
-                    self._section("Era Selection")
-                    self._stat("Selected start year", best_year)
-                    self._stat("Rows kept", len(X))
-                    self._stat("Validation proxy acc", f"{best_acc:.1%}")
+                    # Keep row_dates aligned with the filtered rows (see note above).
+                    row_dates = row_dates.loc[mask].reset_index(drop=True)
+                self._stat("Selected start year", best_year)
+                self._stat("Rows kept", len(X))
+                self._stat("Selection mode", "auto (common-window log-loss, data-preferring)")
 
         n = len(X)
         if n < 200:
@@ -4575,6 +5059,26 @@ class UFCSuperModelPipeline:
         X_val_full = pd.DataFrame(full_imputer.transform(X_val_raw_full), columns=full_feature_cols)
         X_test_full = pd.DataFrame(full_imputer.transform(X_test_raw_full), columns=full_feature_cols)
 
+        # ── Winner correlation prune (leak-safe: TRAIN only) ──────────────────
+        # Drop near-duplicate columns BEFORE stability selection, keeping the more
+        # target-relevant member of each correlated pair. The matchup matrix is
+        # heavily collinear (glicko/elo/interaction variants), which inflates
+        # ensemble variance and widens the val→holdout gap.
+        if len(feature_cols) > 1:
+            _pre_corr_n = len(feature_cols)
+            feature_cols = _correlation_prune(
+                X_train, y=y_train, threshold=WINNER_CORR_PRUNE_THRESHOLD
+            )
+            feature_cols = _complete_swap_pairs(feature_cols, list(X_train.columns))
+            X_train = X_train[feature_cols]
+            X_val = X_val[feature_cols]
+            X_test = X_test[feature_cols]
+            self._section("Feature Pruning (Winner Correlation)")
+            self._stat(
+                "Corr-pruned",
+                f"{_pre_corr_n} → {len(feature_cols)} (thr={WINNER_CORR_PRUNE_THRESHOLD})",
+            )
+
         # Stability selection: rather than a single-pass LightGBM top-N, run K
         # bootstrap subsamples and keep the features that rank in top-N most
         # consistently. Less sensitive to which fold happened to see which
@@ -4609,6 +5113,7 @@ class UFCSuperModelPipeline:
             _composite = _counts + _mean_imp / (max(_mean_imp.max(), 1.0) * 1000.0)
             _keep = sorted(np.argsort(_composite)[::-1][:WINNER_MAX_FEATURES].tolist())
             feature_cols = [feature_cols[i] for i in _keep]
+            feature_cols = _complete_swap_pairs(feature_cols, list(X_train.columns))
             X_train = X_train[feature_cols]
             X_val = X_val[feature_cols]
             X_test = X_test[feature_cols]
@@ -4625,10 +5130,20 @@ class UFCSuperModelPipeline:
             str(STRICT_FUTURE_MODE),
             str(FORCED_START_YEAR),
             str(OPTUNA_TRIALS),
-            str(MIN_HOLDOUT_FIGHTS),
-            str(TRAIN_FRACTION),
-            str(VAL_FRACTION),
-            str(TEST_FRACTION),
+            str(VAL_FIGHTS),
+            str(TEST_FIGHTS),
+            str(MIN_TRAIN_FIGHTS),
+            str(ERA_LOGLOSS_TOL),
+            str(OBA_FEATURES_ENABLED),
+            str(MOV_RATINGS_ENABLED),
+            str(MOV_MODE),
+            str(WINNER_CORR_PRUNE_THRESHOLD),
+            str(WINNER_MAX_FEATURES),
+            str(WINNER_SEES_ALL_FEATURES),
+            str(WINNER_COMBINER_ROBUST),
+            str(CORNER_CORRECTION_ENABLED),
+            str(CORNER_SHIFT_CAP),
+            str(CORNER_FIT_FLOOR),
             str(RANDOM_SEED),
             str(n),
             str(train_end),
@@ -4682,10 +5197,13 @@ class UFCSuperModelPipeline:
                 cb_tuned_params=cb_tuned,
             )
             if STRICT_FUTURE_MODE:
+                # Reseed twins (_S2) add correlation, not diversity; dropped to
+                # cut ensemble variance. Tuned/Wide/Deep variants are kept — they
+                # are genuinely different models.
                 strict_keep = {
-                    "LightGBM", "LightGBM_S2", "LightGBM_Tuned",
-                    "XGBoost", "XGBoost_S2", "XGBoost_Tuned",
-                    "CatBoost", "CatBoost_S2", "CatBoost_Tuned",
+                    "LightGBM", "LightGBM_Tuned",
+                    "XGBoost", "XGBoost_Tuned",
+                    "CatBoost", "CatBoost_Tuned",
                     "HistGBM", "HistGBM_Wide",
                     "ExtraTrees", "ExtraTrees_Deep",
                     "RandForest", "RandForest_Deep",
@@ -4735,7 +5253,10 @@ class UFCSuperModelPipeline:
             y_meta_val = y_dev.loc[meta_val_mask].astype(int)
 
             self._section("Combiner Selection")
-            combiner, val_ll, val_acc, val_thr = _choose_combiner(X_meta_train, y_meta_train, X_meta_val, y_meta_val)
+            combiner, val_ll, val_acc, val_thr = _choose_combiner(
+                X_meta_train, y_meta_train, X_meta_val, y_meta_val,
+                allow_stacker=not WINNER_COMBINER_ROBUST,
+            )
             self._stat("Selected combiner", combiner["kind"])
             self._stat("Validation log-loss", f"{val_ll:.4f}")
             self._stat("Validation accuracy", f"{val_acc:.1%}")
@@ -4779,6 +5300,12 @@ class UFCSuperModelPipeline:
             # Validation probs for calibration.
             val_probs_raw = _combine_probs(X_meta_val, combiner)
             calibrator, cal_name, cal_ll = _fit_best_calibrator(val_probs_raw, y_meta_val)
+            # Preserve the fitted calibrator for transparent reporting even when
+            # the threshold tuner ends up preferring the raw branch (and we null
+            # `calibrator` out below for pick-time use).
+            calibrator_fitted = calibrator
+            cal_name_fitted = cal_name
+            cal_ll_val_fitted = float(cal_ll)
             self._section("Calibration")
             self._stat("Selected method", cal_name)
             self._stat("Validation log-loss", f"{cal_ll:.4f}")
@@ -4831,6 +5358,22 @@ class UFCSuperModelPipeline:
                     calibrator = None
                     cal_name = "none"
 
+            # ── Decision-threshold regularization (corner-symmetric model) ──
+            # Anchor the threshold at 0.5 (the neutral point for a corner-swap
+            # symmetric model), allowing at most WINNER_THR_MAX_DEV of adaptive
+            # deviation. Without this, the dev-tuned threshold drifts below 0.5 to
+            # exploit a red-corner win rate that no longer holds on recent fights,
+            # over-predicting Red and losing holdout accuracy.
+            _thr_pre_reg = decision_threshold
+            decision_threshold = float(
+                0.5 + np.clip(decision_threshold - 0.5, -WINNER_THR_MAX_DEV, WINNER_THR_MAX_DEV)
+            )
+            if abs(decision_threshold - _thr_pre_reg) > 1e-9:
+                _vp_reg = val_probs_cal_branch if use_calibrated_branch else val_probs_raw_branch
+                val_acc_for_log = _model_accuracy_at_threshold(
+                    _vp_reg, y_meta_val, threshold=decision_threshold
+                )
+
             self._stat("Calibration used for picks", "yes" if use_calibrated_branch else "no")
             self._stat("Validation accuracy (picked)", f"{val_acc_for_log:.1%}")
             self._stat("Validation tuned threshold", f"{tuned_thr:.3f} (acc={tuned_acc:.1%})")
@@ -4843,15 +5386,73 @@ class UFCSuperModelPipeline:
                     calibrator.predict_proba(np.asarray(test_probs_raw).reshape(-1, 1))[:, 1]
                 )
 
+            # ── Corner-aware correction (asymmetric calibration) ──────────────
+            # Fit a logit intercept on leak-safe dev OOF pick-probs + true red
+            # labels with recency weights, then shift the holdout (and, later,
+            # production + inference) probabilities. Corrects the symmetric
+            # model's structural Red over-prediction.
+            corner_b = 0.0
+            corner_rows = []
+            test_probs_precorner = _clip_probs(test_probs_cal)
+            if CORNER_CORRECTION_ENABLED:
+                if calibrator is None:
+                    dev_probs_for_corner = _clip_probs(dev_probs_raw)
+                else:
+                    dev_probs_for_corner = _clip_probs(
+                        calibrator.predict_proba(np.asarray(dev_probs_raw).reshape(-1, 1))[:, 1]
+                    )
+                _corner_w = _time_weights(len(dev_probs_for_corner), floor=CORNER_FIT_FLOOR)
+                corner_b = _fit_corner_intercept(
+                    dev_probs_for_corner, y_dev_valid, weights=_corner_w
+                )
+                test_probs_cal = _apply_corner_correction(test_probs_cal, corner_b)
+                _pre_red = int(np.sum(test_probs_precorner >= decision_threshold))
+                _post_red = int(np.sum(test_probs_cal >= decision_threshold))
+                _pre_acc = accuracy_score(
+                    y_test, (test_probs_precorner >= decision_threshold).astype(int)
+                )
+                _post_acc = accuracy_score(
+                    y_test, (test_probs_cal >= decision_threshold).astype(int)
+                )
+                _eff_thr = 1.0 / (1.0 + np.exp(corner_b))  # p_red bar at the 0.5 cut
+                corner_rows = [
+                    ("Enabled", "yes"),
+                    ("Fitted intercept b", f"{corner_b:+.4f} (cap ±{CORNER_SHIFT_CAP})"),
+                    ("Effective red pick threshold", f"{_eff_thr:.3f}"),
+                    ("Holdout Red picks", f"{_pre_red} → {_post_red} (of {len(y_test)})"),
+                    ("Holdout acc (pre → post)", f"{_pre_acc:.2%} → {_post_acc:.2%}"),
+                ]
+                self._section("Corner Correction")
+                for _lbl, _val in corner_rows:
+                    self._stat(_lbl, _val)
+
             raw_ll = log_loss(y_test, test_probs_raw)
             cal_ll_test = log_loss(y_test, test_probs_cal)
             brier = brier_score_loss(y_test, test_probs_cal)
             acc = accuracy_score(y_test, (test_probs_cal >= decision_threshold).astype(int))
             ece = _expected_calibration_error(y_test, test_probs_cal)
             cal_curve_rmse = _calibration_curve_rmse(y_test, test_probs_cal, n_bins=10)
+
+            # Always compute the FITTED calibrator's holdout LL so users can see
+            # what calibration would have produced even when the threshold tuner
+            # rejects it for picks. Without this, the "Calibrated log-loss" line
+            # is just a copy of "Raw log-loss" and looks like calibration was
+            # ineffective when really it was disabled at pick time.
+            if calibrator_fitted is not None and calibrator_fitted is not calibrator:
+                test_probs_cal_fitted = _clip_probs(
+                    calibrator_fitted.predict_proba(
+                        np.asarray(test_probs_raw).reshape(-1, 1)
+                    )[:, 1]
+                )
+                cal_ll_fitted_test = float(log_loss(y_test, test_probs_cal_fitted))
+                cal_label = f"Calibrated log-loss ({cal_name_fitted}, fitted but unused for picks)"
+            else:
+                cal_ll_fitted_test = float(cal_ll_test)
+                cal_label = "Calibrated log-loss"
+
             self._section("Holdout Evaluation")
             self._stat("Raw log-loss", f"{raw_ll:.4f}")
-            self._stat("Calibrated log-loss", f"{cal_ll_test:.4f}")
+            self._stat(cal_label, f"{cal_ll_fitted_test:.4f}")
             self._stat("Brier score", f"{brier:.4f}")
             self._stat("Accuracy", f"{acc:.2%}")
             self._stat("ECE", f"{ece:.4f}")
@@ -4932,6 +5533,8 @@ class UFCSuperModelPipeline:
                 "calibrator": calibrator,
                 "cal_name": cal_name,
                 "decision_threshold": float(decision_threshold),
+                "corner_b": float(corner_b),
+                "corner_rows": [(str(a), str(b)) for a, b in corner_rows],
                 "tuned_thr": float(tuned_thr),
                 "tuned_acc": float(tuned_acc),
                 "val_acc_for_log": float(val_acc_for_log),
@@ -4964,7 +5567,7 @@ class UFCSuperModelPipeline:
                 "decision_thr_str": f"{float(decision_threshold):.3f}",
                 "holdout_eval": [
                     ("Raw log-loss", f"{float(raw_ll):.4f}"),
-                    ("Calibrated log-loss", f"{float(cal_ll_test):.4f}"),
+                    (cal_label, f"{float(cal_ll_fitted_test):.4f}"),
                     ("Brier score", f"{float(brier):.4f}"),
                     ("Accuracy", f"{float(acc):.2%}"),
                     ("ECE", f"{float(ece):.4f}"),
@@ -4990,6 +5593,7 @@ class UFCSuperModelPipeline:
         calibrator = winner_payload["calibrator"]
         cal_name = winner_payload.get("cal_name", "none")
         decision_threshold = float(winner_payload["decision_threshold"])
+        corner_b = float(winner_payload.get("corner_b", 0.0))
         tuned_thr = float(winner_payload["tuned_thr"])
         tuned_acc = float(winner_payload["tuned_acc"])
         val_acc_for_log = float(winner_payload["val_acc_for_log"])
@@ -5014,9 +5618,9 @@ class UFCSuperModelPipeline:
         )
         if STRICT_FUTURE_MODE:
             strict_keep = {
-                "LightGBM", "LightGBM_S2", "LightGBM_Tuned",
-                "XGBoost", "XGBoost_S2", "XGBoost_Tuned",
-                "CatBoost", "CatBoost_S2", "CatBoost_Tuned",
+                "LightGBM", "LightGBM_Tuned",
+                "XGBoost", "XGBoost_Tuned",
+                "CatBoost", "CatBoost_Tuned",
                 "HistGBM", "HistGBM_Wide",
                 "ExtraTrees", "ExtraTrees_Deep",
                 "RandForest", "RandForest_Deep",
@@ -5086,6 +5690,10 @@ class UFCSuperModelPipeline:
                     dev_probs_method = _clip_probs(
                         calibrator.predict_proba(np.asarray(dev_probs_raw).reshape(-1, 1))[:, 1]
                     )
+                # Orient the method stage by the SAME corner-corrected picks the
+                # production winner makes, so training/inference orientation agree.
+                if CORNER_CORRECTION_ENABLED:
+                    dev_probs_method = _apply_corner_correction(dev_probs_method, corner_b)
                 y_dev_pred_valid = (dev_probs_method >= decision_threshold).astype(int)
                 y_method_dev = y_dev_method_df.iloc[valid_idx].reset_index(drop=True)
                 meta_dev_valid = meta_dev.iloc[valid_idx].reset_index(drop=True)
@@ -5097,41 +5705,89 @@ class UFCSuperModelPipeline:
                 X_dev_oriented = _oriented_method_matrix(X_dev_valid, y_dev_pred_valid)
                 X_dev_oriented = _augment_method_features(X_dev_oriented)
 
-                # Method-specific era calibration (optional).
-                if METHOD_AUTO_ERA:
-                    best_method_year = 1993
-                    best_method_score = -1.0
-                    best_method_rows = len(X_dev_oriented)
-                    for yr in METHOD_ERA_CANDIDATES:
-                        mask_yr = row_dates_dev_valid >= pd.Timestamp(f"{int(yr)}-01-01")
-                        if int(mask_yr.sum()) < 700:
-                            continue
-                        sub_true = y_method_dev.loc[mask_yr, "coarse"].astype(str).reset_index(drop=True).values
-                        sub_pred_w = y_dev_pred_valid[mask_yr.values]
-                        sub_true_w = y_dev_true_valid[mask_yr.values]
-                        wc = (sub_pred_w == sub_true_w)
-                        if int(np.sum(wc)) >= 120:
-                            counts = pd.Series(sub_true[wc]).value_counts()
-                            score_yr = float(counts.max() / len(sub_true[wc]))
-                        else:
-                            counts = pd.Series(sub_true).value_counts()
-                            score_yr = float(counts.max() / len(sub_true))
-                        if score_yr > best_method_score + 1e-12 or (
-                            abs(score_yr - best_method_score) <= 1e-12 and int(mask_yr.sum()) > best_method_rows
-                        ):
-                            best_method_year = int(yr)
-                            best_method_score = float(score_yr)
-                            best_method_rows = int(mask_yr.sum())
-                    if best_method_year > 1993:
-                        keep = row_dates_dev_valid >= pd.Timestamp(f"{best_method_year}-01-01")
-                        X_dev_oriented = X_dev_oriented.loc[keep].reset_index(drop=True)
-                        y_method_dev = y_method_dev.loc[keep].reset_index(drop=True)
-                        meta_dev_valid = meta_dev_valid.loc[keep].reset_index(drop=True)
-                        y_dev_pred_valid = y_dev_pred_valid[keep.values]
-                        y_dev_true_valid = y_dev_true_valid[keep.values]
-                        row_dates_dev_valid = row_dates_dev_valid.loc[keep].reset_index(drop=True)
-                        self._stat("Method start year", best_method_year)
-                        self._stat("Method rows kept", int(len(X_dev_oriented)))
+                # Method-specific era selection: train a quick multiclass model per
+                # candidate era and score its macro-F1 on a COMMON recent validation
+                # window (identical fights across eras), CONDITIONED on winner-pick-
+                # correct fights to mirror the real headline metric. Among eras within
+                # METHOD_ERA_F1_TOL of the best, prefer the MOST RECENT window —
+                # finish-type patterns are non-stationary, so (unlike the winner
+                # stage) recency beats raw data volume here. The old criterion
+                # MAXIMIZED class imbalance (majority-class fraction) on each era's own
+                # slice — which measures no model skill and starved it to ~766 rows.
+                best_method_year = 1993
+                _n_dev_all = len(X_dev_oriented)
+                if METHOD_AUTO_ERA and _n_dev_all > METHOD_VAL_FIGHTS + 500:
+                    _m_cols_e = [c for c in X_dev_oriented.columns
+                                 if pd.api.types.is_numeric_dtype(X_dev_oriented[c])]
+                    _lab_e = {"Decision": 0, "KO/TKO": 1, "Submission": 2}
+                    _y_all_e = (y_method_dev["coarse"].astype(str)
+                                .map(_lab_e).fillna(0).astype(int).to_numpy())
+                    _va_lo = _n_dev_all - METHOD_VAL_FIGHTS
+                    _Xva_e = X_dev_oriented[_m_cols_e].iloc[_va_lo:].reset_index(drop=True)
+                    _yva_e = _y_all_e[_va_lo:]
+                    # Winner-pick-correct mask on the common window (mirror real eval).
+                    _wc_win = (np.asarray(y_dev_pred_valid)[_va_lo:]
+                               == np.asarray(y_dev_true_valid)[_va_lo:])
+                    _dates_tr = row_dates_dev_valid.iloc[:_va_lo].to_numpy()
+                    _Xtr_pool = X_dev_oriented[_m_cols_e].iloc[:_va_lo].reset_index(drop=True)
+                    _ytr_pool = _y_all_e[:_va_lo]
+                    _cands_e = []  # (year, macro_f1, train_rows)
+                    if len(np.unique(_yva_e)) >= 2:
+                        for yr in METHOD_ERA_CANDIDATES:
+                            if yr < EARLIEST_ERA_START:
+                                continue
+                            _sel = _dates_tr >= np.datetime64(f"{int(yr)}-01-01")
+                            if int(_sel.sum()) < 500:
+                                continue
+                            _ytr_e = _ytr_pool[_sel]
+                            if len(np.unique(_ytr_e)) < 3:
+                                continue
+                            try:
+                                _imp_e = SimpleImputer(strategy="median")
+                                _Xtr_e = pd.DataFrame(
+                                    _imp_e.fit_transform(_Xtr_pool.loc[_sel]),
+                                    columns=_m_cols_e)
+                                _Xva_i = pd.DataFrame(_imp_e.transform(_Xva_e), columns=_m_cols_e)
+                                _mc = HistGradientBoostingClassifier(
+                                    max_iter=200, learning_rate=0.05, max_depth=4,
+                                    min_samples_leaf=20, l2_regularization=1.0,
+                                    random_state=RANDOM_SEED)
+                                _mc.fit(_Xtr_e, _ytr_e)
+                                _pred_e = _mc.predict(_Xva_i)
+                                if int(_wc_win.sum()) >= 60:
+                                    _yt_e, _yp_e = _yva_e[_wc_win], _pred_e[_wc_win]
+                                else:
+                                    _yt_e, _yp_e = _yva_e, _pred_e
+                                _f1 = precision_recall_fscore_support(
+                                    _yt_e, _yp_e, labels=[0, 1, 2],
+                                    average="macro", zero_division=0)[2]
+                                _cands_e.append((int(yr), float(_f1), int(_sel.sum())))
+                            except Exception:
+                                continue
+                    if _cands_e:
+                        _bf1 = max(c[1] for c in _cands_e)
+                        _within = [c for c in _cands_e if c[1] >= _bf1 - METHOD_ERA_F1_TOL]
+                        # Among near-best eras, prefer the MOST training data (rows),
+                        # earliest start as tiebreak. Recency weighting in training
+                        # handles finish-type non-stationarity; more examples help the
+                        # rare Submission class more than a smaller recent window.
+                        best_method_year = max(_within, key=lambda c: (c[2], -c[0]))[0]
+                        for (yr, f1, rows) in _cands_e:
+                            self._stat(
+                                f"  method start {yr}",
+                                f"macro-F1 {f1:.4f} | {rows} train rows"
+                                + ("   <= selected" if yr == best_method_year else ""),
+                            )
+                if METHOD_AUTO_ERA and best_method_year > 1993:
+                    keep = row_dates_dev_valid >= pd.Timestamp(f"{best_method_year}-01-01")
+                    X_dev_oriented = X_dev_oriented.loc[keep].reset_index(drop=True)
+                    y_method_dev = y_method_dev.loc[keep].reset_index(drop=True)
+                    meta_dev_valid = meta_dev_valid.loc[keep].reset_index(drop=True)
+                    y_dev_pred_valid = y_dev_pred_valid[keep.values]
+                    y_dev_true_valid = y_dev_true_valid[keep.values]
+                    row_dates_dev_valid = row_dates_dev_valid.loc[keep].reset_index(drop=True)
+                    self._stat("Method start year", best_method_year)
+                    self._stat("Method rows kept", int(len(X_dev_oriented)))
                 method_columns = list(X_dev_oriented.columns)
 
                 n_dev_m = len(X_dev_oriented)
@@ -5641,31 +6297,88 @@ class UFCSuperModelPipeline:
                     best_cfg = dict(_DEFAULT_BEST_CFG)
 
                 # ── Champion / challenger ─────────────────────────────────────
-                # Both candidates are scored by the same `_score_cfg_method` the
-                # tuner optimized, so the gate isn't second-guessing the tuner —
-                # it's defending against tuner noise across runs.
+                # The champion exists for run-to-run STABILITY: a freshly tuned cfg
+                # replaces the saved champion only if it beats the champion's
+                # walk-forward objective by METHOD_CHAMPION_MARGIN — enough to clear
+                # tuner/validation noise. Because the tuner is deterministic, an
+                # unchanged setup reproduces the champion exactly (tie → retained,
+                # no churn), so the gate only bites when the data drifted between
+                # runs. The champion is fingerprinted on everything that would make
+                # an old cfg incomparable (search space, method classes, feature
+                # columns, blend-code version); a mismatch retires it outright, so
+                # iterating on features/logic no longer requires deleting the file.
                 try:
                     os.makedirs(os.path.dirname(METHOD_CHAMPION_PATH), exist_ok=True)
-                    champion_cfg = None
-                    if os.path.exists(METHOD_CHAMPION_PATH) and not METHOD_HARD_RESET:
-                        with open(METHOD_CHAMPION_PATH, "r") as _f:
-                            champion_cfg = json.load(_f)
-                    if champion_cfg is not None:
-                        champ_obj = _score_cfg_method(champion_cfg)
-                        new_obj = _score_cfg_method(best_cfg)
-                        if champ_obj >= new_obj:
-                            self._stat("Method config", f"Champion retained (champ={champ_obj:.5f} >= new={new_obj:.5f})")
-                            best_cfg = dict(champion_cfg)
-                        else:
-                            self._stat("Method config", f"Challenger wins (new={new_obj:.5f} > champ={champ_obj:.5f}) — champion updated")
-                            with open(METHOD_CHAMPION_PATH, "w") as _f:
-                                json.dump({k: (list(v) if isinstance(v, tuple) else v)
-                                           for k, v in best_cfg.items()}, _f, indent=2)
-                    else:
-                        self._stat("Method config", "No champion on file — saving current best as champion")
+                    champ_fp = hashlib.sha256("|".join([
+                        ",".join(sorted(_METHOD_SEARCH_SPACE.keys())),
+                        ",".join(METHOD_LABELS),
+                        ",".join(method_columns),
+                        METHOD_CACHE_VERSION,
+                    ]).encode("utf-8")).hexdigest()[:16]
+
+                    def _cfg_complete(_c):
+                        return isinstance(_c, dict) and all(k in _c for k in _METHOD_SEARCH_SPACE)
+
+                    def _save_champion(_cfg, _obj):
+                        _payload = {
+                            "_cfg": {k: (list(v) if isinstance(v, tuple) else v)
+                                     for k, v in _cfg.items() if k in _METHOD_SEARCH_SPACE},
+                            "_fingerprint": champ_fp,
+                            "_objective": float(_obj),
+                            "_saved": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        }
                         with open(METHOD_CHAMPION_PATH, "w") as _f:
-                            json.dump({k: (list(v) if isinstance(v, tuple) else v)
-                                       for k, v in best_cfg.items()}, _f, indent=2)
+                            json.dump(_payload, _f, indent=2)
+
+                    new_obj = _score_cfg_method(best_cfg)
+
+                    champion_record = None
+                    if os.path.exists(METHOD_CHAMPION_PATH) and not METHOD_HARD_RESET:
+                        try:
+                            with open(METHOD_CHAMPION_PATH, "r") as _f:
+                                champion_record = json.load(_f)
+                        except Exception:
+                            champion_record = None
+
+                    champ_cfg = None
+                    champ_obj = float("-inf")
+                    stale_reason = None
+                    if isinstance(champion_record, dict) and "_cfg" in champion_record:
+                        if champion_record.get("_fingerprint") != champ_fp:
+                            stale_reason = "setup changed (features/classes/search space/version)"
+                        elif not _cfg_complete(champion_record.get("_cfg")):
+                            stale_reason = "missing tuned keys"
+                        else:
+                            champ_cfg = dict(champion_record["_cfg"])
+                            champ_obj = _score_cfg_method(champ_cfg)
+                            if not np.isfinite(champ_obj):
+                                champ_cfg, stale_reason = None, "champion no longer scorable"
+                    elif champion_record is not None:
+                        stale_reason = "legacy champion format (no fingerprint)"
+
+                    if champ_cfg is None:
+                        _why = stale_reason if stale_reason else "no champion on file"
+                        self._stat(
+                            "Method config",
+                            f"No usable champion ({_why}) — saving challenger (obj={new_obj:.5f})",
+                        )
+                        best_cfg = dict(best_cfg)
+                        _save_champion(best_cfg, new_obj)
+                    elif new_obj > champ_obj + METHOD_CHAMPION_MARGIN:
+                        self._stat(
+                            "Method config",
+                            f"Challenger wins (new={new_obj:.5f} > champ={champ_obj:.5f} "
+                            f"+ margin {METHOD_CHAMPION_MARGIN:.3f}) — champion updated",
+                        )
+                        best_cfg = dict(best_cfg)
+                        _save_champion(best_cfg, new_obj)
+                    else:
+                        self._stat(
+                            "Method config",
+                            f"Champion retained (champ={champ_obj:.5f} >= new={new_obj:.5f} "
+                            f"− margin {METHOD_CHAMPION_MARGIN:.3f})",
+                        )
+                        best_cfg = dict(champ_cfg)
                 except Exception as _e:
                     self._stat("Method config", f"Champion load/save failed ({_e}) — using tuned config")
 
@@ -6160,6 +6873,8 @@ class UFCSuperModelPipeline:
                     all_probs = _clip_probs(
                         calibrator.predict_proba(np.asarray(all_probs).reshape(-1, 1))[:, 1]
                     )
+                if CORNER_CORRECTION_ENABLED:
+                    all_probs = _apply_corner_correction(all_probs, corner_b)
                 y_pred_all = (np.asarray(all_probs) >= decision_threshold).astype(int)
 
                 X_all_full = pd.DataFrame(full_imputer.fit_transform(X_full[full_feature_cols]), columns=full_feature_cols)
@@ -6352,6 +7067,7 @@ class UFCSuperModelPipeline:
         self.model = SuperEnsembleModel(
             final_models, imputer, scaler_all, feature_cols, final_combiner,
             calibrator=calibrator, decision_threshold=decision_threshold,
+            corner_correction=corner_b,
             method_bundle=method_bundle_all,
             method_feat_cols=method_feat_cols_all,
         )
@@ -6411,6 +7127,7 @@ class UFCSuperModelPipeline:
 
         self._section("Walk-Forward Diagnostics")
         ll_scores = []
+        acc_scores = []
         for i, (tr_end, te_end) in enumerate(folds, start=1):
             X_tr = X.iloc[:tr_end]
             y_tr = y.iloc[:tr_end]
@@ -6431,10 +7148,14 @@ class UFCSuperModelPipeline:
             p_rev = _predict_proba("HistGBM", mdl, X_te_sw)
             p = _clip_probs((p_fwd + (1.0 - p_rev)) / 2.0)
             ll = log_loss(y_te, p)
+            acc = float(accuracy_score(y_te, (np.asarray(p) >= 0.5).astype(int)))
             ll_scores.append(ll)
-            self._stat(f"Fold {i} log-loss", f"{ll:.4f} ({len(y_te)} fights)")
+            acc_scores.append(acc)
+            self._stat(f"Fold {i}", f"log-loss {ll:.4f} | acc {acc:.1%} ({len(y_te)} fights)")
         self._stat("Walk-forward mean log-loss", f"{np.mean(ll_scores):.4f}")
-        self._stat("Walk-forward std", f"{np.std(ll_scores):.4f}")
+        self._stat("Walk-forward mean accuracy", f"{np.mean(acc_scores):.1%}")
+        self._stat("Walk-forward std (log-loss)", f"{np.std(ll_scores):.4f}")
+        self._stat("Walk-forward std (accuracy)", f"{np.std(acc_scores):.1%}")
 
     def predict_matchup(self, fighter_a, fighter_b, weight_class="", gender="", rounds=3):
         if self.model is None:
