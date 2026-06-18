@@ -94,7 +94,7 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
 METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_champion_cfg.json")
 ###################################################################################################
 # Bump when winner-stage training logic changes.
-WINNER_CACHE_VERSION = "v19"
+WINNER_CACHE_VERSION = "v21"
 # Bump when method-stage training logic changes.
 METHOD_CACHE_VERSION = "v38"
 ###################################################################################################
@@ -144,6 +144,34 @@ MOV_W_STR = 0.7     # significant strikes landed per minute
 MOV_W_CTRL = 0.5    # control-time fraction
 MOV_W_TD = 0.4      # takedowns landed
 MOV_D_BLEND = 0.5   # weight on the box-score index vs finish-timing / judge consensus
+# ─── Multi-dimensional (phase) Glicko ratings ─────────────────────────────────
+# A single scalar rating can't express style-conditional skill. These add FOUR
+# Glicko ratings per fighter — striking-OFFENSE, striking-DEFENSE, grappling-
+# OFFENSE, grappling-DEFENSE — updated bipartite within every fight: each fighter's
+# offense "plays" the opponent's defense, scored by that fighter's normalized
+# phase output. So "elite wrestler with weak TDD" reads as high grapple-offense +
+# low grapple-defense, and the matchup crosses them (red imposes grappling iff
+# red_grapple_off > blue_grapple_def). Phase attribution is position-aware:
+#   striking = distance+clinch strikes (per STANDING minute) + accuracy + KD
+#   grappling = takedowns + control + GROUND strikes (GnP) + sub attempts − reversals
+# Leak-safe (pre-fight read, post-fight update). Set env UFC_PHASE_RATINGS=0 for A/B.
+PHASE_RATINGS_ENABLED = os.environ.get("UFC_PHASE_RATINGS", "1") != "0"
+PHASE_STEEP = 0.85   # sigmoid steepness mapping a z-scored phase output → success
+# Striking-offense success weights (per STANDING minute, league-standardized).
+PHASE_W_VOL = 1.0    # distance+clinch significant strikes landed
+PHASE_W_ACC = 0.6    # significant strike accuracy (efficiency / made-them-miss)
+PHASE_W_KD = 0.8     # knockdowns
+# Grappling-offense success weights.
+PHASE_W_TD = 0.8     # takedowns landed (per 15 min)
+PHASE_W_CTRL = 1.0   # control-time fraction
+PHASE_W_GNP = 0.6    # ground-and-pound strikes landed (per ground minute)
+PHASE_W_SUB = 0.7    # submission attempts (per 15 min)
+PHASE_W_REV = 0.4    # penalty for being reversed (opponent reversals)
+# A fighter's grappling OFFENSE (and the opponent's grappling DEFENSE) only update
+# when that fighter actually engaged grappling (≥1 takedown/sub attempt or ≥60s
+# control) — a pure kickboxing match carries no grappling-skill information.
+PHASE_GRAPPLE_MIN_ACTIONS = 1.0
+PHASE_GRAPPLE_MIN_CTRL_SEC = 60.0
 # ─── Corner-aware correction (asymmetric calibration) ─────────────────────────
 # The winner ensemble is corner-SYMMETRIC (swap-augmented + forward/reverse
 # averaged), so its p_red is a pure "red is the more skilled corner" probability.
@@ -3321,6 +3349,10 @@ _SWAP_PAIR_COLUMNS = (
     ("r_wr_vs_striker", "b_wr_vs_striker"),
     ("r_wr_vs_wrestler", "b_wr_vs_wrestler"),
     ("r_wr_vs_sub_hunter", "b_wr_vs_sub_hunter"),
+    ("r_strike_off_glicko", "b_strike_off_glicko"),
+    ("r_strike_def_glicko", "b_strike_def_glicko"),
+    ("r_grapple_off_glicko", "b_grapple_off_glicko"),
+    ("r_grapple_def_glicko", "b_grapple_def_glicko"),
 )
 
 
@@ -4267,6 +4299,228 @@ def _build_elo_features_from_csv(csv_path):
     return pd.DataFrame(rows), dict(ratings), dict(div_ratings), last_fight_date, dict(elo_history)
 
 
+# ─── Multi-dimensional (phase) Glicko ratings ─────────────────────────────────
+
+def _phase_time_split(elapsed, r_ctrl_sec, b_ctrl_sec):
+    """Split a fight's elapsed seconds into standing vs ground time, so striking
+    output is rated per STANDING minute (a striker taken down for 4 min isn't
+    penalized for low output) and ground-and-pound per GROUND minute.
+    """
+    ground = min(max(r_ctrl_sec, 0.0) + max(b_ctrl_sec, 0.0), 0.95 * elapsed)
+    standing = max(elapsed - ground, 30.0)
+    ground = max(ground, 30.0)
+    return standing, ground
+
+
+def _compute_phase_scales(df):
+    """League mean+std of each ABSOLUTE phase-output metric (pooled over both
+    corners), used to z-score per-fighter offense in _phase_success. Normalization
+    constants, not predictive features — a global scale is reproducible.
+    """
+    def _num(c):
+        s = df.get(c)
+        if s is None:
+            return np.zeros(len(df), dtype=float)
+        return pd.to_numeric(s, errors="coerce").to_numpy(dtype=float)
+
+    elapsed = _num("total_fight_time_sec")
+    el = np.where(elapsed > 0, elapsed, np.nan)
+    ground = np.minimum(np.maximum(_num("r_ctrl_sec"), 0.0) + np.maximum(_num("b_ctrl_sec"), 0.0),
+                        0.95 * el)
+    standing = np.maximum(el - ground, 30.0)
+    ground = np.maximum(ground, 30.0)
+    stand_min = standing / 60.0
+    ground_min = ground / 60.0
+    t15 = el / 900.0
+
+    def _stack(rf, bf):
+        return np.concatenate([rf, bf])
+
+    metrics = {
+        "strike_vol": _stack(
+            (_num("r_sig_str") * (_num("r_distance") + _num("r_clinch"))) / stand_min,
+            (_num("b_sig_str") * (_num("b_distance") + _num("b_clinch"))) / stand_min),
+        "strike_acc": _stack(_num("r_sig_str_acc"), _num("b_sig_str_acc")),
+        "kd_pm": _stack(_num("r_kd") / stand_min, _num("b_kd") / stand_min),
+        "grap_td": _stack(_num("r_td") / t15, _num("b_td") / t15),
+        "grap_ctrl": _stack(_num("r_ctrl_sec") / el, _num("b_ctrl_sec") / el),
+        "grap_gnp": _stack(
+            (_num("r_sig_str") * _num("r_ground")) / ground_min,
+            (_num("b_sig_str") * _num("b_ground")) / ground_min),
+        "grap_sub": _stack(_num("r_sub_att") / t15, _num("b_sub_att") / t15),
+        "rev": _stack(_num("r_rev"), _num("b_rev")),
+    }
+
+    def _ms(a):
+        a = a[np.isfinite(a)]
+        if len(a) == 0:
+            return (0.0, 1.0)
+        m = float(np.mean(a))
+        s = float(np.std(a))
+        return (m, s if s > 1e-6 else 1.0)
+
+    return {k: _ms(v) for k, v in metrics.items()}
+
+
+def _phase_success(row, scales):
+    """Per-fight phase OFFENSE success scores (each in (0,1)) for both fighters,
+    plus per-direction engagement flags. A score is the fighter's own normalized
+    phase output (NOT a differential): the opponent's quality is accounted for by
+    the Glicko expectation when offense plays defense. Returns
+    (s_strike_r, s_strike_b, s_grapple_r, s_grapple_b,
+     r_strike_eng, b_strike_eng, r_grap_eng, b_grap_eng).
+    """
+    def _f(c):
+        try:
+            v = float(row.get(c))
+        except (TypeError, ValueError):
+            return 0.0
+        return v if np.isfinite(v) else 0.0
+
+    try:
+        total_rounds = int(row.get("total_rounds") or 3)
+    except (TypeError, ValueError):
+        total_rounds = 3
+    elapsed = _f("total_fight_time_sec")
+    if elapsed <= 0:
+        elapsed = max(float(total_rounds) * 300.0, 1.0)
+    standing, ground = _phase_time_split(elapsed, _f("r_ctrl_sec"), _f("b_ctrl_sec"))
+    stand_min = standing / 60.0
+    ground_min = ground / 60.0
+    t15 = max(elapsed / 900.0, 1.0 / 30.0)
+
+    def _z(val, key):
+        m, s = scales[key]
+        return (val - m) / s
+
+    def _strike(px):
+        vol = (_f(f"{px}_sig_str") * (_f(f"{px}_distance") + _f(f"{px}_clinch"))) / stand_min
+        acc = _f(f"{px}_sig_str_acc")
+        kd = _f(f"{px}_kd") / stand_min
+        raw = (PHASE_W_VOL * _z(vol, "strike_vol")
+               + PHASE_W_ACC * _z(acc, "strike_acc")
+               + PHASE_W_KD * _z(kd, "kd_pm"))
+        return float(np.clip(1.0 / (1.0 + np.exp(-PHASE_STEEP * raw)), 0.02, 0.98))
+
+    def _grapple(px, opp):
+        td = _f(f"{px}_td") / t15
+        ctrl = _f(f"{px}_ctrl_sec") / max(elapsed, 1.0)
+        gnp = (_f(f"{px}_sig_str") * _f(f"{px}_ground")) / ground_min
+        sub = _f(f"{px}_sub_att") / t15
+        opp_rev = _f(f"{opp}_rev")
+        raw = (PHASE_W_TD * _z(td, "grap_td")
+               + PHASE_W_CTRL * _z(ctrl, "grap_ctrl")
+               + PHASE_W_GNP * _z(gnp, "grap_gnp")
+               + PHASE_W_SUB * _z(sub, "grap_sub")
+               - PHASE_W_REV * _z(opp_rev, "rev"))
+        return float(np.clip(1.0 / (1.0 + np.exp(-PHASE_STEEP * raw)), 0.02, 0.98))
+
+    def _grap_eng(px):
+        return (_f(f"{px}_td_att") + _f(f"{px}_sub_att") >= PHASE_GRAPPLE_MIN_ACTIONS
+                or _f(f"{px}_ctrl_sec") >= PHASE_GRAPPLE_MIN_CTRL_SEC)
+
+    return (
+        _strike("r"), _strike("b"), _grapple("r", "b"), _grapple("b", "r"),
+        _f("r_sig_str_att") >= 1.0, _f("b_sig_str_att") >= 1.0,
+        _grap_eng("r"), _grap_eng("b"),
+    )
+
+
+def _e_off_def(off_rating, def_rating):
+    """Glicko expected 'offense lands on defense' probability."""
+    return _E((off_rating[0] - MU_0) / SCALE,
+              (def_rating[0] - MU_0) / SCALE,
+              def_rating[1] / SCALE)
+
+
+def _phase_glicko_features(r_so, b_so, r_sd, b_sd, r_go, b_go, r_gd, b_gd):
+    """Build the offense/defense style-clash feature dict from pre-fight phase
+    ratings (shared by training and inference so they can never drift). Each arg
+    is a (mu, phi, sigma) tuple. Directional values are d_* (negate cleanly under
+    corner swap); raw r_/b_ mu pairs swap via _SWAP_PAIR_COLUMNS;
+    phase_clash_magnitude is symmetric (unchanged by swap).
+    """
+    # Two-sided phase superiority: red's offense vs blue's defense, minus the reverse.
+    r_strike_succ = _e_off_def(r_so, b_sd)
+    b_strike_succ = _e_off_def(b_so, r_sd)
+    r_grap_succ = _e_off_def(r_go, b_gd)
+    b_grap_succ = _e_off_def(b_go, r_gd)
+    d_strike_edge = r_strike_succ - b_strike_succ
+    d_grapple_edge = r_grap_succ - b_grap_succ
+    return {
+        "r_strike_off_glicko": float(r_so[0]),
+        "b_strike_off_glicko": float(b_so[0]),
+        "r_strike_def_glicko": float(r_sd[0]),
+        "b_strike_def_glicko": float(b_sd[0]),
+        "r_grapple_off_glicko": float(r_go[0]),
+        "b_grapple_off_glicko": float(b_go[0]),
+        "r_grapple_def_glicko": float(r_gd[0]),
+        "b_grapple_def_glicko": float(b_gd[0]),
+        "d_strike_off_glicko": float(r_so[0] - b_so[0]),
+        "d_strike_def_glicko": float(r_sd[0] - b_sd[0]),
+        "d_grapple_off_glicko": float(r_go[0] - b_go[0]),
+        "d_grapple_def_glicko": float(r_gd[0] - b_gd[0]),
+        # Two-sided edges (incorporate opponent defense + rating uncertainty).
+        "d_strike_edge": float(d_strike_edge),
+        "d_grapple_edge": float(d_grapple_edge),
+        # Overall two-phase edge (well-roundedness when both agree).
+        "d_phase_sum_edge": float(d_strike_edge + d_grapple_edge),
+        # Style-clash axis: large +ve ⇒ red is the striker, blue the grappler.
+        "d_phase_clash": float(d_strike_edge - d_grapple_edge),
+        # Symmetric: how big a striker-vs-grappler mismatch this is (upset risk).
+        "phase_clash_magnitude": float(abs(d_strike_edge - d_grapple_edge)),
+    }
+
+
+def _build_phase_glicko_features_from_csv(csv_path):
+    """Chronological pre-fight offense/defense phase-Glicko features, aligned to
+    the training rows (winner in Red/Blue). Returns (DataFrame, strike_off,
+    strike_def, grapple_off, grapple_def). Leak-safe: each row reads pre-fight
+    ratings, then runs up to four bipartite (offense-vs-defense) Glicko games.
+    """
+    df = pd.read_csv(csv_path)
+    df["event_date"] = pd.to_datetime(df["event_date"], format="%m/%d/%Y", errors="coerce")
+    df = df.sort_values("event_date").reset_index(drop=True)
+    scales = _compute_phase_scales(df)
+
+    so, sd, go, gd = {}, {}, {}, {}   # strike_off, strike_def, grapple_off, grapple_def
+    _default = (MU_0, PHI_0, SIGMA_0)
+    rows = []
+    for _, row in df.iterrows():
+        winner = str(row.get("winner", "")).strip()
+        if winner not in ("Red", "Blue"):
+            continue
+        r_name = str(row.get("r_name", "")).strip()
+        b_name = str(row.get("b_name", "")).strip()
+        if not r_name or not b_name:
+            continue
+
+        # Snapshot ALL pre-fight ratings before any update (leak-safe + consistent).
+        r_so, b_so = so.get(r_name, _default), so.get(b_name, _default)
+        r_sd, b_sd = sd.get(r_name, _default), sd.get(b_name, _default)
+        r_go, b_go = go.get(r_name, _default), go.get(b_name, _default)
+        r_gd, b_gd = gd.get(r_name, _default), gd.get(b_name, _default)
+        rows.append(_phase_glicko_features(r_so, b_so, r_sd, b_sd, r_go, b_go, r_gd, b_gd))
+
+        ss_r, ss_b, gs_r, gs_b, r_se, b_se, r_ge, b_ge = _phase_success(row, scales)
+        # Striking: red offense vs blue defense, and blue offense vs red defense.
+        if r_se:
+            so[r_name] = glicko2_update(r_so, [(b_sd[0], b_sd[1], ss_r)])
+            sd[b_name] = glicko2_update(b_sd, [(r_so[0], r_so[1], 1.0 - ss_r)])
+        if b_se:
+            so[b_name] = glicko2_update(b_so, [(r_sd[0], r_sd[1], ss_b)])
+            sd[r_name] = glicko2_update(r_sd, [(b_so[0], b_so[1], 1.0 - ss_b)])
+        # Grappling: only when that fighter actually engaged grappling offense.
+        if r_ge:
+            go[r_name] = glicko2_update(r_go, [(b_gd[0], b_gd[1], gs_r)])
+            gd[b_name] = glicko2_update(b_gd, [(r_go[0], r_go[1], 1.0 - gs_r)])
+        if b_ge:
+            go[b_name] = glicko2_update(b_go, [(r_gd[0], r_gd[1], gs_b)])
+            gd[r_name] = glicko2_update(r_gd, [(b_go[0], b_go[1], 1.0 - gs_b)])
+
+    return pd.DataFrame(rows), dict(so), dict(sd), dict(go), dict(gd)
+
+
 def _training_row_dates_from_csv(csv_path):
     """Return event_date series aligned with training rows (winner in Red/Blue)."""
     df = pd.read_csv(csv_path)
@@ -4753,6 +5007,10 @@ class UFCSuperModelPipeline:
         self.div_elo_ratings = {}
         self.last_fight_date = {}
         self.elo_history = {}
+        self.strike_off_ratings = {}
+        self.strike_def_ratings = {}
+        self.grapple_off_ratings = {}
+        self.grapple_def_ratings = {}
         self.style_tracker = None
         self.benchmarks = None
         self.method_model = None
@@ -4867,6 +5125,20 @@ class UFCSuperModelPipeline:
             self.div_elo_ratings = {}
             self.last_fight_date = {}
             self.elo_history = {}
+        if PHASE_RATINGS_ENABLED:
+            phase_df, so_glk, sd_glk, go_glk, gd_glk = _build_phase_glicko_features_from_csv(self.csv_path)
+            if len(phase_df) == len(X):
+                X = pd.concat([X.reset_index(drop=True), phase_df.reset_index(drop=True)], axis=1)
+                self.strike_off_ratings = so_glk
+                self.strike_def_ratings = sd_glk
+                self.grapple_off_ratings = go_glk
+                self.grapple_def_ratings = gd_glk
+            else:
+                self._log("Warning: phase-rating feature alignment mismatch. Skipping phase ratings.")
+                self.strike_off_ratings = {}
+                self.strike_def_ratings = {}
+                self.grapple_off_ratings = {}
+                self.grapple_def_ratings = {}
         X = _augment_matchup_features(X)
         self.fighter_history = fighter_history
         self.glicko_ratings = glicko_ratings
@@ -5141,6 +5413,7 @@ class UFCSuperModelPipeline:
             str(WINNER_MAX_FEATURES),
             str(WINNER_SEES_ALL_FEATURES),
             str(WINNER_COMBINER_ROBUST),
+            str(PHASE_RATINGS_ENABLED),
             str(CORNER_CORRECTION_ENABLED),
             str(CORNER_SHIFT_CAP),
             str(CORNER_FIT_FLOOR),
@@ -7217,6 +7490,14 @@ class UFCSuperModelPipeline:
         matchup["r_elo_slope_5"] = _a_slope
         matchup["b_elo_slope_5"] = _b_slope
         matchup["d_elo_slope_5"] = _a_slope - _b_slope
+        if PHASE_RATINGS_ENABLED:
+            _d = (MU_0, PHI_0, SIGMA_0)
+            matchup.update(_phase_glicko_features(
+                self.strike_off_ratings.get(a_key, _d), self.strike_off_ratings.get(b_key, _d),
+                self.strike_def_ratings.get(a_key, _d), self.strike_def_ratings.get(b_key, _d),
+                self.grapple_off_ratings.get(a_key, _d), self.grapple_off_ratings.get(b_key, _d),
+                self.grapple_def_ratings.get(a_key, _d), self.grapple_def_ratings.get(b_key, _d),
+            ))
         if self.style_tracker is not None:
             matchup.update(self.style_tracker.matchup_features(a_key, b_key))
         matchup_df = _augment_matchup_features(pd.DataFrame([matchup]))
