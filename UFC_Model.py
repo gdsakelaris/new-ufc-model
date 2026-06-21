@@ -111,7 +111,7 @@ os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
 # and holdout windows are the SAME most-recent fights for every era candidate.
 # This makes era start years directly comparable (identical val fights) and keeps
 # the holdout stable run-to-run regardless of which start year wins.
-VAL_FIGHTS = 400          # tuning/selection window: the fights just before holdout
+VAL_FIGHTS = 600          # tuning/selection window: the fights just before holdout
 TEST_FIGHTS = 500         # final untouched holdout = the most-recent fights
 MIN_TRAIN_FIGHTS = 1000   # an era candidate must leave at least this many training fights
 # Era selection prefers the EARLIEST start year whose common-window validation
@@ -3606,6 +3606,21 @@ def _make_model_specs(lgb_tuned_params=None, xgb_tuned_params=None, cb_tuned_par
     return specs
 
 
+def _format_optuna_params(params):
+    """Render an Optuna best-params dict as compact, copy-pasteable key=value
+    pairs so the chosen hyperparameters can be logged and later fed back in as
+    warm starts. Floats use 5 significant figures; ints/strings print as-is."""
+    parts = []
+    for k, v in params.items():
+        if isinstance(v, bool):
+            parts.append(f"{k}={v}")
+        elif isinstance(v, float):
+            parts.append(f"{k}={v:.5g}")
+        else:
+            parts.append(f"{k}={v}")
+    return ", ".join(parts)
+
+
 def _tune_lightgbm_optuna(X_train, y_train, X_val, y_val, n_trials=OPTUNA_TRIALS, logger=None, progress_cb=None):
     if lgb is None or optuna is None:
         return None
@@ -3662,6 +3677,7 @@ def _tune_lightgbm_optuna(X_train, y_train, X_val, y_val, n_trials=OPTUNA_TRIALS
             f"val ll: {best.user_attrs.get('ll', float('nan')):.4f} | "
             f"thr: {best.user_attrs.get('thr', 0.5):.3f}"
         )
+        logger(f"Optuna LightGBM best params: {_format_optuna_params(best.params)}")
     return best.params
 
 
@@ -3722,6 +3738,7 @@ def _tune_xgboost_optuna(X_train, y_train, X_val, y_val, n_trials=OPTUNA_TRIALS,
             f"val ll: {best.user_attrs.get('ll', float('nan')):.4f} | "
             f"thr: {best.user_attrs.get('thr', 0.5):.3f}"
         )
+        logger(f"Optuna XGBoost best params: {_format_optuna_params(best.params)}")
     return best.params
 
 
@@ -3780,6 +3797,7 @@ def _tune_catboost_optuna(X_train, y_train, X_val, y_val, n_trials=OPTUNA_TRIALS
             f"val ll: {best.user_attrs.get('ll', float('nan')):.4f} | "
             f"thr: {best.user_attrs.get('thr', 0.5):.3f}"
         )
+        logger(f"Optuna CatBoost best params: {_format_optuna_params(best.params)}")
     return best.params
 
 
