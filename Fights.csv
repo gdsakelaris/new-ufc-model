@@ -271,16 +271,14 @@ Karol Rosa,Luana Santos,Women's Bantamweight,Women,3
 Leon Shahbazyan,Levan Chokheli,Welterweight,Men,3
 Shane Collins,Otari Tanzilovi,Featherweight,Men,3
 
-Rafael Fiziev,Manuel Torres,Lightweight,Men,5
-Shara Magomedov,Michel Pereira,Middleweight,Men,3
-Nazim Sadykhov,Matheus Camilo,Lightweight,Men,3
-Asu Almabayev,Charles Johnson,Flyweight,Men,3
-Ikram Aliskerov,Brunno Ferreira,Middleweight,Men,3
-Abus Magomedov,Michal Oleksiejczuk,Middleweight,Men,3
-Farman Hasanov,Eric Nolan,Welterweight,Men,3
-Abdul Rakhman Yakhyaev,Julius Walker,Light Heavyweight,Men,3
-Nursulton Ruziboev,Andrey Pulyaev,Middleweight,Men,3
-Kaan Ofli,Javier Reyes,Featherweight,Men,3
-Daniil Donchenko,Theodor Berggren,Welterweight,Men,3
-Bekzat Almakhan,Jean Matsumoto,Bantamweight,Men,3
-Tahir Abdullayev,Jefferson Nascimento,Welterweight,Men,3
+Rafael Fiziev,-111,Manuel Torres,-105,Lightweight,Men,5
+Shara Magomedov,-346,Michel Pereira,+281,Middleweight,Men,3
+Nazim Sadykhov,-246,Matheus Camilo,+205,Lightweight,Men,3
+Asu Almabayev,-229,Charles Johnson,+192,Flyweight,Men,3
+Ikram Aliskerov,-304,Brunno Ferreira,+250,Middleweight,Men,3
+Abus Magomedov,-136,Michal Oleksiejczuk,+117,Middleweight,Men,3
+Abdul Rakhman Yakhyaev,-525,Julius Walker,+404,Light Heavyweight,Men,3
+Nursulton Ruziboev,-217,Andrey Pulyaev,+183,Middleweight,Men,3
+Kaan Ofli,+143,Javier Reyes,-168,Featherweight,Men,3
+Bekzat Almakhan,+134,Jean Matsumoto,-157,Bantamweight,Men,3
+

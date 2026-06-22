@@ -422,6 +422,22 @@ STRICT_FUTURE_MODE = True
 # auto era selection.
 FORCED_START_YEAR = 2010
 
+# Active base-model lineup when STRICT_FUTURE_MODE is on (filters _make_model_specs).
+# Single source of truth for BOTH the winner and method stages — edit here only.
+# This set is fingerprinted into the winner cache key, so adding/removing a model
+# (e.g. toggling AdaBoost) self-invalidates the cache — no manual pkl deletion needed.
+# AdaBoost commented out per the 2026-06-21 audit (had 0.30 combiner weight,
+# calibration off; removing it improved ECE 0.0566->0.0487 at zero accuracy cost).
+STRICT_KEEP_MODELS = frozenset({
+    "LightGBM", "LightGBM_Tuned",
+    "XGBoost", "XGBoost_Tuned",
+    "CatBoost", "CatBoost_Tuned",
+    "HistGBM", "HistGBM_Wide",
+    "ExtraTrees", "ExtraTrees_Deep",
+    "RandForest", "RandForest_Deep",
+    # "AdaBoost",
+})
+
 MU_0 = 1500.0
 PHI_0 = 200.0
 SIGMA_0 = 0.06
@@ -5436,6 +5452,9 @@ class UFCSuperModelPipeline:
             str(CORNER_SHIFT_CAP),
             str(CORNER_FIT_FLOOR),
             str(RANDOM_SEED),
+            # Active base-model lineup: changing STRICT_KEEP_MODELS (e.g. toggling
+            # AdaBoost) now self-invalidates the cache instead of silently stale-hitting.
+            ("+".join(sorted(STRICT_KEEP_MODELS)) if STRICT_FUTURE_MODE else "ALL_MODELS"),
             str(n),
             str(train_end),
             str(val_end),
@@ -5490,17 +5509,9 @@ class UFCSuperModelPipeline:
             if STRICT_FUTURE_MODE:
                 # Reseed twins (_S2) add correlation, not diversity; dropped to
                 # cut ensemble variance. Tuned/Wide/Deep variants are kept — they
-                # are genuinely different models.
-                strict_keep = {
-                    "LightGBM", "LightGBM_Tuned",
-                    "XGBoost", "XGBoost_Tuned",
-                    "CatBoost", "CatBoost_Tuned",
-                    "HistGBM", "HistGBM_Wide",
-                    "ExtraTrees", "ExtraTrees_Deep",
-                    "RandForest", "RandForest_Deep",
-                    # "AdaBoost",  # EXPERIMENT: removed (had 0.30 combiner weight, calibration off)
-                }
-                specs = [(n, mk) for n, mk in specs if n in strict_keep]
+                # are genuinely different models. Lineup defined by STRICT_KEEP_MODELS
+                # (top of file); it's fingerprinted into the cache key above.
+                specs = [(n, mk) for n, mk in specs if n in STRICT_KEEP_MODELS]
             model_order = [n for n, _ in specs]
             self._section("Model Setup")
             self._stat("Base models", ", ".join(model_order))
@@ -5908,16 +5919,8 @@ class UFCSuperModelPipeline:
             cb_tuned_params=cb_tuned,
         )
         if STRICT_FUTURE_MODE:
-            strict_keep = {
-                "LightGBM", "LightGBM_Tuned",
-                "XGBoost", "XGBoost_Tuned",
-                "CatBoost", "CatBoost_Tuned",
-                "HistGBM", "HistGBM_Wide",
-                "ExtraTrees", "ExtraTrees_Deep",
-                "RandForest", "RandForest_Deep",
-                # "AdaBoost",  # EXPERIMENT: removed (had 0.30 combiner weight, calibration off)
-            }
-            specs = [(n, mk) for n, mk in specs if n in strict_keep]
+            # Same lineup as the winner stage — see STRICT_KEEP_MODELS at top of file.
+            specs = [(n, mk) for n, mk in specs if n in STRICT_KEEP_MODELS]
         model_order = [n for n, _ in specs]
         X_dev = pd.concat([X_train, X_val], ignore_index=True)
         y_dev = pd.concat([y_train, y_val], ignore_index=True)
@@ -7448,7 +7451,8 @@ class UFCSuperModelPipeline:
         self._stat("Walk-forward std (log-loss)", f"{np.std(ll_scores):.4f}")
         self._stat("Walk-forward std (accuracy)", f"{np.std(acc_scores):.1%}")
 
-    def predict_matchup(self, fighter_a, fighter_b, weight_class="", gender="", rounds=3):
+    def predict_matchup(self, fighter_a, fighter_b, weight_class="", gender="", rounds=3,
+                        red_odds=None, blue_odds=None):
         if self.model is None:
             raise RuntimeError("Model is not trained.")
         a_key = fuzzy_find(fighter_a, self.fighter_history) or fighter_a
@@ -7519,7 +7523,15 @@ class UFCSuperModelPipeline:
         if self.style_tracker is not None:
             matchup.update(self.style_tracker.matchup_features(a_key, b_key))
         matchup_df = _augment_matchup_features(pd.DataFrame([matchup]))
-        p_a = self.model.predict_proba_single(matchup_df.iloc[0].to_dict())
+        p_a_model = float(self.model.predict_proba_single(matchup_df.iloc[0].to_dict()))
+        # Optional odds blend (inference only). market is None unless valid odds were
+        # supplied for BOTH fighters; when None, p_a == p_a_model and every line below
+        # is byte-for-byte the original model-only behavior.
+        market = _devig_two_way(red_odds, blue_odds)
+        market_a = market[0] if market is not None else None
+        p_a = _logit_blend(p_a_model, market_a, ODDS_BLEND_WEIGHT) if market is not None else p_a_model
+        # The pick — and therefore the winner-conditioned method below — follows the
+        # blended probability, so a flip from the odds re-routes the method too.
         pick_a = p_a >= 0.5
         winner_name = a_key if pick_a else b_key
         loser_name = b_key if pick_a else a_key
@@ -7541,6 +7553,13 @@ class UFCSuperModelPipeline:
             "name_b": b_key,
             "prob_a": p_a,
             "prob_b": 1.0 - p_a,
+            "prob_a_model": p_a_model,
+            "prob_b_model": 1.0 - p_a_model,
+            "odds_blended": market is not None,
+            "red_odds": red_odds if market is not None else None,
+            "blue_odds": blue_odds if market is not None else None,
+            "market_prob_a": market_a,
+            "market_prob_b": (1.0 - market_a) if market_a is not None else None,
             "rating_a": float(a_feats.get("glicko_mu", MU_0)),
             "rating_b": float(b_feats.get("glicko_mu", MU_0)),
             "weight_class": weight_class,
@@ -7592,6 +7611,60 @@ def _auto_width(ws):
         ws.column_dimensions[get_column_letter(ci)].width = mx + 3
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Optional betting-odds blend (inference only). This is ENTIRELY opt-in: it kicks
+# in only when valid moneyline odds are supplied for BOTH fighters in a matchup.
+# With no/partial/invalid odds, predict_matchup falls back to the pure model and
+# behaves exactly as before. Tune the single knob below.
+# ─────────────────────────────────────────────────────────────────────────────
+ODDS_BLEND_WEIGHT = 0.50  # weight on the MODEL vs the market in [0,1]; 0.50 = equal trust (logit geometric mean)
+
+
+def _looks_like_odds(tok):
+    """True if a pasted field looks like an American moneyline (e.g. -150, +105)."""
+    s = str(tok).strip()
+    if not s:
+        return False
+    core = s[1:] if s[0] in "+-" else s
+    if not core.isdigit():
+        return False
+    return s[0] in "+-" or abs(int(s)) >= 100
+
+
+def _american_odds_to_prob(odds):
+    """American moneyline -> raw implied win probability. None if unparseable."""
+    try:
+        o = float(str(odds).strip())
+    except (TypeError, ValueError):
+        return None
+    if o < 0:
+        return (-o) / ((-o) + 100.0)
+    if o > 0:
+        return 100.0 / (o + 100.0)
+    return None
+
+
+def _devig_two_way(red_odds, blue_odds):
+    """De-vigged market probabilities (P_red, P_blue). None if either side is bad."""
+    pr = _american_odds_to_prob(red_odds)
+    pb = _american_odds_to_prob(blue_odds)
+    if pr is None or pb is None:
+        return None
+    tot = pr + pb
+    if tot <= 0:
+        return None
+    return pr / tot, pb / tot
+
+
+def _logit_blend(p_model, p_market, w):
+    """Blend two probabilities in logit space; w = weight on the model."""
+    eps = 1e-6
+    pm = min(max(float(p_model), eps), 1.0 - eps)
+    pk = min(max(float(p_market), eps), 1.0 - eps)
+    L = w * np.log(pm / (1.0 - pm)) + (1.0 - w) * np.log(pk / (1.0 - pk))
+    return float(1.0 / (1.0 + np.exp(-L)))
+
+
 def export_to_excel(path, predictions, rankings):
     wb = Workbook()
     hdr_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
@@ -7602,10 +7675,14 @@ def export_to_excel(path, predictions, rankings):
 
     ws = wb.active
     ws.title = "Predictions"
+    has_odds = any(p.get("odds_blended") for p in predictions)
     headers = [
         "Red Corner", "Blue Corner", "Weight Class", "Winner", "Win %",
         "Method", "Method %", "DEC %", "(T)KO %", "SUB %",
     ]
+    if has_odds:
+        headers += ["Red Odds", "Blue Odds", "Model Pick", "Model %"]
+    pct_cols = {5, 7, 8, 9, 10} | ({14} if has_odds else set())
     for ci, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=ci, value=h)
         c.fill, c.font, c.alignment, c.border = hdr_fill, hdr_font, hdr_align, border
@@ -7622,11 +7699,19 @@ def export_to_excel(path, predictions, rankings):
             pred_method, method_probs[pred_method],
             method_probs["Decision"], method_probs["KO/TKO"], method_probs["Submission"],
         ]
+        if has_odds:
+            if p.get("odds_blended"):
+                pam = p.get("prob_a_model")
+                model_winner = p["name_a"] if (pam is not None and pam >= 0.5) else p["name_b"]
+                model_pct = (pam if model_winner == p["name_a"] else 1.0 - pam) if pam is not None else None
+                row += [p.get("red_odds") or "", p.get("blue_odds") or "", model_winner, model_pct]
+            else:
+                row += ["", "", "", None]
         for ci, v in enumerate(row, 1):
             c = ws.cell(row=ri, column=ci, value=v)
             c.border = border
             c.alignment = hdr_align
-            if ci in (5, 7, 8, 9, 10):
+            if ci in pct_cols:
                 c.number_format = "0.0%"
     _auto_width(ws)
     _ = rankings  # Intentionally unused: keep workbook to Predictions sheet only.
@@ -7673,8 +7758,13 @@ class SuperModelGUI:
         tk.Label(main, textvariable=self.status_var, bg=self.BG, fg=self.MUTED,
                  font=("Helvetica", 9, "italic")).pack(anchor="w")
 
-        tk.Label(main, text="Enter fights (one per line: Fighter A,Fighter B,Weight Class,Gender,Rounds)",
-                 bg=self.BG, fg=self.FG, font=("Helvetica", 9, "bold")).pack(anchor="w", pady=(8, 4))
+        tk.Label(main, text="Enter fights — one per line:  Red,Blue,Weight Class,Gender,Rounds",
+                 bg=self.BG, fg=self.FG, font=("Helvetica", 9, "bold")).pack(anchor="w", pady=(8, 1))
+        tk.Label(main,
+                 text=("Optional — add moneyline odds after each fighter (auto-detected):  "
+                       "Red,-150,Blue,+130,Weight Class,Gender,Rounds"),
+                 bg=self.BG, fg=self.MUTED, font=("Helvetica", 8, "italic"),
+                 justify="left").pack(anchor="w", pady=(0, 4))
 
         input_wrap = tk.Frame(main, bg=self.BG_HEADER, padx=2, pady=2)
         input_wrap.pack(fill="both", expand=True, pady=4)
@@ -7725,20 +7815,38 @@ class SuperModelGUI:
                 preds = []
                 skipped_debut = 0
                 for line in [ln.strip() for ln in text.splitlines() if ln.strip()]:
-                    parts = [p.strip() for p in line.split(",")]
+                    parts = [p.strip() for p in line.split(",") if p.strip()]
                     if len(parts) < 2:
                         continue
-                    a, b = parts[0], parts[1]
+                    # Layout: red,[red_odds],blue,[blue_odds],weight,gender,rounds
+                    # Odds are auto-detected, so old (no-odds) lines parse exactly as before.
+                    a = parts[0]
+                    i = 1
+                    red_odds = None
+                    if i < len(parts) and _looks_like_odds(parts[i]):
+                        red_odds = parts[i]
+                        i += 1
+                    if i >= len(parts):
+                        continue
+                    b = parts[i]
+                    i += 1
+                    blue_odds = None
+                    if i < len(parts) and _looks_like_odds(parts[i]):
+                        blue_odds = parts[i]
+                        i += 1
                     if self.pipeline.is_debutant(a) or self.pipeline.is_debutant(b):
                         skipped_debut += 1
                         continue
-                    wc = parts[2] if len(parts) > 2 else ""
-                    g = parts[3] if len(parts) > 3 else ""
+                    wc = parts[i] if i < len(parts) else ""
+                    i += 1
+                    g = parts[i] if i < len(parts) else ""
+                    i += 1
                     try:
-                        rounds = int(parts[4]) if len(parts) > 4 else 3
+                        rounds = int(parts[i]) if i < len(parts) else 3
                     except Exception:
                         rounds = 3
-                    p = self.pipeline.predict_matchup(a, b, wc, g, rounds)
+                    p = self.pipeline.predict_matchup(a, b, wc, g, rounds,
+                                                      red_odds=red_odds, blue_odds=blue_odds)
                     # User-facing picks should always align with displayed probability.
                     pick_a = p["prob_a"] >= 0.5
                     p["predicted_winner"] = p["name_a"] if pick_a else p["name_b"]
