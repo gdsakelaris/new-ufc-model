@@ -5498,7 +5498,7 @@ class UFCSuperModelPipeline:
                     "HistGBM", "HistGBM_Wide",
                     "ExtraTrees", "ExtraTrees_Deep",
                     "RandForest", "RandForest_Deep",
-                    "AdaBoost",
+                    # "AdaBoost",  # EXPERIMENT: removed (had 0.30 combiner weight, calibration off)
                 }
                 specs = [(n, mk) for n, mk in specs if n in strict_keep]
             model_order = [n for n, _ in specs]
@@ -5915,7 +5915,7 @@ class UFCSuperModelPipeline:
                 "HistGBM", "HistGBM_Wide",
                 "ExtraTrees", "ExtraTrees_Deep",
                 "RandForest", "RandForest_Deep",
-                "AdaBoost",
+                # "AdaBoost",  # EXPERIMENT: removed (had 0.30 combiner weight, calibration off)
             }
             specs = [(n, mk) for n, mk in specs if n in strict_keep]
         model_order = [n for n, _ in specs]
