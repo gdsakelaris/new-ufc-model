@@ -88,7 +88,7 @@ if optuna is not None:
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(SCRIPT_DIR, "pure_fight_data.csv")
+DATA_PATH = os.path.join(SCRIPT_DIR, "pure_fight_data_with_altitude.csv")
 PREDICTIONS_XLSX = os.path.join(SCRIPT_DIR, "UFC_Predictions.xlsx")
 CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
 METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_champion_cfg.json")
@@ -7452,7 +7452,11 @@ class UFCSuperModelPipeline:
         self._stat("Walk-forward std (accuracy)", f"{np.std(acc_scores):.1%}")
 
     def predict_matchup(self, fighter_a, fighter_b, weight_class="", gender="", rounds=3,
-                        red_odds=None, blue_odds=None):
+                        red_odds=None, blue_odds=None, location=None):
+        # `location` is accepted for input forward-compat (event venue, e.g.
+        # "Denver, Colorado, USA"). Altitude features are NOT wired yet, so it is
+        # intentionally unused here — the model is byte-for-byte unchanged.
+        _ = location
         if self.model is None:
             raise RuntimeError("Model is not trained.")
         a_key = fuzzy_find(fighter_a, self.fighter_history) or fighter_a
@@ -7676,13 +7680,22 @@ def export_to_excel(path, predictions, rankings):
     ws = wb.active
     ws.title = "Predictions"
     has_odds = any(p.get("odds_blended") for p in predictions)
-    headers = [
-        "Red Corner", "Blue Corner", "Weight Class", "Winner", "Win %",
-        "Method", "Method %", "DEC %", "(T)KO %", "SUB %",
-    ]
+    # With odds: odds interleave next to each corner and the model's pre-blend pick
+    # sits beside the blended Final Pick. Without odds: the original 10-col layout,
+    # byte-for-byte unchanged.
     if has_odds:
-        headers += ["Red Odds", "Blue Odds", "Model Pick", "Model %"]
-    pct_cols = {5, 7, 8, 9, 10} | ({14} if has_odds else set())
+        headers = [
+            "Red Corner", "Red Odds", "Blue Corner", "Blue Odds", "Weight Class",
+            "Model Pick", "Model %", "Final Pick", "Win %",
+            "Method", "Method %", "DEC %", "(T)KO %", "SUB %",
+        ]
+        pct_cols = {7, 9, 11, 12, 13, 14}
+    else:
+        headers = [
+            "Red Corner", "Blue Corner", "Weight Class", "Winner", "Win %",
+            "Method", "Method %", "DEC %", "(T)KO %", "SUB %",
+        ]
+        pct_cols = {5, 7, 8, 9, 10}
     for ci, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=ci, value=h)
         c.fill, c.font, c.alignment, c.border = hdr_fill, hdr_font, hdr_align, border
@@ -7694,19 +7707,26 @@ def export_to_excel(path, predictions, rankings):
             win_pct = p["prob_a"] if winner == p["name_a"] else p["prob_b"]
         method_probs = _normalize_method_probs(p.get("method_probs", {}))
         pred_method = p.get("predicted_method") or max(METHOD_LABELS, key=lambda m: method_probs[m])
-        row = [
-            p["name_a"], p["name_b"], p.get("weight_class", ""), winner, win_pct,
-            pred_method, method_probs[pred_method],
-            method_probs["Decision"], method_probs["KO/TKO"], method_probs["Submission"],
-        ]
         if has_odds:
             if p.get("odds_blended"):
                 pam = p.get("prob_a_model")
                 model_winner = p["name_a"] if (pam is not None and pam >= 0.5) else p["name_b"]
                 model_pct = (pam if model_winner == p["name_a"] else 1.0 - pam) if pam is not None else None
-                row += [p.get("red_odds") or "", p.get("blue_odds") or "", model_winner, model_pct]
+                red_odds, blue_odds = p.get("red_odds") or "", p.get("blue_odds") or ""
             else:
-                row += ["", "", "", None]
+                model_winner, model_pct, red_odds, blue_odds = "", None, "", ""
+            row = [
+                p["name_a"], red_odds, p["name_b"], blue_odds, p.get("weight_class", ""),
+                model_winner, model_pct, winner, win_pct,
+                pred_method, method_probs[pred_method],
+                method_probs["Decision"], method_probs["KO/TKO"], method_probs["Submission"],
+            ]
+        else:
+            row = [
+                p["name_a"], p["name_b"], p.get("weight_class", ""), winner, win_pct,
+                pred_method, method_probs[pred_method],
+                method_probs["Decision"], method_probs["KO/TKO"], method_probs["Submission"],
+            ]
         for ci, v in enumerate(row, 1):
             c = ws.cell(row=ri, column=ci, value=v)
             c.border = border
@@ -7758,11 +7778,11 @@ class SuperModelGUI:
         tk.Label(main, textvariable=self.status_var, bg=self.BG, fg=self.MUTED,
                  font=("Helvetica", 9, "italic")).pack(anchor="w")
 
-        tk.Label(main, text="Enter fights — one per line:  Red,Blue,Weight Class,Gender,Rounds",
+        tk.Label(main, text="Enter fights — one per line:  Red,Blue,Weight Class,Gender,Rounds,Location",
                  bg=self.BG, fg=self.FG, font=("Helvetica", 9, "bold")).pack(anchor="w", pady=(8, 1))
         tk.Label(main,
-                 text=("Optional — add moneyline odds after each fighter (auto-detected):  "
-                       "Red,-150,Blue,+130,Weight Class,Gender,Rounds"),
+                 text=("Optional moneyline odds after each fighter (auto-detected); location last:  "
+                       "Red,-150,Blue,+130,Weight Class,Gender,Rounds,Denver, Colorado, USA"),
                  bg=self.BG, fg=self.MUTED, font=("Helvetica", 8, "italic"),
                  justify="left").pack(anchor="w", pady=(0, 4))
 
@@ -7818,8 +7838,9 @@ class SuperModelGUI:
                     parts = [p.strip() for p in line.split(",") if p.strip()]
                     if len(parts) < 2:
                         continue
-                    # Layout: red,[red_odds],blue,[blue_odds],weight,gender,rounds
-                    # Odds are auto-detected, so old (no-odds) lines parse exactly as before.
+                    # Layout: red,[red_odds],blue,[blue_odds],weight,gender,rounds,location
+                    # Odds are auto-detected and location is optional, so old lines
+                    # (no odds, no location) parse exactly as before.
                     a = parts[0]
                     i = 1
                     red_odds = None
@@ -7841,12 +7862,20 @@ class SuperModelGUI:
                     i += 1
                     g = parts[i] if i < len(parts) else ""
                     i += 1
-                    try:
-                        rounds = int(parts[i]) if i < len(parts) else 3
-                    except Exception:
-                        rounds = 3
+                    rounds = 3
+                    if i < len(parts):
+                        try:
+                            rounds = int(parts[i])
+                            i += 1
+                        except (ValueError, TypeError):
+                            pass  # not a rounds int -> leave default, treat as location
+                    # Location is always LAST and is the only field that can contain
+                    # commas ("Atlanta, Georgia, USA"), so re-join everything that
+                    # remains after the fixed fields back into one string.
+                    location = ", ".join(parts[i:]).strip() if i < len(parts) else ""
                     p = self.pipeline.predict_matchup(a, b, wc, g, rounds,
-                                                      red_odds=red_odds, blue_odds=blue_odds)
+                                                      red_odds=red_odds, blue_odds=blue_odds,
+                                                      location=location or None)
                     # User-facing picks should always align with displayed probability.
                     pick_a = p["prob_a"] >= 0.5
                     p["predicted_winner"] = p["name_a"] if pick_a else p["name_b"]
