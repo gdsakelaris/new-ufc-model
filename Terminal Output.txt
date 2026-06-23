@@ -126,32 +126,12 @@ Accuracy by Gender
 ------------------------------------------------------------------------
 Men (n=434): 67.1%
 Women (n=66): 75.8%
-Method cache: MISS (v38) — training method stage
+Method cache: HIT (v38) key=e496ed9e036c file=method_stage_e496ed9e036c4d111ae2.pkl
 
 ========================================================================
 Method Model
 ========================================================================
-  method start 2005: macro-F1 0.3736 | 5880 train rows
-  method start 2010: macro-F1 0.3736 | 5880 train rows
-  method start 2014: macro-F1 0.3560 | 5856 train rows
-  method start 2016: macro-F1 0.4300 | 4898 train rows   <= selected
-  method start 2018: macro-F1 0.4066 | 3930 train rows
-  method start 2020: macro-F1 0.4142 | 2855 train rows
-  method start 2021: macro-F1 0.3834 | 2363 train rows
-  method start 2022: macro-F1 0.3996 | 1817 train rows
-  method start 2023: macro-F1 0.3870 | 1235 train rows
-  method start 2024: macro-F1 0.3532 | 654 train rows
-Method start year: 2016
-Method rows kept: 5148
-Stage1 corr-pruned: 490 → 416 (thr=0.95)
-Stage1 HGB [##############################]  80/80  100.0%
-Stage1 HGB params: lr=0.0206, depth=10, leaves=17, iter=160
-Stage2 corr-pruned: 467 → 394 (thr=0.95)
-Stage2 top-N pruned: kept 180/180
-Stage2 HGB [##############################]  80/80  100.0%
-Stage2 HGB params: lr=0.0204, depth=4, leaves=38, iter=160
-Method Blend [##############################] 400/400 100.0%
-Method config: Champion retained (champ=0.47532 >= new=0.47682 − margin 0.004)
+Cache: HIT (v38) — method retrain skipped
 Method classes (training): Decision, KO/TKO, Submission
 Validation metric target (method | winner correct): 53.9%
 Validation majority baseline (same subset): 52.4%
@@ -181,7 +161,6 @@ Actual\Pred     Decision    KO/TKO  Submission
 Decision              82        41          24
 KO/TKO                40        74          19
 Submission            26        17          18
-Method cache: SAVED (v38) key=e496ed9e036c file=method_stage_e496ed9e036c4d111ae2.pkl
 
 ========================================================================
 Walk-Forward Diagnostics
