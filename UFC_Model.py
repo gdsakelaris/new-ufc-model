@@ -7695,7 +7695,7 @@ class UFCSuperModelPipeline:
         self._stat("Walk-forward std (accuracy)", f"{np.std(acc_scores):.1%}")
 
     def predict_matchup(self, fighter_a, fighter_b, weight_class="", gender="", rounds=3,
-                        red_odds=None, blue_odds=None, location=None):
+                        red_odds=None, blue_odds=None, location=None, event_elevation=None):
         if self.model is None:
             raise RuntimeError("Model is not trained.")
         a_key = fuzzy_find(fighter_a, self.fighter_history) or fighter_a
@@ -7768,8 +7768,15 @@ class UFCSuperModelPipeline:
         # Altitude features: venue altitude (median fallback for blank/unknown
         # location) + each fighter's latest known training-camp elevation (median
         # fallback when the camp is unrecorded), for the acclimatization signals.
-        _event_alt = (self.location_altitude.get(location, self.alt_median)
-                      if location else self.alt_median)
+        # Venue altitude: an explicit elevation (ft) wins — it works for venues the
+        # model has never seen (no silent median fallback); otherwise look the
+        # location up, then fall back to the dataset median.
+        if event_elevation is not None:
+            _event_alt = float(event_elevation)
+        elif location:
+            _event_alt = self.location_altitude.get(location, self.alt_median)
+        else:
+            _event_alt = self.alt_median
         _rt = self.fighter_train_alt.get(a_key)
         _bt = self.fighter_train_alt.get(b_key)
         _known = 1.0 if (_rt is not None and _bt is not None) else 0.0
@@ -8030,11 +8037,12 @@ class SuperModelGUI:
         tk.Label(main, textvariable=self.status_var, bg=self.BG, fg=self.MUTED,
                  font=("Helvetica", 9, "italic")).pack(anchor="w")
 
-        tk.Label(main, text="Enter fights — one per line:  Red,Blue,Weight Class,Gender,Rounds,Location",
+        tk.Label(main, text="Enter fights — one per line:  Red,Blue,Weight Class,Gender,Rounds,Elevation(ft) or Location",
                  bg=self.BG, fg=self.FG, font=("Helvetica", 9, "bold")).pack(anchor="w", pady=(8, 1))
         tk.Label(main,
-                 text=("Optional moneyline odds after each fighter (auto-detected); location last:  "
-                       "Red,-150,Blue,+130,Weight Class,Gender,Rounds,Denver, Colorado, USA"),
+                 text=("Optional moneyline odds after each fighter (auto-detected). Last field = venue "
+                       "ELEVATION in feet (e.g. 5280 — works for any new venue) OR a place name:\n"
+                       "  Red,-150,Blue,+130,Weight Class,Gender,Rounds,5280      or      ...,Rounds,Denver, Colorado, USA"),
                  bg=self.BG, fg=self.MUTED, font=("Helvetica", 8, "italic"),
                  justify="left").pack(anchor="w", pady=(0, 4))
 
@@ -8128,13 +8136,23 @@ class SuperModelGUI:
                             i += 1
                         except (ValueError, TypeError):
                             pass  # not a rounds int -> leave default, treat as location
-                    # Location is always LAST and is the only field that can contain
-                    # commas ("Atlanta, Georgia, USA"), so re-join everything that
-                    # remains after the fixed fields back into one string.
-                    location = ", ".join(parts[i:]).strip() if i < len(parts) else ""
+                    # Trailing field is the venue, LAST. A bare number = the event's
+                    # elevation in feet (works for venues the model has never seen);
+                    # anything else = a place name (the only field that can contain
+                    # commas, "Atlanta, Georgia, USA"), re-joined into one string and
+                    # looked up. Either is optional.
+                    _tail = ", ".join(parts[i:]).strip() if i < len(parts) else ""
+                    location = None
+                    event_elevation = None
+                    if _tail:
+                        try:
+                            event_elevation = float(_tail)
+                        except ValueError:
+                            location = _tail
                     p = self.pipeline.predict_matchup(a, b, wc, g, rounds,
                                                       red_odds=red_odds, blue_odds=blue_odds,
-                                                      location=location or None)
+                                                      location=location,
+                                                      event_elevation=event_elevation)
                     # User-facing picks should always align with displayed probability.
                     pick_a = p["prob_a"] >= 0.5
                     p["predicted_winner"] = p["name_a"] if pick_a else p["name_b"]
