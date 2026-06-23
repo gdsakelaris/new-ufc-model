@@ -194,7 +194,16 @@ CORNER_SHIFT_CAP = 0.6
 CORNER_FIT_FLOOR = 0.25
 OPTUNA_TRIALS = 80
 METHOD_TUNING_TRIALS = 400
-WINNER_MAX_FEATURES = 240
+# Winner stability selection (threshold form — no fixed feature count). Each
+# bootstrap run marks a feature "selected" if it lands in the top
+# STABILITY_PER_RUN_FRAC of that run's importance ranking; the model then keeps
+# every feature whose selection FREQUENCY across runs is >= STABILITY_FREQ_THRESHOLD.
+# The kept count FLOATS to however many features are reliably useful — replacing
+# the old arbitrary top-240 cap. Textbook stability selection (Meinshausen-Bühlmann):
+# a selection-probability cutoff, not a fixed count. Lower the frequency threshold
+# (or raise the per-run fraction) to keep more features; raise it to keep fewer.
+STABILITY_PER_RUN_FRAC = 0.75    # per-run regularizer: top 75% by importance counts as "selected"
+STABILITY_FREQ_THRESHOLD = 0.60  # keep features selected in >= 60% of bootstrap runs
 # Winner-stage correlation prune: drop near-duplicate columns (|corr| > this),
 # keeping the more target-relevant member of each correlated pair, BEFORE
 # stability selection. The winner matchup matrix is heavily collinear (many
@@ -5529,17 +5538,19 @@ class UFCSuperModelPipeline:
                 f"{_pre_corr_n} → {len(feature_cols)} (thr={WINNER_CORR_PRUNE_THRESHOLD})",
             )
 
-        # Stability selection: rather than a single-pass LightGBM top-N, run K
-        # bootstrap subsamples and keep the features that rank in top-N most
-        # consistently. Less sensitive to which fold happened to see which
-        # features — closer to the Old_Model stability-selection approach.
-        if lgb is not None and len(feature_cols) > WINNER_MAX_FEATURES:
+        # Stability selection (threshold form): run K bootstrap subsamples; in
+        # each, a feature is "selected" if it lands in the top STABILITY_PER_RUN_FRAC
+        # of that run's importance ranking. Keep every feature whose selection
+        # FREQUENCY across runs is >= STABILITY_FREQ_THRESHOLD — the kept count
+        # FLOATS to however many features are reliably useful (no fixed top-N cap).
+        # Textbook stability selection: a selection-probability cutoff, not a count.
+        if lgb is not None and len(feature_cols) > 2:
             X_quick_aug, y_quick_aug = _augment_swap(X_train, y_train)
             _STAB_RUNS = 15
             _STAB_SUB_FRAC = 0.75
             _n_feats = X_quick_aug.shape[1]
+            _per_run_q = max(1, int(round(STABILITY_PER_RUN_FRAC * _n_feats)))
             _counts = np.zeros(_n_feats, dtype=float)
-            _mean_imp = np.zeros(_n_feats, dtype=float)
             _rng = np.random.default_rng(RANDOM_SEED)
             _n_rows = len(X_quick_aug)
             _sub_size = max(int(_n_rows * _STAB_SUB_FRAC), 1)
@@ -5554,25 +5565,26 @@ class UFCSuperModelPipeline:
                 )
                 _quick.fit(_X_sub, _y_sub)
                 _imp = np.asarray(_quick.feature_importances_, dtype=float)
-                _top = np.argsort(_imp)[::-1][:WINNER_MAX_FEATURES]
+                _top = np.argsort(_imp)[::-1][:_per_run_q]
                 _counts[_top] += 1
-                # Also track mean importance so ties on selection frequency
-                # are broken by average usefulness.
-                _mean_imp += _imp / _STAB_RUNS
-            # Rank by (selection frequency, mean importance) descending.
-            _composite = _counts + _mean_imp / (max(_mean_imp.max(), 1.0) * 1000.0)
-            _keep = sorted(np.argsort(_composite)[::-1][:WINNER_MAX_FEATURES].tolist())
+            # Keep features whose selection frequency clears the threshold.
+            _freq = _counts / _STAB_RUNS
+            _keep = sorted(np.where(_freq >= STABILITY_FREQ_THRESHOLD)[0].tolist())
+            # Safety: never collapse to (near-)nothing if the threshold is misset.
+            if len(_keep) < 2:
+                _keep = sorted(np.argsort(_freq)[::-1][:max(2, _n_feats // 2)].tolist())
             feature_cols = [feature_cols[i] for i in _keep]
             feature_cols = _complete_swap_pairs(feature_cols, list(X_train.columns))
             X_train = X_train[feature_cols]
             X_val = X_val[feature_cols]
             X_test = X_test[feature_cols]
-            # Report how stable the selection actually was.
-            _kept_counts = _counts[_keep]
-            _sel_freq = float(_kept_counts.mean()) / _STAB_RUNS
+            # Report the FLOATED count + how stable the kept set actually was.
+            _sel_freq = float(_freq[_keep].mean())
             self._section("Feature Pruning (Stability Selection)")
-            self._stat("Kept features", len(feature_cols))
+            self._stat("Kept features (floated)", len(feature_cols))
             self._stat("Bootstrap runs", _STAB_RUNS)
+            self._stat("Per-run select top", f"{_per_run_q}/{_n_feats} ({STABILITY_PER_RUN_FRAC:.0%})")
+            self._stat("Freq threshold", f"{STABILITY_FREQ_THRESHOLD:.0%}")
             self._stat("Mean selection freq of kept", f"{_sel_freq:.1%}")
 
         feature_cols_fp = hashlib.sha256(",".join(feature_cols).encode("utf-8")).hexdigest()[:12]
@@ -5588,7 +5600,8 @@ class UFCSuperModelPipeline:
             str(MOV_RATINGS_ENABLED),
             str(MOV_MODE),
             str(WINNER_CORR_PRUNE_THRESHOLD),
-            str(WINNER_MAX_FEATURES),
+            str(STABILITY_PER_RUN_FRAC),
+            str(STABILITY_FREQ_THRESHOLD),
             str(WINNER_SEES_ALL_FEATURES),
             str(WINNER_COMBINER_ROBUST),
             str(PHASE_RATINGS_ENABLED),
