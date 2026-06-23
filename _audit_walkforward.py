@@ -92,9 +92,17 @@ K_SWEEP_INCLUDE_FULL = True
 # value. A = leak-free top-K WITHOUT any column whose name contains a listed
 # substring; B = A + exactly those columns. B beating A past the noise floor =
 # the group helps. The named cols must be present in the current bundle. [] off.
-# Testing d_is_southpaw — the one non-redundant feature the prune drops
-# (imp 0.00074, corr only 0.078). Already in the bundle; no rebuild needed.
-ABLATE_PREFIXES = ["is_southpaw"]
+# Testing the WINNER-eligible altitude features. After FEATURE_ROUTING, the
+# winner stage sees the signed acclimatization DIFFERENTIALS + new composites
+# (d_accl_shock_kft, d_alt_descent_kft, d_train_alt_kft, r/b_event_camp_gap_kft,
+# d_alt_net_edge_kft, d_camp_x_event_kft, train_alt_known) — the raw per-corner
+# shocks + absolute venue + mutual_gas/accl_asym are method-routed (this
+# winner-only harness can't score those). The substrings below union to ALL
+# altitude cols; winner_elig filtering keeps only the winner-eligible ones, so
+# the printout shows exactly that winner group — confirm no strays.
+# Requires a bundle REBUILT from the camp-altitude data + new features (delete
+# _audit_stage2_bundle_v2.pkl, re-run _audit_stage2.py).
+ABLATE_PREFIXES = ["alt", "accl", "gas", "camp"]
 # Faithful surrogate: family -> deployed-approx combiner weight (AdaBoost removed,
 # renormalized from the audit's non-zero weights). Unavailable libs are dropped
 # and the rest renormalized.

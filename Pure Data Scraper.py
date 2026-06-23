@@ -622,6 +622,13 @@ Find URLs at: http://ufcstats.com/statistics/events/completed"""
                 'fight_url': fight_url,
                 'event_date': event_data['event_date'],
                 'event_location': event_data['event_location'],
+                # Placeholders for the event/camp altitude columns — populated
+                # downstream (geocoding venue + each fighter's training gym).
+                'event_altitude': '',
+                'r_trains_at': '',
+                'b_trains_at': '',
+                'r_training_altitude_ft': '',
+                'b_training_altitude_ft': '',
                 'r_fighter': fighters[0],
                 'b_fighter': fighters[1],
                 'winner': winner,
@@ -767,7 +774,10 @@ Find URLs at: http://ufcstats.com/statistics/events/completed"""
         
         # Reorder columns to match original scraper
         column_order = [
-            'event_date', 'event_name', 'event_url', 'fight_url', 'event_location', 'r_fighter', 'b_fighter',
+            'event_date', 'event_name', 'event_url', 'fight_url', 'event_location',
+            'event_altitude', 'r_trains_at', 'b_trains_at',
+            'r_training_altitude_ft', 'b_training_altitude_ft',
+            'r_fighter', 'b_fighter',
             'weight_class', 'gender', 'total_rounds', 'is_title_bout', 'referee',
             'winner', 'method', 'finish_round', 'time_sec', 'total_fight_time_sec',
             'r_height', 'b_height', 'height_diff',

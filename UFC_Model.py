@@ -16,6 +16,7 @@ Optional CLI:
 """
 
 import argparse
+import csv
 import hashlib
 import json
 import math
@@ -88,7 +89,7 @@ if optuna is not None:
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(SCRIPT_DIR, "pure_fight_data_with_altitude.csv")
+DATA_PATH = os.path.join(SCRIPT_DIR, "pure_fight_data_with_event_and_camp_altitudes.csv")
 PREDICTIONS_XLSX = os.path.join(SCRIPT_DIR, "UFC_Predictions.xlsx")
 CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
 METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_champion_cfg.json")
@@ -402,6 +403,24 @@ FEATURE_ROUTING = {
     "r_elo_slope_5":               {"winner", "stage1"},
     "b_elo_slope_5":               {"winner", "stage1"},
     "d_elo_slope_5":               {"winner", "stage1"},
+
+    # ═══════════════════════════════════════════════════════════════════
+    # ALTITUDE / ACCLIMATIZATION (training-elevation baseline)
+    # The absolute venue + raw per-corner shock/descent are METHOD signals
+    # (at altitude an acclimatized fighter submits the gassed one; both gassed
+    # -> sloppy -> decision). The event-altitude winner test was dead, so the
+    # winner model sees only the signed DIFFERENTIALS (left unrouted below:
+    # d_accl_shock_kft, d_alt_descent_kft, d_train_alt_kft, train_alt_known) —
+    # not the raw per-corner shocks that proved to be winner noise.
+    # ═══════════════════════════════════════════════════════════════════
+    "event_alt_kft":               {"stage1", "stage2"},
+    "alt_ge_4000":                 {"stage1", "stage2"},
+    "r_accl_shock_kft":            {"stage1", "stage2"},
+    "b_accl_shock_kft":            {"stage1", "stage2"},
+    "r_alt_descent_kft":           {"stage1", "stage2"},
+    "b_alt_descent_kft":           {"stage1", "stage2"},
+    "mutual_gas_kft":              {"stage1"},
+    "accl_asym_kft":               {"stage1", "stage2"},
 }
 def _feature_allowed(feature_name, model):
     """True if `feature_name` should be fed to `model` ('winner'/'stage1'/'stage2').
@@ -3194,6 +3213,77 @@ def _mov_performance_score(row, scales):
     return s_red, 1.0 - s_red
 
 
+def _altitude_feature_row(event_alt, r_train_alt, b_train_alt, train_known):
+    """Altitude / acclimatization features for one matchup, built on each
+    fighter's TRAINING-CAMP elevation (the true physiological baseline — past
+    FIGHT venues cluster at Vegas/sea-level regardless of where a fighter is
+    acclimatized, so they can't tell who's adapted).
+
+    'Shock' is RECTIFIED — fighting ABOVE your camp costs cardio; staying/going
+    down is ~free (the max(0,.) keeps it event-dependent). 'Descent' is the
+    mirror: dropping from a high camp to a low venue rides a temporary RBC/O2
+    boost (the Dagestan/altitude-camp-before-a-sea-level-fight effect).
+
+    The method story (verified in the raw data) lives in the asymmetry: at a
+    high venue, an acclimatized fighter SUBMITS the gassing opponent (sub rate
+    ~triples), while if BOTH gas the fight turns sloppy and drifts to DECISION.
+    `accl_asym_kft` / `mutual_gas_kft` isolate those two regimes. kft-scaled so
+    magnitudes sit near the other features."""
+    ev = float(event_alt)
+    rt = float(r_train_alt)
+    bt = float(b_train_alt)
+    ek = ev / 1000.0
+    r_shock = max(0.0, ev - rt) / 1000.0       # red fighting above its camp
+    b_shock = max(0.0, ev - bt) / 1000.0
+    r_descent = max(0.0, rt - ev) / 1000.0     # red descending off a high camp
+    b_descent = max(0.0, bt - ev) / 1000.0
+    d_accl_shock = r_shock - b_shock
+    d_alt_descent = r_descent - b_descent
+    d_train_alt = (rt - bt) / 1000.0
+    # Signed venue-vs-camp gaps (+ = fighting above camp, - = below). One feature
+    # carries both the shock and descent direction, so a single tree split at 0
+    # separates the two regimes (the rectified pieces need two splits).
+    r_gap = (ev - rt) / 1000.0
+    b_gap = (ev - bt) / 1000.0
+    return {
+        # Absolute venue (the base method signal — affects both fighters).
+        "event_alt_kft": ek,
+        "alt_ge_4000": 1.0 if ev >= 4000.0 else 0.0,
+        # Acclimatization shock vs training camp (winner asymmetry + method).
+        "r_accl_shock_kft": r_shock,
+        "b_accl_shock_kft": b_shock,
+        "d_accl_shock_kft": d_accl_shock,
+        # Sea-level / RBC boost from descending off a high camp (winner).
+        "r_alt_descent_kft": r_descent,
+        "b_alt_descent_kft": b_descent,
+        "d_alt_descent_kft": d_alt_descent,
+        # Altitude-camp cardio-conditioning edge, always-on (winner).
+        "d_train_alt_kft": d_train_alt,
+        # Signed event-vs-camp elevation gap, per corner (winner; user-requested).
+        "r_event_camp_gap_kft": r_gap,
+        "b_event_camp_gap_kft": b_gap,
+        # COMPOSITE: net altitude advantage for red = (descent benefit - shock cost)
+        # differenced across corners. Single directional "who does altitude favor"
+        # axis the winner can split on. (= d_alt_descent - d_accl_shock.)
+        "d_alt_net_edge_kft": d_alt_descent - d_accl_shock,
+        # COMPOSITE: camp-elevation edge AMPLIFIED by venue altitude — training
+        # higher matters far more at Mexico City than at sea level (winner).
+        "d_camp_x_event_kft": d_train_alt * ek,
+        # COMPOSITE: difference in elevation FAMILIARITY = how far each camp sits
+        # from the venue (|gap|), differenced. + = red is closer to the venue's
+        # elevation (more familiar). The one event-dependent diff-of-diffs not
+        # already covered (= -(d_accl_shock + d_alt_descent); independent of
+        # d_alt_net_edge). Symmetric-deviation hypothesis -> weaker than net_edge.
+        "d_event_camp_famil_kft": abs(b_gap) - abs(r_gap),
+        # Method: both gas -> sloppy -> DECISION (anti-finish).
+        "mutual_gas_kft": min(r_shock, b_shock),
+        # Method: asymmetric stress -> fresher SUBMITS gassed one (finish/sub).
+        "accl_asym_kft": abs(d_accl_shock),
+        # Data-availability gate (~60% of fights impute a training elevation).
+        "train_alt_known": float(train_known),
+    }
+
+
 def build_training_data(csv_path, progress_cb=None):
     """Process fights chronologically, build features, return X, y and state."""
     df = pd.read_csv(csv_path)
@@ -3203,6 +3293,29 @@ def build_training_data(csv_path, progress_cb=None):
     mov_scales = _compute_mov_scales(df) if MOV_RATINGS_ENABLED else None
 
     ctx_finish_prior_arr, ref_finish_prior_arr = _precompute_context_finish_priors(df)
+
+    # Altitude: dataset median venue (neutral fallback for unknown venues at
+    # inference) and a location->altitude map (for inference lookup).
+    _alt_col = pd.to_numeric(df.get("event_altitude"), errors="coerce")
+    alt_median = float(_alt_col.median()) if _alt_col.notna().any() else 0.0
+    location_altitude = {}
+    if "event_location" in df.columns and "event_altitude" in df.columns:
+        for _loc, _a in df.groupby("event_location")["event_altitude"].first().items():
+            try:
+                location_altitude[str(_loc)] = float(_a)
+            except (TypeError, ValueError):
+                pass
+    # Training-camp elevation = the acclimatization baseline. Clamp to [-500, 9000]
+    # ft to kill junk geocodes (e.g. generic "United States" -> 10617 ft) while
+    # keeping legit high camps (Mexico City ~7350, Bogota ~8400). Median-impute the
+    # ~60% of fights with an unknown camp (most camps are low, so this is the modal
+    # truth); a `train_alt_known` flag lets the model discount the imputed rows.
+    # The median is outcome-independent, so a global (non-causal) fit is leak-safe.
+    _rt_col = pd.to_numeric(df.get("r_training_altitude_ft"), errors="coerce").clip(-500.0, 9000.0)
+    _bt_col = pd.to_numeric(df.get("b_training_altitude_ft"), errors="coerce").clip(-500.0, 9000.0)
+    _all_train = pd.concat([_rt_col, _bt_col])
+    train_alt_median = float(_all_train.median()) if _all_train.notna().any() else 0.0
+    fighter_train_alt = {}  # latest known camp elevation per fighter (for inference)
 
     # Fit style-dim quartile thresholds from per-fighter averages across the
     # first 80% of fights, then instantiate the tracker.
@@ -3252,6 +3365,15 @@ def build_training_data(csv_path, progress_cb=None):
         )
         # Style-class matchup win-rate features (leak-safe: reads pre-fight).
         matchup.update(style_tracker.matchup_features(r_name, b_name))
+        # Altitude features (leak-safe: training-camp elevation is a known
+        # pre-fight attribute, read straight from the row; unknown -> median).
+        _event_alt = _num_or(row.get("event_altitude"), alt_median)
+        _rt_raw = _rt_col.iloc[idx]
+        _bt_raw = _bt_col.iloc[idx]
+        _known = 1.0 if (pd.notna(_rt_raw) and pd.notna(_bt_raw)) else 0.0
+        _rt = float(_rt_raw) if pd.notna(_rt_raw) else train_alt_median
+        _bt = float(_bt_raw) if pd.notna(_bt_raw) else train_alt_median
+        matchup.update(_altitude_feature_row(_event_alt, _rt, _bt, _known))
         if row["winner"] in ("Red", "Blue"):
             matchup["ctx_finish_prior_2y"] = float(ctx_finish_prior_arr[idx])
             matchup["ref_finish_prior"] = float(ref_finish_prior_arr[idx])
@@ -3310,14 +3432,24 @@ def build_training_data(csv_path, progress_cb=None):
 
         # Update style-matchup tracker AFTER the row is built.
         style_tracker.update_after_fight(r_name, b_name, winner, row)
+        # Remember each fighter's latest known camp elevation for inference lookup.
+        if pd.notna(_rt_raw):
+            fighter_train_alt[r_name] = float(_rt_raw)
+        if pd.notna(_bt_raw):
+            fighter_train_alt[b_name] = float(_bt_raw)
 
     X = pd.DataFrame(rows_X)
     y = pd.Series(rows_y)
 
+    alt_state = {"location_altitude": location_altitude, "alt_median": alt_median,
+                 "fighter_train_alt": fighter_train_alt,
+                 "train_alt_median": train_alt_median}
+
     if progress_cb:
         progress_cb(f"  Built {len(X)} training samples with {X.shape[1]} features.")
 
-    return X, y, fighter_history, glicko_ratings, opp_glicko_list, style_tracker
+    return (X, y, fighter_history, glicko_ratings, opp_glicko_list, style_tracker,
+            alt_state)
 
 
 def _method_labels_from_csv(csv_path):
@@ -3369,6 +3501,9 @@ _SWAP_PAIR_COLUMNS = (
     ("r_strike_def_glicko", "b_strike_def_glicko"),
     ("r_grapple_off_glicko", "b_grapple_off_glicko"),
     ("r_grapple_def_glicko", "b_grapple_def_glicko"),
+    ("r_accl_shock_kft", "b_accl_shock_kft"),
+    ("r_alt_descent_kft", "b_alt_descent_kft"),
+    ("r_event_camp_gap_kft", "b_event_camp_gap_kft"),
 )
 
 
@@ -5046,6 +5181,10 @@ class UFCSuperModelPipeline:
         self.grapple_off_ratings = {}
         self.grapple_def_ratings = {}
         self.style_tracker = None
+        self.location_altitude = {}
+        self.alt_median = 0.0
+        self.fighter_train_alt = {}
+        self.train_alt_median = 0.0
         self.benchmarks = None
         self.method_model = None
         self.method_imputer = None
@@ -5136,10 +5275,15 @@ class UFCSuperModelPipeline:
     def train(self):
         self._section("Data Build")
         self._log("Building chronological leak-safe training matrix...")
-        X, y, fighter_history, glicko_ratings, opp_glicko_list, style_tracker = build_training_data(
+        (X, y, fighter_history, glicko_ratings, opp_glicko_list, style_tracker,
+         alt_state) = build_training_data(
             self.csv_path, progress_cb=self._log
         )
         self.style_tracker = style_tracker
+        self.location_altitude = alt_state["location_altitude"]
+        self.alt_median = alt_state["alt_median"]
+        self.fighter_train_alt = alt_state["fighter_train_alt"]
+        self.train_alt_median = alt_state["train_alt_median"]
         y_method_df = _method_labels_from_csv(self.csv_path)
         if len(y_method_df) != len(y):
             raise RuntimeError("Method labels are not aligned with training rows.")
@@ -7453,10 +7597,6 @@ class UFCSuperModelPipeline:
 
     def predict_matchup(self, fighter_a, fighter_b, weight_class="", gender="", rounds=3,
                         red_odds=None, blue_odds=None, location=None):
-        # `location` is accepted for input forward-compat (event venue, e.g.
-        # "Denver, Colorado, USA"). Altitude features are NOT wired yet, so it is
-        # intentionally unused here — the model is byte-for-byte unchanged.
-        _ = location
         if self.model is None:
             raise RuntimeError("Model is not trained.")
         a_key = fuzzy_find(fighter_a, self.fighter_history) or fighter_a
@@ -7526,6 +7666,19 @@ class UFCSuperModelPipeline:
             ))
         if self.style_tracker is not None:
             matchup.update(self.style_tracker.matchup_features(a_key, b_key))
+        # Altitude features: venue altitude (median fallback for blank/unknown
+        # location) + each fighter's latest known training-camp elevation (median
+        # fallback when the camp is unrecorded), for the acclimatization signals.
+        _event_alt = (self.location_altitude.get(location, self.alt_median)
+                      if location else self.alt_median)
+        _rt = self.fighter_train_alt.get(a_key)
+        _bt = self.fighter_train_alt.get(b_key)
+        _known = 1.0 if (_rt is not None and _bt is not None) else 0.0
+        matchup.update(_altitude_feature_row(
+            _event_alt,
+            _rt if _rt is not None else self.train_alt_median,
+            _bt if _bt is not None else self.train_alt_median,
+            _known))
         matchup_df = _augment_matchup_features(pd.DataFrame([matchup]))
         p_a_model = float(self.model.predict_proba_single(matchup_df.iloc[0].to_dict()))
         # Optional odds blend (inference only). market is None unless valid odds were
@@ -7835,7 +7988,14 @@ class SuperModelGUI:
                 preds = []
                 skipped_debut = 0
                 for line in [ln.strip() for ln in text.splitlines() if ln.strip()]:
-                    parts = [p.strip() for p in line.split(",") if p.strip()]
+                    # csv.reader respects quotes, so a quoted "Baku, Azerbaijan"
+                    # parses as one field; unquoted still works because location
+                    # is last and the trailing parts are re-joined below.
+                    try:
+                        raw = next(csv.reader([line]))
+                    except Exception:
+                        raw = line.split(",")
+                    parts = [p.strip() for p in raw if p.strip()]
                     if len(parts) < 2:
                         continue
                     # Layout: red,[red_odds],blue,[blue_odds],weight,gender,rounds,location

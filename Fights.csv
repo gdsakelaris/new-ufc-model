@@ -272,14 +272,17 @@ Leon Shahbazyan,Levan Chokheli,Welterweight,Men,3
 Shane Collins,Otari Tanzilovi,Featherweight,Men,3
 
 red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,location
-Rafael Fiziev,-111,Manuel Torres,-105,Lightweight,Men,5
-Shara Magomedov,-346,Michel Pereira,+281,Middleweight,Men,3
-Nazim Sadykhov,-246,Matheus Camilo,+205,Lightweight,Men,3
-Asu Almabayev,-229,Charles Johnson,+192,Flyweight,Men,3
-Ikram Aliskerov,-304,Brunno Ferreira,+250,Middleweight,Men,3
-Abus Magomedov,-136,Michal Oleksiejczuk,+117,Middleweight,Men,3
-Abdul Rakhman Yakhyaev,-525,Julius Walker,+404,Light Heavyweight,Men,3
-Nursulton Ruziboev,-217,Andrey Pulyaev,+183,Middleweight,Men,3
-Kaan Ofli,+143,Javier Reyes,-168,Featherweight,Men,3
-Bekzat Almakhan,+134,Jean Matsumoto,-157,Bantamweight,Men,3
+
+Rafael Fiziev,-117,Manuel Torres,+100,Lightweight,Men,5,"Baku, Azerbaijan"
+Shara Magomedov,-346,Michel Pereira,+281,Middleweight,Men,3,"Baku, Azerbaijan"
+Nazim Sadykhov,-238,Matheus Camilo,+199,Lightweight,Men,3,"Baku, Azerbaijan"
+Asu Almabayev,-236,Charles Johnson,+198,Flyweight,Men,3,"Baku, Azerbaijan"
+Ikram Aliskerov,-304,Brunno Ferreira,+250,Middleweight,Men,3,"Baku, Azerbaijan"
+Abus Magomedov,-133,Michal Oleksiejczuk,+114,Middleweight,Men,3,"Baku, Azerbaijan"
+Abdul Rakhman Yakhyaev,-525,Julius Walker,+404,Light Heavyweight,Men,3,"Baku, Azerbaijan"
+Nursulton Ruziboev,-217,Andrey Pulyaev,+183,Middleweight,Men,3,"Baku, Azerbaijan"
+Kaan Ofli,+143,Javier Reyes,-168,Featherweight,Men,3,"Baku, Azerbaijan"
+Bekzat Almakhan,+138,Jean Matsumoto,-162,Bantamweight,Men,3,"Baku, Azerbaijan"
+
+
 
