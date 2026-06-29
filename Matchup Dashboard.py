@@ -32,7 +32,7 @@ class MatchupDashboard:
         self.root.configure(bg=self.BG)
 
         if data_file is None:
-            data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pure_fight_data.csv")
+            data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pure_fight_data_with_event_and_camp_altitudes.csv")
 
         self.df = self._load_data(data_file)
         self.fighter_logs = self._build_fighter_logs(self.df)

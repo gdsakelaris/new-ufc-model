@@ -5362,7 +5362,7 @@ class UFCSuperModelPipeline:
                 }
         self.fighter_meta = meta
 
-    def train(self):
+    def train(self, winner_only=False):
         self._section("Data Build")
         self._log("Building chronological leak-safe training matrix...")
         (X, y, fighter_history, glicko_ratings, opp_glicko_list, style_tracker,
@@ -6165,6 +6165,17 @@ class UFCSuperModelPipeline:
         dev_meta_valid = oof.loc[valid, model_order].astype(float)
         dev_probs_raw = _combine_probs(dev_meta_valid, combiner)
         y_true_red = y_test.astype(int).values
+        # Expose the aligned holdout (true outcome, calibrated P(red) fed to picks)
+        # so external calibration audits read it without re-deriving the split.
+        # Inert: set on every path, used by nothing in the model itself.
+        self.holdout_y_true = y_true_red
+        self.holdout_prob_cal = np.asarray(test_probs_cal, dtype=float)
+        self.holdout_threshold = float(decision_threshold)
+
+        if winner_only:
+            # Winner-only callers (e.g. the calibration audit) need just the
+            # holdout stashed above; skip the expensive method stage below.
+            return
 
         # Method diagnostics/training (winner-model OOF conditioned, 2-stage).
         method_key_extra = "|".join([
@@ -7811,6 +7822,12 @@ class UFCSuperModelPipeline:
         )
         predicted_method = max(METHOD_LABELS, key=lambda m: method_probs[m])
 
+        # Betting value on the RAW model prob (independent of the odds-blended pick
+        # above). All None when odds are missing/unparseable for this matchup.
+        value_side, value_ev, value_stake = _value_metrics(
+            p_a_model, a_key, b_key, red_odds, blue_odds
+        )
+
         return {
             "name_a": a_key,
             "name_b": b_key,
@@ -7833,6 +7850,9 @@ class UFCSuperModelPipeline:
             "ko_tko_pct": method_probs["KO/TKO"],
             "submission_pct": method_probs["Submission"],
             "method_pct": method_probs[predicted_method],
+            "value_side": value_side,
+            "value_ev": value_ev,
+            "value_stake": value_stake,
         }
 
     def is_debutant(self, fighter_name):
@@ -7882,6 +7902,15 @@ def _auto_width(ws):
 # ─────────────────────────────────────────────────────────────────────────────
 ODDS_BLEND_WEIGHT = 0.50  # weight on the MODEL vs the market in [0,1]; 0.50 = equal trust (logit geometric mean)
 
+# ─── Betting value (inference only) ──────────────────────────────────────────
+# Value is computed on the RAW model probability, orthogonally to the odds blend
+# above: edge is measured vs the de-vigged (fair) market, while EV/Kelly use the
+# actual offered (vigged) odds. So a fight can show one Blended Model pick and a
+# different Value Pick — that is intended, not a bug.
+KELLY_FRACTION = 0.25     # fraction of full Kelly to stake; the one conservatism dial
+MIN_EV_TO_FLAG = 0.02     # below +2% EV → "No bet" (filters vig-noise)
+MAX_STAKE_CAP  = 0.05     # hard ceiling on recommended bankroll fraction
+
 
 def _looks_like_odds(tok):
     """True if a pasted field looks like an American moneyline (e.g. -150, +105)."""
@@ -7907,6 +7936,23 @@ def _american_odds_to_prob(odds):
     return None
 
 
+def _american_to_decimal(odds):
+    """American moneyline -> decimal odds (total payout per $1 incl. stake).
+
+    Payout twin of `_american_odds_to_prob`; mirrors its sign handling. None if
+    unparseable.
+    """
+    try:
+        o = float(str(odds).strip())
+    except (TypeError, ValueError):
+        return None
+    if o < 0:
+        return 100.0 / (-o) + 1.0
+    if o > 0:
+        return o / 100.0 + 1.0
+    return None
+
+
 def _devig_two_way(red_odds, blue_odds):
     """De-vigged market probabilities (P_red, P_blue). None if either side is bad."""
     pr = _american_odds_to_prob(red_odds)
@@ -7928,6 +7974,37 @@ def _logit_blend(p_model, p_market, w):
     return float(1.0 / (1.0 + np.exp(-L)))
 
 
+def _value_metrics(p_model_a, name_a, name_b, red_odds, blue_odds):
+    """Betting value for a two-way moneyline, computed on the RAW model prob.
+
+    Returns (value_side, value_ev, value_stake) for the +EV bet, or (None, None,
+    None) when no side clears MIN_EV_TO_FLAG or the odds are unparseable.
+
+    Edge is measured against the de-vigged (fair) market; EV and Kelly use the
+    actual offered (vigged) decimal odds. Stake is KELLY_FRACTION of full Kelly,
+    clipped at 0 and capped at MAX_STAKE_CAP. In a two-way market at most one side
+    has a positive edge, and EV>0 implies edge>0, so the +edge side is the only
+    bet candidate.
+    """
+    market = _devig_two_way(red_odds, blue_odds)
+    d_a = _american_to_decimal(red_odds)
+    d_b = _american_to_decimal(blue_odds)
+    if market is None or d_a is None or d_b is None:
+        return None, None, None
+    q_a, q_b = market
+    for name, p, q, d in ((name_a, p_model_a, q_a, d_a),
+                          (name_b, 1.0 - p_model_a, q_b, d_b)):
+        if p - q <= 0:
+            continue  # never the value side; its mirror holds any positive edge
+        ev = p * d - 1.0
+        if ev < MIN_EV_TO_FLAG:
+            return None, None, None  # +edge but EV doesn't clear the bar
+        kelly = max(0.0, (p * d - 1.0) / (d - 1.0))
+        stake = min(MAX_STAKE_CAP, KELLY_FRACTION * kelly)
+        return name, ev, stake
+    return None, None, None
+
+
 def export_to_excel(path, predictions, rankings):
     wb = Workbook()
     hdr_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
@@ -7939,16 +8016,17 @@ def export_to_excel(path, predictions, rankings):
     ws = wb.active
     ws.title = "Predictions"
     has_odds = any(p.get("odds_blended") for p in predictions)
-    # With odds: odds interleave next to each corner and the model's pre-blend pick
-    # sits beside the blended Final Pick. Without odds: the original 10-col layout,
-    # byte-for-byte unchanged.
+    # With odds: odds interleave next to each corner, the Raw Model (pre-blend)
+    # pick sits beside the Blended Model pick, and the value columns follow.
+    # Without odds: the original 10-col layout, byte-for-byte unchanged.
     if has_odds:
         headers = [
             "Red Corner", "Red Odds", "Blue Corner", "Blue Odds", "Weight Class",
-            "Model Pick", "Model %", "Final Pick", "Win %",
+            "Raw Model", "Model %", "Blended Model", "Win %",
+            "Value Pick", "EV %", "Stake %",
             "Method", "Method %", "DEC %", "(T)KO %", "SUB %",
         ]
-        pct_cols = {7, 9, 11, 12, 13, 14}
+        pct_cols = {7, 9, 11, 12, 14, 15, 16, 17}
     else:
         headers = [
             "Red Corner", "Blue Corner", "Weight Class", "Winner", "Win %",
@@ -7972,11 +8050,20 @@ def export_to_excel(path, predictions, rankings):
                 model_winner = p["name_a"] if (pam is not None and pam >= 0.5) else p["name_b"]
                 model_pct = (pam if model_winner == p["name_a"] else 1.0 - pam) if pam is not None else None
                 red_odds, blue_odds = p.get("red_odds") or "", p.get("blue_odds") or ""
+                value_pick = p.get("value_side") or "No bet"
+                value_ev = p.get("value_ev")
+                value_stake = p.get("value_stake")
             else:
-                model_winner, model_pct, red_odds, blue_odds = "", None, "", ""
+                # No odds for this fight: the raw model IS the blended model, so
+                # show the same pick under both columns instead of blanking Raw
+                # Model. Value needs odds, so those three cells stay empty.
+                model_winner, model_pct = winner, win_pct
+                red_odds, blue_odds = "", ""
+                value_pick, value_ev, value_stake = "", None, None
             row = [
                 p["name_a"], red_odds, p["name_b"], blue_odds, p.get("weight_class", ""),
                 model_winner, model_pct, winner, win_pct,
+                value_pick, value_ev, value_stake,
                 pred_method, method_probs[pred_method],
                 method_probs["Decision"], method_probs["KO/TKO"], method_probs["Submission"],
             ]
