@@ -492,9 +492,16 @@ def _clip_probs(p):
 
 
 def _cache_data_fingerprint(path):
+    # Hash the file CONTENTS (not mtime/size) so the cache invalidates iff the
+    # data actually changed: a no-op re-save won't force an expensive rebuild, and
+    # an mtime-preserving rewrite can't silently serve a stale model. Cost is a few
+    # ms on this CSV; chunked so it stays memory-safe if the file grows.
     try:
-        st = os.stat(path)
-        raw = f"{os.path.abspath(path)}|{st.st_size}|{int(st.st_mtime)}"
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        raw = f"{os.path.abspath(path)}|{h.hexdigest()}"
     except Exception:
         raw = f"{os.path.abspath(path)}|missing"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -6171,6 +6178,16 @@ class UFCSuperModelPipeline:
         self.holdout_y_true = y_true_red
         self.holdout_prob_cal = np.asarray(test_probs_cal, dtype=float)
         self.holdout_threshold = float(decision_threshold)
+        # Per-fight data-sufficiency, aligned with the holdout above, so audits can
+        # segment calibration by experience. Pulled from the full (pre-selection,
+        # median-imputed) feature frame; any absent column degrades to NaN.
+        def _hcol(_name):
+            return (X_test_full[_name].to_numpy(dtype=float)
+                    if _name in X_test_full.columns
+                    else np.full(len(y_true_red), np.nan, dtype=float))
+        self.holdout_min_fights = _hcol("min_num_fights")
+        self.holdout_max_fights = _hcol("max_num_fights")
+        self.holdout_avg_glicko_conf = _hcol("avg_glicko_confidence")
 
         if winner_only:
             # Winner-only callers (e.g. the calibration audit) need just the

@@ -39,6 +39,7 @@ HERE = r"c:\Users\gdsak\OneDrive\Desktop\Glicko-2, Etc"
 MODEL_PATH = os.path.join(HERE, "UFC_Model.py")
 PNG_OUT = os.path.join(HERE, "_audit_calibration.png")
 N_BINS = 10
+SPARSE_FIGHTS_LT = 4   # "sparse" fighter = fewer than this many prior fights (0..3)
 
 # ── thresholds for the heuristic verdict (NOT gospel; calibration is graded on a
 #    spectrum and this holdout is noisy). Roughly: the model's own logs treat ECE
@@ -134,6 +135,68 @@ def _slope_intercept(y, p):
     lr = LogisticRegression(C=1e6, solver="lbfgs", max_iter=1000)
     lr.fit(z, np.asarray(y, dtype=int))
     return float(lr.coef_[0][0]), float(lr.intercept_[0])
+
+
+def _bucket_stats(y, p):
+    """Compact calibration summary on a subset (per-bin tables are too sparse for
+    the small experience buckets, so report whole-subset numbers + an accuracy CI)."""
+    y = np.asarray(y, dtype=float); p = np.asarray(p, dtype=float)
+    n = len(y)
+    if n == 0:
+        return None
+    pick = p >= 0.5
+    conf = np.where(pick, p, 1.0 - p)
+    hit = (y == pick.astype(int)).astype(int)
+    k = int(hit.sum())
+    acc = k / n
+    cl, ch = _wilson(k, n)
+    ece, _ = _ece(y, p)
+    brier = float(np.mean((p - y) ** 2))
+    mean_conf = float(conf.mean())
+    return dict(n=n, acc=acc, acc_lo=cl, acc_hi=ch, mean_conf=mean_conf,
+                over=mean_conf - acc, ece=ece, brier=brier)
+
+
+def _experience_section(y, p_red, pipe, n):
+    """[3] Is the model overconfident specifically on thin-data fights?"""
+    min_f = np.asarray(getattr(pipe, "holdout_min_fights", np.full(n, np.nan)), float)
+    max_f = np.asarray(getattr(pipe, "holdout_max_fights", np.full(n, np.nan)), float)
+    avg_gc = np.asarray(getattr(pipe, "holdout_avg_glicko_conf", np.full(n, np.nan)), float)
+    print("\n" + "=" * 78)
+    print(f"[3] CALIBRATION BY EXPERIENCE  (sparse = < {SPARSE_FIGHTS_LT} prior fights)")
+    print("=" * 78)
+    if np.all(np.isnan(min_f)) or np.all(np.isnan(max_f)):
+        print("  (min/max_num_fights not exposed -- rerun after the UFC_Model.py edit.)")
+        return
+    both_vet = min_f >= SPARSE_FIGHTS_LT
+    both_sparse = max_f < SPARSE_FIGHTS_LT
+    one_sparse = (~both_vet) & (~both_sparse)
+    buckets = [("both veteran", both_vet), ("one sparse", one_sparse),
+               ("both sparse", both_sparse)]
+    print(f"  {'bucket':<14}{'n':>5}{'acc':>9}{'95% CI':>15}"
+          f"{'shown':>9}{'over':>9}{'ECE':>8}{'Brier':>8}  flag")
+    print("  " + "-" * 74)
+    for label, mask in buckets:
+        s = _bucket_stats(y[mask], p_red[mask])
+        if s is None:
+            print(f"  {label:<14}{0:>5}        --")
+            continue
+        sig = "OVERCONF" if s["mean_conf"] > s["acc_hi"] else ""
+        ci = f"[{s['acc_lo']*100:4.1f},{s['acc_hi']*100:4.1f}]"
+        print(f"  {label:<14}{s['n']:>5}{s['acc']*100:>8.1f}%{ci:>15}"
+              f"{s['mean_conf']*100:>8.1f}%{s['over']*100:>+8.1f}%"
+              f"{s['ece']:>8.3f}{s['brier']:>8.3f}  {sig}")
+    print("  " + "-" * 74)
+    if not np.all(np.isnan(avg_gc)):
+        print("  mean avg_glicko_confidence: " + ", ".join(
+            f"{lab}={np.nanmean(avg_gc[m]):.2f}" if m.any() else f"{lab}=--"
+            for lab, m in buckets))
+    print("\n  READ: 'over' = mean shown confidence - actual accuracy (positive =")
+    print("  overconfident). OVERCONF means shown confidence exceeds the UPPER 95%")
+    print("  bound of accuracy, so the gap survives the bucket's sample size. Tiny n")
+    print("  (esp. 'both sparse') is usually too few to call -- weight by n and CI,")
+    print("  not the point gap. If only thin buckets are overconfident, the shrinkage")
+    print("  isn't reaching far enough and a data-sufficiency fix is justified.")
 
 
 def _save_plot(corner_rows, conf_rows):
@@ -252,6 +315,8 @@ def main():
     print("  CIs above). The verdict leans on ECE + slope/intercept, which pool")
     print("  the whole set. A bin flagged MISS whose CI still spans the diagonal")
     print("  is sampling noise, not a real calibration defect.")
+
+    _experience_section(y, p_red, pipe, n)
 
     _save_plot(corner_rows, conf_rows)
 
