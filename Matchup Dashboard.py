@@ -14,6 +14,44 @@ except Exception:
     HAS_OPENPYXL = False
 
 
+def _looks_like_odds(tok):
+    """True if a field looks like an American moneyline (e.g. -106, +317)."""
+    s = str(tok).strip()
+    if not s:
+        return False
+    core = s[1:] if s[0] in "+-" else s
+    if not core.isdigit():
+        return False
+    return s[0] in "+-" or abs(int(s)) >= 100
+
+
+_HEADER_FIRST_FIELDS = {"red_fighter", "red corner", "fighter a", "fighter_a", "red"}
+
+
+def parse_fight_line(parts):
+    """Extract (red_name, blue_name) from a comma-split line, keeping ONLY the two
+    fighters. Supports the odds format
+
+        red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
+
+    (fighters in fields 0 and 2, odds between them) and the legacy
+    'Fighter A,Fighter B[,...]' forms. Returns None for a header or malformed line.
+    """
+    parts = [p.strip() for p in parts]
+    if not parts or parts[0].lower() in _HEADER_FIRST_FIELDS:
+        return None
+    odds_layout = len(parts) >= 3 and (
+        _looks_like_odds(parts[1]) or (len(parts) >= 4 and _looks_like_odds(parts[3]))
+    )
+    if odds_layout:
+        red, blue = parts[0], parts[2]
+    elif len(parts) >= 2:
+        red, blue = parts[0], parts[1]
+    else:
+        return None
+    return (red, blue) if red and blue else None
+
+
 class MatchupDashboard:
     BG = "#0A0A0A"
     BG_HEADER = "#111111"
@@ -234,7 +272,7 @@ class MatchupDashboard:
         header.pack(fill="x")
         tk.Label(header, text="UFC", font=("Helvetica", 34, "bold"), bg=self.BG_HEADER, fg=self.ACCENT).pack()
         tk.Label(header, text="MATCHUP DASHBOARD", font=("Helvetica", 11, "bold"), bg=self.BG_HEADER, fg=self.FG).pack()
-        tk.Label(header, text="Leak-safe manual stat reconstruction from pure_fight_data.csv", font=("Helvetica", 9, "italic"), bg=self.BG_HEADER, fg=self.MUTED).pack(pady=(2, 0))
+        tk.Label(header, text="Leak-safe manual stat reconstruction from pure_fight_data_with_event_and_camp_altitudes.csv", font=("Helvetica", 9, "italic"), bg=self.BG_HEADER, fg=self.MUTED).pack(pady=(2, 0))
 
         main = tk.Frame(self.root, bg=self.BG, padx=18, pady=12)
         main.pack(fill="both", expand=True)
@@ -271,7 +309,7 @@ class MatchupDashboard:
         right = tk.Frame(mid, bg=self.BG_CARD, highlightthickness=1, highlightbackground=self.CYAN)
         right.pack(side="left", fill="both", expand=True, padx=(8, 0))
         tk.Label(right, text="Batch Input", bg=self.BG_CARD, fg=self.CYAN, font=("Helvetica", 11, "bold")).pack(anchor="w", padx=10, pady=(8, 4))
-        tk.Label(right, text="One per line: Fighter A,Fighter B[,WeightClass,Gender,Rounds]", bg=self.BG_CARD, fg=self.MUTED, font=("Helvetica", 9)).pack(anchor="w", padx=10)
+        tk.Label(right, text="One per line (only names used): red,odds,blue,odds,wc,gender,rounds,elev  or  Fighter A,Fighter B", bg=self.BG_CARD, fg=self.MUTED, font=("Helvetica", 9)).pack(anchor="w", padx=10)
         self.bulk_text = tk.Text(right, bg=self.BG_INPUT, fg=self.FG, insertbackground=self.FG, font=("Consolas", 10), relief="flat")
         self.bulk_text.pack(fill="both", expand=True, padx=10, pady=(8, 8))
         bar = tk.Frame(right, bg=self.BG_CARD)
@@ -328,11 +366,11 @@ class MatchupDashboard:
             return
         added, skipped = 0, 0
         for line in [ln.strip() for ln in txt.splitlines() if ln.strip()]:
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 2:
+            parsed = parse_fight_line(line.split(","))
+            if not parsed:
                 skipped += 1
                 continue
-            red, blue = parts[0], parts[1]
+            red, blue = parsed
             if red == blue or red not in self.fighter_logs or blue not in self.fighter_logs:
                 skipped += 1
                 continue

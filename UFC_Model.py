@@ -7927,6 +7927,10 @@ ODDS_BLEND_WEIGHT = 0.50  # weight on the MODEL vs the market in [0,1]; 0.50 = e
 KELLY_FRACTION = 0.25     # fraction of full Kelly to stake; the one conservatism dial
 MIN_EV_TO_FLAG = 0.02     # below +2% EV → "No bet" (filters vig-noise)
 MAX_STAKE_CAP  = 0.05     # hard ceiling on recommended bankroll fraction
+VALUE_SHARPEN  = 1.25     # >1 sharpens the prob used for VALUE ONLY (not the pick):
+                          # corrects the model's stable ~1.26x under-confidence (see
+                          # _audit_recalibration.py) so underdog edges aren't
+                          # systematically overstated. 1.0 = off.
 
 
 def _looks_like_odds(tok):
@@ -7991,23 +7995,39 @@ def _logit_blend(p_model, p_market, w):
     return float(1.0 / (1.0 + np.exp(-L)))
 
 
+def _sharpen_prob(p, s):
+    """Push a probability away from 0.5 by scaling its logit by s (s>1 sharpens,
+    s=1 is a no-op). Symmetric: _sharpen_prob(1-p, s) == 1 - _sharpen_prob(p, s)."""
+    if s == 1.0:
+        return float(p)
+    eps = 1e-6
+    pc = min(max(float(p), eps), 1.0 - eps)
+    return float(1.0 / (1.0 + np.exp(-s * np.log(pc / (1.0 - pc)))))
+
+
 def _value_metrics(p_model_a, name_a, name_b, red_odds, blue_odds):
     """Betting value for a two-way moneyline, computed on the RAW model prob.
 
     Returns (value_side, value_ev, value_stake) for the +EV bet, or (None, None,
     None) when no side clears MIN_EV_TO_FLAG or the odds are unparseable.
 
-    Edge is measured against the de-vigged (fair) market; EV and Kelly use the
-    actual offered (vigged) decimal odds. Stake is KELLY_FRACTION of full Kelly,
-    clipped at 0 and capped at MAX_STAKE_CAP. In a two-way market at most one side
-    has a positive edge, and EV>0 implies edge>0, so the +edge side is the only
-    bet candidate.
+    The prob is first sharpened by VALUE_SHARPEN to undo the model's mild
+    under-confidence (VALUE only — the displayed pick is untouched). Edge is
+    measured against the de-vigged (fair) market; EV and Kelly use the actual
+    offered (vigged) decimal odds. Stake is KELLY_FRACTION of full Kelly, clipped
+    at 0 and capped at MAX_STAKE_CAP. In a two-way market at most one side has a
+    positive edge, and EV>0 implies edge>0, so the +edge side is the only bet
+    candidate.
     """
     market = _devig_two_way(red_odds, blue_odds)
     d_a = _american_to_decimal(red_odds)
     d_b = _american_to_decimal(blue_odds)
     if market is None or d_a is None or d_b is None:
         return None, None, None
+    # De-bias under-confidence for the value calc only. Sharpening is symmetric, so
+    # sharpening p_a also correctly sharpens side B (1 - p_a) — pulling underdog
+    # probs down (smaller, truer edges) and favorite probs up.
+    p_model_a = _sharpen_prob(p_model_a, VALUE_SHARPEN)
     q_a, q_b = market
     for name, p, q, d in ((name_a, p_model_a, q_a, d_a),
                           (name_b, 1.0 - p_model_a, q_b, d_b)):
@@ -8034,16 +8054,17 @@ def export_to_excel(path, predictions, rankings):
     ws.title = "Predictions"
     has_odds = any(p.get("odds_blended") for p in predictions)
     # With odds: odds interleave next to each corner, the Raw Model (pre-blend)
-    # pick sits beside the Blended Model pick, and the value columns follow.
-    # Without odds: the original 10-col layout, byte-for-byte unchanged.
+    # pick sits beside the Blended Model pick, then the method block, and the
+    # value columns trail at the end. Without odds: the original 10-col layout,
+    # byte-for-byte unchanged.
     if has_odds:
         headers = [
             "Red Corner", "Red Odds", "Blue Corner", "Blue Odds", "Weight Class",
             "Raw Model", "Model %", "Blended Model", "Win %",
-            "Value Pick", "EV %", "Stake %",
             "Method", "Method %", "DEC %", "(T)KO %", "SUB %",
+            "Value Pick", "EV %", "Stake %",
         ]
-        pct_cols = {7, 9, 11, 12, 14, 15, 16, 17}
+        pct_cols = {7, 9, 11, 12, 13, 14, 16, 17}
     else:
         headers = [
             "Red Corner", "Blue Corner", "Weight Class", "Winner", "Win %",
@@ -8080,9 +8101,9 @@ def export_to_excel(path, predictions, rankings):
             row = [
                 p["name_a"], red_odds, p["name_b"], blue_odds, p.get("weight_class", ""),
                 model_winner, model_pct, winner, win_pct,
-                value_pick, value_ev, value_stake,
                 pred_method, method_probs[pred_method],
                 method_probs["Decision"], method_probs["KO/TKO"], method_probs["Submission"],
+                value_pick, value_ev, value_stake,
             ]
         else:
             row = [

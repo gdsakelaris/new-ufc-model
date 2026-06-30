@@ -1,11 +1,13 @@
 """
 Standalone Glicko-2 rating system for UFC fighters.
 
-Processes all historical fights from pure_fight_data.csv chronologically,
-then predicts win probabilities for new matchups via a tkinter GUI.
-Exports predictions and per-weight-class top 25 rankings to Excel.
+Processes all historical fights from
+pure_fight_data_with_event_and_camp_altitudes.csv chronologically, then predicts
+win probabilities for new matchups via a tkinter GUI. Exports predictions and
+per-weight-class top 25 rankings to Excel.
 
-Matchup input formats (one per line):
+Matchup input formats (one per line; only the two fighter names are used):
+  red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
   Fighter A,Fighter B,Weight Class,Gender,Rounds
   Fighter A,Fighter B
 """
@@ -303,6 +305,57 @@ def format_method_pcts(method_stats, name):
             f"Dec {dec / total * 100:.0f}%")
 
 
+def format_method_records(method_stats, name):
+    """Per-method win-loss records as a (KO/TKO, Submission, Decision) tuple of
+    'W-L' strings, e.g. ('8-2', '0-2', '2-0')."""
+    s = method_stats.get(name, {})
+    return (
+        f"{s.get('ko_w', 0)}-{s.get('ko_l', 0)}",
+        f"{s.get('sub_w', 0)}-{s.get('sub_l', 0)}",
+        f"{s.get('dec_w', 0)}-{s.get('dec_l', 0)}",
+    )
+
+
+# ─── Matchup input parsing ────────────────────────────────────────────────────
+
+def _looks_like_odds(tok):
+    """True if a field looks like an American moneyline (e.g. -106, +317)."""
+    s = str(tok).strip()
+    if not s:
+        return False
+    core = s[1:] if s[0] in "+-" else s
+    if not core.isdigit():
+        return False
+    return s[0] in "+-" or abs(int(s)) >= 100
+
+
+_HEADER_FIRST_FIELDS = {"red_fighter", "red corner", "fighter a", "fighter_a", "red"}
+
+
+def parse_fight_line(parts):
+    """Extract (red_name, blue_name) from a comma-split line, keeping ONLY the two
+    fighters. Supports the odds format
+
+        red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
+
+    (fighters in fields 0 and 2, odds between them) and the legacy
+    'Fighter A,Fighter B[,...]' forms. Returns None for a header or malformed line.
+    """
+    parts = [p.strip() for p in parts]
+    if not parts or parts[0].lower() in _HEADER_FIRST_FIELDS:
+        return None
+    odds_layout = len(parts) >= 3 and (
+        _looks_like_odds(parts[1]) or (len(parts) >= 4 and _looks_like_odds(parts[3]))
+    )
+    if odds_layout:
+        red, blue = parts[0], parts[2]
+    elif len(parts) >= 2:
+        red, blue = parts[0], parts[1]
+    else:
+        return None
+    return (red, blue) if red and blue else None
+
+
 # ─── Excel export ────────────────────────────────────────────────────────────
 
 def _auto_width(ws):
@@ -328,19 +381,46 @@ def export_to_excel(output_path, predictions, ratings, records,
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     pct_fmt = "0.0%"
 
+    # Corner highlight palette: red-corner columns are filled red, blue-corner
+    # columns blue (solid header + light body tint); neutral columns stay grey.
+    red_header_fill = PatternFill(start_color="E94560", end_color="E94560", fill_type="solid")
+    blue_header_fill = PatternFill(start_color="3B82F6", end_color="3B82F6", fill_type="solid")
+    red_cell_fill = PatternFill(start_color="FBDDE2", end_color="FBDDE2", fill_type="solid")
+    blue_cell_fill = PatternFill(start_color="DCE7FF", end_color="DCE7FF", fill_type="solid")
+    corner_header_font = Font(bold=True, size=11, color="FFFFFF")
+
+    def _corner_of(hdr):
+        if hdr.startswith("Red"):
+            return "red"
+        if hdr.startswith("Blue"):
+            return "blue"
+        return None
+
     # ── Sheet 1: Predictions ─────────────────────────────────────────────────
     ws = wb.active
     ws.title = "Predictions"
 
-    headers = ["Fighter A", "Fighter B", "Rating A", "Rating B",
-               "Record A", "Record B", "A Win Methods", "B Win Methods",
-               "Fighter A %", "Fighter B %",
+    headers = ["Red Fighter", "Blue Fighter",
+               "Red Record", "Blue Record",
+               "Red (T)KO", "Blue (T)KO",
+               "Red SUB", "Blue SUB",
+               "Red DEC", "Blue DEC",
+               "Red Rating", "Blue Rating",
                "Predicted Winner", "Win %"]
+    col_corner = [_corner_of(h) for h in headers]
 
     for col_idx, hdr in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_idx, value=hdr)
-        cell.fill = header_fill
-        cell.font = header_font
+        corner = col_corner[col_idx - 1]
+        if corner == "red":
+            cell.fill = red_header_fill
+            cell.font = corner_header_font
+        elif corner == "blue":
+            cell.fill = blue_header_fill
+            cell.font = corner_header_font
+        else:
+            cell.fill = header_fill
+            cell.font = header_font
         cell.alignment = header_align
         cell.border = border
 
@@ -348,12 +428,16 @@ def export_to_excel(output_path, predictions, ratings, records,
         winner = pred["name_a"] if pred["prob_a"] >= pred["prob_b"] else pred["name_b"]
         win_pct = max(pred["prob_a"], pred["prob_b"])
 
+        red_ko, red_sub, red_dec = format_method_records(method_stats, pred["name_a"])
+        blue_ko, blue_sub, blue_dec = format_method_records(method_stats, pred["name_b"])
+
         row_data = [
             pred["name_a"], pred["name_b"],
-            round(pred["rating_a"]), round(pred["rating_b"]),
             pred["rec_a"], pred["rec_b"],
-            pred.get("methods_a", ""), pred.get("methods_b", ""),
-            pred["prob_a"], pred["prob_b"],
+            red_ko, blue_ko,
+            red_sub, blue_sub,
+            red_dec, blue_dec,
+            round(pred["rating_a"]), round(pred["rating_b"]),
             winner, win_pct,
         ]
 
@@ -361,7 +445,12 @@ def export_to_excel(output_path, predictions, ratings, records,
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
             cell.alignment = Alignment(horizontal="left", vertical="center")
             cell.border = border
-            if col_idx in (9, 10, 12):
+            corner = col_corner[col_idx - 1]
+            if corner == "red":
+                cell.fill = red_cell_fill
+            elif corner == "blue":
+                cell.fill = blue_cell_fill
+            if col_idx == len(row_data):
                 cell.number_format = pct_fmt
 
     _auto_width(ws)
@@ -472,7 +561,8 @@ class Glicko2GUI:
         # Input label
         tk.Label(
             main,
-            text="Enter fights (one per line: Fighter A, Fighter B)",
+            text="Enter fights — one per line, only names used (odds format ok):  "
+                 "RedFighter,odds,BlueFighter,…  or  Fighter A,Fighter B",
             bg=BG,
             fg=MUTED,
             font=("Helvetica", 9, "italic"),
@@ -563,7 +653,7 @@ class Glicko2GUI:
 
     def _load_ratings(self):
         def _do():
-            data_path = os.path.join(SCRIPT_DIR, "pure_fight_data.csv")
+            data_path = os.path.join(SCRIPT_DIR, "pure_fight_data_with_event_and_camp_altitudes.csv")
             if not os.path.exists(data_path):
                 self.status_var.set(f"Error: {data_path} not found")
                 return
@@ -585,15 +675,10 @@ class Glicko2GUI:
             return
         self.fight_input.delete("1.0", tk.END)
         with open(fights_path, newline="", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            next(reader, None)
-            for row in reader:
-                if not row or not row[0].strip():
-                    continue
-                a = row[0].strip()
-                b = row[1].strip() if len(row) > 1 else ""
-                if a and b:
-                    self.fight_input.insert(tk.END, f"{a},{b}\n")
+            for row in csv.reader(f):
+                parsed = parse_fight_line(row)
+                if parsed:
+                    self.fight_input.insert(tk.END, f"{parsed[0]},{parsed[1]}\n")
 
     def _clear(self):
         self.fight_input.delete("1.0", tk.END)
@@ -618,10 +703,10 @@ class Glicko2GUI:
         predictions = []
 
         for line in lines:
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 2:
+            parsed = parse_fight_line(line.split(","))
+            if not parsed:
                 continue
-            a_name, b_name = parts[0], parts[1]
+            a_name, b_name = parsed
 
             a_key = fuzzy_find(a_name, self.ratings)
             b_key = fuzzy_find(b_name, self.ratings)
