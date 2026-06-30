@@ -725,6 +725,31 @@ def _normalize_method_probs(prob_map):
     return {k: float(v) for k, v in zip(METHOD_LABELS, vals)}
 
 
+def _history_prior_row(d_dec, d_ko, d_sub):
+    """Method history prior from oriented (winner-loser) win-method differentials.
+
+    SINGLE SOURCE OF TRUTH for this prior, called identically at training,
+    holdout evaluation, AND inference. `d_dec`/`d_ko`/`d_sub` are the oriented
+    `d_*_win_pct` features (predicted-winner's method share minus the predicted
+    loser's). Previously inference computed this term from per-fighter win/loss
+    profiles instead — a different recipe with different denominators — so the
+    `w_hist` weight (tuned against THIS recipe) was applied to a different prior
+    in production. Routing all three call sites through this function removes that
+    train/serve skew.
+    """
+    def _f(v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return 0.0
+        return 0.0 if math.isnan(v) else v
+    return _normalize_method_probs({
+        "Decision":   0.50 + 0.35 * _f(d_dec),
+        "KO/TKO":     0.32 + 0.35 * _f(d_ko),
+        "Submission": 0.18 + 0.35 * _f(d_sub),
+    })
+
+
 # Method-probability shaping helpers: logit-space bias application and submission signal boost.
 # Called during tuning (blending loop) and inference (predict_method_probs).
 def _apply_method_logit_bias_arr(probs_arr, bias_vec):
@@ -808,29 +833,6 @@ def _sub_attempt_prior_array(X_df):
     arr = np.clip(arr, MIN_METHOD_PROB, 1.0)
     arr = arr / np.sum(arr, axis=1, keepdims=True)
     return arr
-
-
-def _method_profile_from_history(history):
-    wins = [h for h in history if h.get("result") == "W"]
-    losses = [h for h in history if h.get("result") == "L"]
-
-    def _rate(rows, method_label, prior, strength=8.0):
-        n = len(rows)
-        if n == 0:
-            return float(prior)
-        hits = sum(1 for h in rows if _normalize_method_label(h.get("method", "")) == method_label)
-        return (hits + prior * strength) / (n + strength)
-
-    return {
-        "win_decision": _rate(wins, "Decision", 0.50),
-        "win_ko_tko": _rate(wins, "KO/TKO", 0.32),
-        "win_submission": _rate(wins, "Submission", 0.18),
-        "loss_decision": _rate(losses, "Decision", 0.45),
-        "loss_ko_tko": _rate(losses, "KO/TKO", 0.35),
-        "loss_submission": _rate(losses, "Submission", 0.20),
-        "wins_n": float(len(wins)),
-        "losses_n": float(len(losses)),
-    }
 
 
 def _oriented_method_matrix(X_df, y_red_win):
@@ -5075,8 +5077,7 @@ class SuperEnsembleModel:
         return float(np.clip(p, 1e-6, 1 - 1e-6))
 
     def predict_method_probs(
-        self, feat_dict, winner_is_a=True,
-        winner_profile=None, loser_profile=None, weight_class="", gender="",
+        self, feat_dict, winner_is_a=True, weight_class="", gender="",
     ):
         if not self.method_bundle or not self.method_feat_cols:
             return {"Decision": 1.0 / 3.0, "KO/TKO": 1.0 / 3.0, "Submission": 1.0 / 3.0}
@@ -5193,13 +5194,21 @@ class SuperEnsembleModel:
                 for m in METHOD_LABELS
             })
 
-        winner_profile = winner_profile or {}
-        loser_profile = loser_profile or {}
-        hist_probs = _normalize_method_probs({
-            "Decision": 0.62 * float(winner_profile.get("win_decision", 0.50)) + 0.38 * float(loser_profile.get("loss_decision", 0.45)),
-            "KO/TKO": 0.62 * float(winner_profile.get("win_ko_tko", 0.32)) + 0.38 * float(loser_profile.get("loss_ko_tko", 0.35)),
-            "Submission": 0.62 * float(winner_profile.get("win_submission", 0.18)) + 0.38 * float(loser_profile.get("loss_submission", 0.20)),
-        })
+        # History prior: SAME recipe as training/holdout (oriented winner-loser
+        # win-method differentials read from the already-oriented frame `X`), so
+        # production matches the evaluated model. See _history_prior_row.
+        def _orient_diff(col):
+            if col not in X.columns:
+                return 0.0
+            try:
+                return float(X.iloc[0][col])
+            except (TypeError, ValueError):
+                return 0.0
+        hist_probs = _history_prior_row(
+            _orient_diff("d_dec_win_pct"),
+            _orient_diff("d_ko_win_pct"),
+            _orient_diff("d_sub_win_pct"),
+        )
 
         group_priors = self.method_bundle.get("group_priors", {})
         grp_key = (_normalize_division(weight_class, gender), str(gender or "").strip().lower() or "unknown")
@@ -6634,11 +6643,7 @@ class UFCSuperModelPipeline:
                         d_dec = float(pd.to_numeric(Xr.get("d_dec_win_pct", pd.Series([0.0])).iloc[i], errors="coerce") if "d_dec_win_pct" in Xr else 0.0)
                         d_ko = float(pd.to_numeric(Xr.get("d_ko_win_pct", pd.Series([0.0])).iloc[i], errors="coerce") if "d_ko_win_pct" in Xr else 0.0)
                         d_sub = float(pd.to_numeric(Xr.get("d_sub_win_pct", pd.Series([0.0])).iloc[i], errors="coerce") if "d_sub_win_pct" in Xr else 0.0)
-                        p = _normalize_method_probs({
-                            "Decision": 0.50 + 0.35 * d_dec,
-                            "KO/TKO": 0.32 + 0.35 * d_ko,
-                            "Submission": 0.18 + 0.35 * d_sub,
-                        })
+                        p = _history_prior_row(d_dec, d_ko, d_sub)
                         out[i, 0] = float(p["Decision"])
                         out[i, 1] = float(p["KO/TKO"])
                         out[i, 2] = float(p["Submission"])
@@ -7225,11 +7230,7 @@ class UFCSuperModelPipeline:
                     d_dec = float(X_test_oriented_pred.reset_index(drop=True).iloc[i].get("d_dec_win_pct", 0.0))
                     d_ko = float(X_test_oriented_pred.reset_index(drop=True).iloc[i].get("d_ko_win_pct", 0.0))
                     d_sub = float(X_test_oriented_pred.reset_index(drop=True).iloc[i].get("d_sub_win_pct", 0.0))
-                    hp = _normalize_method_probs({
-                        "Decision": 0.50 + 0.35 * d_dec,
-                        "KO/TKO": 0.32 + 0.35 * d_ko,
-                        "Submission": 0.18 + 0.35 * d_sub,
-                    })
+                    hp = _history_prior_row(d_dec, d_ko, d_sub)
                     sub_prior_arr = _sub_attempt_prior_array(X_test_oriented_pred.reset_index(drop=True).iloc[[i]])[0]
                     sp = _normalize_method_probs({
                         "Decision": float(sub_prior_arr[0]),
@@ -7824,16 +7825,9 @@ class UFCSuperModelPipeline:
         # The pick — and therefore the winner-conditioned method below — follows the
         # blended probability, so a flip from the odds re-routes the method too.
         pick_a = p_a >= 0.5
-        winner_name = a_key if pick_a else b_key
-        loser_name = b_key if pick_a else a_key
-
-        winner_profile = _method_profile_from_history(self.fighter_history.get(winner_name, []))
-        loser_profile = _method_profile_from_history(self.fighter_history.get(loser_name, []))
         method_probs = self.model.predict_method_probs(
             matchup_df.iloc[0].to_dict(),
             winner_is_a=pick_a,
-            winner_profile=winner_profile,
-            loser_profile=loser_profile,
             weight_class=weight_class,
             gender=gender,
         )
