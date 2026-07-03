@@ -476,6 +476,15 @@ STRICT_KEEP_MODELS = frozenset({
     "HistGBM", "HistGBM_Wide",
     "ExtraTrees", "ExtraTrees_Deep",
     "RandForest", "RandForest_Deep",
+    # LogReg tested and REMOVED per the 2026-07-01 diversity audit + full-run A/B.
+    # The paired proxy audit (_audit_elasticnet_blend.py) was a clear win (prob-corr
+    # ~0.67 vs the trees; HGB+LogReg blends won walk-forward log-loss 6/6 folds),
+    # but deployed, the fitted combiner gave it only 0.07 weight (~0.007 prob
+    # shift — below the n=500 measurement floor). Holdout was a wash (ll
+    # 0.6115→0.6127, acc 67.6→67.2, ECE 0.0552→0.0527) while the nudged winner
+    # probs flipped the method era 2005→2016 (-979 rows), dropping Submission F1
+    # 30.4→26.4. Wash upstream + real cost downstream = incumbent lineup stays.
+    # "LogReg",
     # "AdaBoost",
 })
 
@@ -594,6 +603,9 @@ def _replay_winner_cache_logs(pl, W, winner_cache_key):
     pl._stat("Cache", f"HIT ({WINNER_CACHE_VERSION}) — OOF skipped [key={h}]")
     pl._section("Combiner Selection")
     pl._stat("Selected combiner", W.get("combiner_kind", ""))
+    _w_str = _format_combiner_weights(W.get("combiner"))
+    if _w_str:
+        pl._stat("Combiner weights", _w_str)
     pl._stat("Validation log-loss", W.get("val_ll_str", ""))
     pl._stat("Validation accuracy", W.get("val_acc_str", ""))
     pl._stat("Validation threshold", W.get("val_thr_str", ""))
@@ -4235,6 +4247,18 @@ def _softmax(x):
     return e / np.sum(e)
 
 
+def _format_combiner_weights(combiner):
+    """One-line view of a 'weighted' combiner's fitted weights, largest first.
+    Members below 0.005 are named under '~0:' so an ignored model is visibly
+    ignored rather than silently absent. Empty string for non-weighted kinds."""
+    if not isinstance(combiner, dict) or combiner.get("kind") != "weighted":
+        return ""
+    items = sorted(combiner.get("weights", {}).items(), key=lambda kv: -kv[1])
+    kept = ", ".join(f"{k}={v:.2f}" for k, v in items if v >= 0.005)
+    zeros = [k for k, v in items if v < 0.005]
+    return kept + (f" | ~0: {', '.join(zeros)}" if zeros else "")
+
+
 def _combine_probs(pred_df, combiner):
     kind = combiner["kind"]
     if kind == "stacker":
@@ -5814,6 +5838,9 @@ class UFCSuperModelPipeline:
                 allow_stacker=not WINNER_COMBINER_ROBUST,
             )
             self._stat("Selected combiner", combiner["kind"])
+            _w_str = _format_combiner_weights(combiner)
+            if _w_str:
+                self._stat("Combiner weights", _w_str)
             self._stat("Validation log-loss", f"{val_ll:.4f}")
             self._stat("Validation accuracy", f"{val_acc:.1%}")
             self._stat("Validation threshold", f"{val_thr:.3f}")

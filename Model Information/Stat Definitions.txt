@@ -3,6 +3,11 @@ event_name: Name of the UFC event.
 event_url: UFC Stats URL for the event page.
 fight_url: UFC Stats URL for the specific fight page.
 event_location: Location of the event.
+event_altitude: Elevation of the event venue above sea level, in feet.
+r_trains_at: Red-corner fighter training camp (gym or team) around the time of the fight; blank when unknown.
+b_trains_at: Blue-corner fighter training camp (gym or team) around the time of the fight; blank when unknown.
+r_training_altitude_ft: Elevation of the red-corner fighter's training camp above sea level, in feet, geocoded from the camp location; blank when the camp is unknown.
+b_training_altitude_ft: Elevation of the blue-corner fighter's training camp above sea level, in feet, geocoded from the camp location; blank when the camp is unknown.
 r_fighter: Red-corner fighter identifier or name as stored in the dataset.
 b_fighter: Blue-corner fighter identifier or name as stored in the dataset.
 weight_class: Fight weight class.
