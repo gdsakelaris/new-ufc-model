@@ -35,8 +35,9 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import importlib.util
 
-HERE = r"c:\Users\gdsak\OneDrive\Desktop\Glicko-2, Etc"
-MODEL_PATH = os.path.join(HERE, "UFC_Model.py")
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+MODEL_PATH = os.path.join(ROOT, "UFC_Model.py")
 PNG_OUT = os.path.join(HERE, "_audit_calibration.png")
 N_BINS = 10
 SPARSE_FIGHTS_LT = 4   # "sparse" fighter = fewer than this many prior fights (0..3)

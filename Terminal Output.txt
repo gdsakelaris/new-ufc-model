@@ -47,28 +47,28 @@ Corr-pruned: 383 → 325 (thr=0.95)
 ========================================================================
 Feature Pruning (Stability Selection)
 ========================================================================
-Kept features (floated): 250
+Kept features (floated): 253
 Bootstrap runs: 15
 Per-run select top: 244/325 (75%)
 Freq threshold: 60%
-Mean selection freq of kept: 94.0%
-Winner cache: MISS (v21) — training winner stage
+Mean selection freq of kept: 93.8%
+Winner cache: MISS (v22) — training winner stage
 
 ========================================================================
 Optuna Tuning
 ========================================================================
 LightGBM  [##############################]  80/80  100.0%
-Optuna LightGBM best score: 0.34701
-Optuna LightGBM val acc: 71.3% | val ll: 0.6034 | thr: 0.515
-Optuna LightGBM best params: n_estimators=611, learning_rate=0.012895, max_depth=7, num_leaves=86, min_child_samples=39, subsample=0.75464, colsample_bytree=0.70892, reg_alpha=0.00063801, reg_lambda=0.21512, min_split_gain=0.11539
+Optuna LightGBM best score: 0.34893
+Optuna LightGBM val acc: 71.2% | val ll: 0.6060 | thr: 0.479
+Optuna LightGBM best params: n_estimators=681, learning_rate=0.01307, max_depth=4, num_leaves=57, min_child_samples=41, subsample=0.99716, colsample_bytree=0.71686, reg_alpha=0.00051605, reg_lambda=1.1105, min_split_gain=0.12685
 XGBoost   [##############################]  80/80  100.0%
-Optuna XGBoost best score: 0.34829
-Optuna XGBoost val acc: 71.2% | val ll: 0.5996 | thr: 0.474
-Optuna XGBoost best params: n_estimators=672, learning_rate=0.015646, max_depth=9, min_child_weight=9.8702, subsample=0.63216, colsample_bytree=0.67364, reg_alpha=0.010323, reg_lambda=1.4877, gamma=0.955
+Optuna XGBoost best score: 0.34345
+Optuna XGBoost val acc: 71.7% | val ll: 0.6011 | thr: 0.472
+Optuna XGBoost best params: n_estimators=420, learning_rate=0.014316, max_depth=8, min_child_weight=11.942, subsample=0.69735, colsample_bytree=0.98168, reg_alpha=2.4304, reg_lambda=0.0021058, gamma=0.29326
 CatBoost  [##############################]  80/80  100.0%
-Optuna CatBoost best score: 0.33277
-Optuna CatBoost val acc: 72.7% | val ll: 0.5944 | thr: 0.509
-Optuna CatBoost best params: iterations=788, learning_rate=0.034899, depth=8, l2_leaf_reg=5.1932, random_strength=1.5858, bagging_temperature=0.35623, border_count=215
+Optuna CatBoost best score: 0.34691
+Optuna CatBoost val acc: 71.3% | val ll: 0.6024 | thr: 0.475
+Optuna CatBoost best params: iterations=823, learning_rate=0.015235, depth=9, l2_leaf_reg=4.7088, random_strength=1.3304, bagging_temperature=0.87305, border_count=250
 
 ========================================================================
 Model Setup
@@ -88,30 +88,31 @@ OOF fold: 5/5
 Combiner Selection
 ========================================================================
 Selected combiner: weighted
-Validation log-loss: 0.6073
-Validation accuracy: 70.0%
-Validation threshold: 0.515
+Combiner weights: XGBoost_Tuned=0.25, CatBoost_Tuned=0.24, CatBoost=0.22, LightGBM_Tuned=0.17, ExtraTrees=0.09, ExtraTrees_Deep=0.03 | ~0: XGBoost, HistGBM_Wide, LightGBM, HistGBM, RandForest, RandForest_Deep
+Validation log-loss: 0.6049
+Validation accuracy: 70.5%
+Validation threshold: 0.504
 
 ========================================================================
 Calibration
 ========================================================================
 Selected method: none
-Validation log-loss: 0.6199
+Validation log-loss: 0.6114
 Strict future mode: ON
 Calibration used for picks: no
-Validation accuracy (picked): 69.5%
-Validation tuned threshold: 0.495 (acc=63.9%)
+Validation accuracy (picked): 70.0%
+Validation tuned threshold: 0.503 (acc=64.0%)
 Decision threshold: 0.500
 
 ========================================================================
 Holdout Evaluation
 ========================================================================
-Raw log-loss: 0.6115
-Calibrated log-loss: 0.6115
-Brier score: 0.2115
-Accuracy: 67.60%
-ECE: 0.0552
-Calibration curve RMSE: 0.0613
+Raw log-loss: 0.6102
+Calibrated log-loss: 0.6102
+Brier score: 0.2107
+Accuracy: 69.00%
+ECE: 0.0644
+Calibration curve RMSE: 0.0703
 Accuracy threshold: 0.500
 
 ========================================================================
@@ -119,99 +120,99 @@ Winner Diagnostics
 ========================================================================
 Confusion Matrix (Winner: Red=positive)
                Pred Blue   Pred Red
-Actual Blue         129        105
-Actual Red           57        209
+Actual Blue         135         99
+Actual Red           56        210
 
 Accuracy by Weight Class
 ------------------------------------------------------------------------
-Women's Strawweight (n=27): 70.4%
-Women's Flyweight (n=16): 75.0%
+Women's Strawweight (n=27): 74.1%
+Women's Flyweight (n=16): 68.8%
 Women's Bantamweight (n=20): 80.0%
 Flyweight (n=40): 67.5%
-Bantamweight (n=56): 58.9%
-Featherweight (n=65): 63.1%
-Lightweight (n=64): 54.7%
+Bantamweight (n=56): 62.5%
+Featherweight (n=65): 66.2%
+Lightweight (n=64): 60.9%
 Welterweight (n=55): 76.4%
-Middleweight (n=73): 71.2%
+Middleweight (n=73): 69.9%
 Light Heavyweight (n=38): 65.8%
 Heavyweight (n=37): 73.0%
 Catch Weight (n=9): 100.0%
 
 Accuracy by Gender
 ------------------------------------------------------------------------
-Men (n=437): 66.6%
+Men (n=437): 68.2%
 Women (n=63): 74.6%
-Winner cache: SAVED (v21) key=58152662c7d2 file=winner_stage_58152662c7d205c4b764.pkl
-Method cache: MISS (v38) — training method stage
+Winner cache: SAVED (v22) key=a2cbe9e33d37 file=winner_stage_a2cbe9e33d3779dbfafe.pkl
+Method cache: MISS (v39) — training method stage
 
 ========================================================================
 Method Model
 ========================================================================
-  method start 2005: macro-F1 0.4068 | 5890 train rows   <= selected
-  method start 2010: macro-F1 0.4068 | 5890 train rows
-  method start 2014: macro-F1 0.3899 | 5869 train rows
-  method start 2016: macro-F1 0.3458 | 4911 train rows
-  method start 2018: macro-F1 0.3906 | 3943 train rows
-  method start 2020: macro-F1 0.3551 | 2868 train rows
-  method start 2021: macro-F1 0.3737 | 2376 train rows
-  method start 2022: macro-F1 0.3482 | 1830 train rows
-  method start 2023: macro-F1 0.3871 | 1248 train rows
-  method start 2024: macro-F1 0.3793 | 667 train rows
-Method start year: 2005
-Method rows kept: 6140
-Stage1 corr-pruned: 490 → 415 (thr=0.95)
+  method start 2005: macro-F1 0.3730 | 5890 train rows
+  method start 2010: macro-F1 0.3730 | 5890 train rows
+  method start 2014: macro-F1 0.3773 | 5869 train rows
+  method start 2016: macro-F1 0.3870 | 4911 train rows   <= selected
+  method start 2018: macro-F1 0.3907 | 3943 train rows
+  method start 2020: macro-F1 0.4063 | 2868 train rows
+  method start 2021: macro-F1 0.3292 | 2376 train rows
+  method start 2022: macro-F1 0.3876 | 1830 train rows
+  method start 2023: macro-F1 0.3588 | 1248 train rows
+  method start 2024: macro-F1 0.3617 | 667 train rows
+Method start year: 2016
+Method rows kept: 5161
+Stage1 corr-pruned: 490 → 413 (thr=0.95)
 Stage1 HGB [##############################]  80/80  100.0%
-Stage1 HGB params: lr=0.0277, depth=7, leaves=56, iter=200
+Stage1 HGB params: lr=0.0250, depth=10, leaves=18, iter=180
 Stage2 corr-pruned: 467 → 393 (thr=0.95)
 Stage2 top-N pruned: kept 180/180
 Stage2 HGB [##############################]  80/80  100.0%
-Stage2 HGB params: lr=0.0230, depth=4, leaves=38, iter=180
+Stage2 HGB params: lr=0.0216, depth=10, leaves=16, iter=160
 Method Blend [##############################] 400/400 100.0%
-Method config: Challenger wins (new=0.45514 > champ=0.38592 + margin 0.020) — champion updated
+Method config: No usable champion (setup changed (features/classes/search space/version)) — saving challenger (obj=0.45700)
 Method classes (training): Decision, KO/TKO, Submission
-Validation metric target (method | winner correct): 53.3%
-Validation majority baseline (same subset): 51.4%
+Validation metric target (method | winner correct): 51.0%
+Validation majority baseline (same subset): 52.3%
 
 ========================================================================
 Method Evaluation (Conditioned on Winner Pick)
 ========================================================================
-Stage1 acc (Finish vs Decision): 61.0%
-Stage1 AUC (Finish vs Decision): 0.631
-Stage2 acc (KO/Sub | true finishes): 65.7%
+Stage1 acc (Finish vs Decision): 61.8%
+Stage1 AUC (Finish vs Decision): 0.644
+Stage2 acc (KO/Sub | true finishes): 66.4%
 Stage2 sample size (true finishes): 283
-Method acc (predicted winner conditioned): 50.4%
-Method acc | winner pick correct: 50.3%
-Majority baseline | winner pick correct: 42.0%
-Balanced accuracy | winner pick correct: 46.1%
-Macro F1 | winner pick correct: 46.3%
-FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1): 42.1%
+Method acc (predicted winner conditioned): 51.6%
+Method acc | winner pick correct: 52.2%
+Majority baseline | winner pick correct: 41.7%
+Balanced accuracy | winner pick correct: 49.3%
+Macro F1 | winner pick correct: 49.0%
+FinishScore (0.4 KO R + 0.4 Sub R + 0.2 KO/Sub F1): 46.8%
 
 Per-Class Metrics (Method | winner pick correct)
 Class          Precision    Recall      F1
-Decision           55.8%     54.2%     55.0%
-KO/TKO             51.0%     56.3%     53.5%
-Submission         33.3%     27.9%     30.4%
+Decision           59.7%     53.5%     56.4%
+KO/TKO             57.1%     58.4%     57.8%
+Submission         30.3%     35.9%     32.9%
 
 Confusion Matrix (Method | winner pick correct)
 Actual\Pred     Decision    KO/TKO  Submission
-Decision              77        51          14
-KO/TKO                39        76          20
-Submission            22        22          17
-Method cache: SAVED (v38) key=9809dfb9e431 file=method_stage_9809dfb9e431cf93e752.pkl
+Decision              77        41          26
+KO/TKO                30        80          27
+Submission            22        19          23
+Method cache: SAVED (v39) key=a663df8a7ca3 file=method_stage_a663df8a7ca39a6f52c2.pkl
 
 ========================================================================
 Walk-Forward Diagnostics
 ========================================================================
-Fold 1: log-loss 0.6891 | acc 59.6% (629 fights)
-Fold 2: log-loss 0.6702 | acc 59.9% (629 fights)
-Fold 3: log-loss 0.6812 | acc 57.6% (629 fights)
-Fold 4: log-loss 0.6441 | acc 62.3% (629 fights)
-Fold 5: log-loss 0.6390 | acc 63.3% (629 fights)
-Fold 6: log-loss 0.6154 | acc 67.7% (629 fights)
-Walk-forward mean log-loss: 0.6565
+Fold 1: log-loss 0.6931 | acc 59.5% (629 fights)
+Fold 2: log-loss 0.6649 | acc 60.7% (629 fights)
+Fold 3: log-loss 0.6871 | acc 57.2% (629 fights)
+Fold 4: log-loss 0.6449 | acc 62.5% (629 fights)
+Fold 5: log-loss 0.6377 | acc 63.3% (629 fights)
+Fold 6: log-loss 0.6137 | acc 67.2% (629 fights)
+Walk-forward mean log-loss: 0.6569
 Walk-forward mean accuracy: 61.7%
-Walk-forward std (log-loss): 0.0258
-Walk-forward std (accuracy): 3.3%
+Walk-forward std (log-loss): 0.0279
+Walk-forward std (accuracy): 3.2%
 
 ========================================================================
 Prediction Run Complete

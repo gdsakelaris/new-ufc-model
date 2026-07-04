@@ -45,6 +45,11 @@ Kept:
     event_url
     fight_url
     event_location
+    event_altitude
+    r_trains_at
+    b_trains_at
+    r_training_altitude_ft
+    b_training_altitude_ft
     r_fighter
     b_fighter
     weight_class

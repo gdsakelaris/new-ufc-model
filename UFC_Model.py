@@ -95,9 +95,9 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
 METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_champion_cfg.json")
 ###################################################################################################
 # Bump when winner-stage training logic changes.
-WINNER_CACHE_VERSION = "v21"
+WINNER_CACHE_VERSION = "v22"
 # Bump when method-stage training logic changes.
-METHOD_CACHE_VERSION = "v38"
+METHOD_CACHE_VERSION = "v39"
 ###################################################################################################
 # Pickle payload discriminator (stable across cache file renames).
 WINNER_STAGE_CACHE_KIND = "ufc_winner_stage_v1"
@@ -851,14 +851,23 @@ def _oriented_method_matrix(X_df, y_red_win):
     X_m = X_df.copy()
     y_arr = np.asarray(y_red_win).astype(int)
     sign = np.where(y_arr == 1, 1.0, -1.0)
+    # Same parity rules as _swap_features, applied per-row: negate the
+    # antisymmetric columns (d_* minus the symmetric even-product set, plus
+    # _SWAP_NEGATE_COLS) on blue-winner rows.
     for col in X_m.columns:
-        if col.startswith("d_"):
+        if ((col.startswith("d_") and col not in _SWAP_SYMMETRIC_D_COLS)
+                or col in _SWAP_NEGATE_COLS):
             X_m[col] = X_m[col].astype(float).values * sign
-    # Raw r_/b_ pair columns aren't differences, so per-row orientation must
-    # exchange them on blue-winner rows (sign == -1) to stay consistent with
-    # the d_* negation above.
     blue_mask = (sign == -1)
     if blue_mask.any():
+        # Probability columns complement (p -> 1-p) on blue-winner rows.
+        for col in _SWAP_COMPLEMENT_COLS:
+            if col in X_m.columns:
+                vals = X_m[col].astype(float).values
+                X_m[col] = np.where(blue_mask, 1.0 - vals, vals)
+        # Raw r_/b_ pair columns aren't differences, so per-row orientation must
+        # exchange them on blue-winner rows (sign == -1) to stay consistent with
+        # the d_* negation above.
         for r_col, b_col in _SWAP_PAIR_COLUMNS:
             if r_col in X_m.columns and b_col in X_m.columns:
                 r_arr = X_m[r_col].values.copy()
@@ -2703,11 +2712,17 @@ def compute_matchup_features(a_feats, b_feats, is_title=0, total_rounds=3, weigh
     )
 
     # ── Glicko expected win probability (THE strongest single predictor) ──
-    # This encodes the full Glicko-2 prediction: rating difference + uncertainty
+    # This encodes the full Glicko-2 prediction: rating difference + uncertainty.
+    # Uses the POOLED deviation sqrt(phi_a² + phi_b²): the one-sided textbook
+    # form E(a, b, phi_b) reads only the OPPONENT's uncertainty, so
+    # E(a,b) + E(b,a) != 1 whenever the deviations differ — which broke exact
+    # corner-swap equivariance (the swapped row's complement wasn't what the
+    # reversed orientation would compute). Pooling keeps the same signal and
+    # makes the complement exact.
     a_mu_s = (a_mu - MU_0) / SCALE
     b_mu_s = (b_mu - MU_0) / SCALE
-    b_phi_s = b_phi / SCALE
-    features["glicko_win_prob"] = _E(a_mu_s, b_mu_s, b_phi_s)
+    pooled_phi_s = math.sqrt(a_phi ** 2 + b_phi ** 2) / SCALE
+    features["glicko_win_prob"] = _E(a_mu_s, b_mu_s, pooled_phi_s)
     features["d_glicko_win_prob"] = features["glicko_win_prob"] - 0.5  # directional version
 
     # Confidence gap: rating gap normalised by combined uncertainty
@@ -3617,6 +3632,34 @@ _SWAP_PAIR_COLUMNS = (
     ("r_event_camp_gap_kft", "b_event_camp_gap_kft"),
 )
 
+# d_*-prefixed columns that are corner-SYMMETRIC — even products of two
+# antisymmetric differences (or squares of one), so exchanging corners leaves
+# them UNCHANGED. The blanket "negate every d_* column" rule must skip these,
+# or the swapped row misrepresents the reversed fight (verified empirically:
+# these were the swap-equivariance violators). NOTE: any new d_* interaction
+# built from an EVEN number of d_* factors belongs here; odd products (or a
+# single d_* times symmetric context like rounds/title) stay on the negate path.
+_SWAP_SYMMETRIC_D_COLS = frozenset({
+    "d_reach_x_striking",             # reach_diff * striking_diff
+    "d_youth_exp",                    # age_diff * experience_diff
+    "d_glicko_win_prob_sq",           # d_glicko_win_prob ** 2
+    "d_glicko_activity_interaction",  # d_glicko_win_prob * d_activity
+    "d_cardio_momentum_interaction",  # d_cardio_ratio * d_momentum
+    "d_style_synergy",                # d_striking_vs_defense * d_grapple_vs_tdd
+    "d_form_iq_synergy",              # d_form_trend * d_fight_iq
+    "d_confidence_form_synergy",      # d_glicko_confidence * d_form_trend
+    "d_elo_hybrid_sq",                # d_elo_hybrid ** 2
+    "d_style_rounds_interaction",     # d_style_synergy * total_rounds
+    "d_title_finish_pressure",        # is_title * finish_pressure (both symmetric)
+    "d_glicko_activity_rounds",       # d_glicko_win_prob * d_activity * rounds
+    "d_form_confidence_rounds",       # d_form_trend * d_glicko_confidence * rounds
+})
+# Corner-ANTISYMMETRIC columns without the d_ prefix: must negate on swap.
+_SWAP_NEGATE_COLS = ("elo_divergence",)
+# Red-win probability columns: complement (p -> 1-p) on swap. Exact because
+# each is a symmetric-scale sigmoid / Glicko-E of a rating difference.
+_SWAP_COMPLEMENT_COLS = ("glicko_win_prob", "elo_win_prob", "div_elo_win_prob")
+
 
 def _apply_pair_swap(X_src, X_dst):
     for r_col, b_col in _SWAP_PAIR_COLUMNS:
@@ -3644,10 +3687,7 @@ def _complete_swap_pairs(cols, available):
 
 
 def _augment_swap(X, y):
-    d_cols = [c for c in X.columns if c.startswith("d_")]
-    X_swap = X.copy()
-    X_swap[d_cols] = -X_swap[d_cols]
-    _apply_pair_swap(X, X_swap)
+    X_swap = _swap_features(X)
     y_swap = 1.0 - y
     # Interleave to preserve chronology for folds.
     X_aug = pd.concat([X, X_swap], ignore_index=True)
@@ -3667,9 +3707,18 @@ def _time_weights(n, floor=0.35):
 
 
 def _swap_features(X):
+    """Return X re-expressed as the SAME fights seen from the opposite corner:
+    negate antisymmetric columns (d_* minus the symmetric even-product set,
+    plus _SWAP_NEGATE_COLS), complement probability columns, exchange r_/b_
+    pair columns, and leave corner-symmetric columns untouched."""
     X2 = X.copy()
-    d_cols = [c for c in X2.columns if c.startswith("d_")]
-    X2[d_cols] = -X2[d_cols]
+    neg_cols = [c for c in X2.columns
+                if (c.startswith("d_") and c not in _SWAP_SYMMETRIC_D_COLS)
+                or c in _SWAP_NEGATE_COLS]
+    X2[neg_cols] = -X2[neg_cols]
+    comp_cols = [c for c in _SWAP_COMPLEMENT_COLS if c in X2.columns]
+    if comp_cols:
+        X2[comp_cols] = 1.0 - X2[comp_cols]
     _apply_pair_swap(X, X2)
     return X2
 
