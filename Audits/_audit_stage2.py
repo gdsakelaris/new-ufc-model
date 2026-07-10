@@ -29,7 +29,7 @@ _T0 = time.time()
 def banner(msg):
     print(f"\n>>> [{time.time() - _T0:5.0f}s] {msg}", flush=True)
 
-HERE = r"c:\Users\gdsak\OneDrive\Desktop\Glicko-2, Etc"
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (parent of Audits/)
 MODEL_PATH = os.path.join(HERE, "UFC_Model.py")
 BUNDLE_PATH = os.path.join(HERE, "_audit_stage2_bundle_v2.pkl")  # full 426-col matrix
 STAGE1_CSV = os.path.join(HERE, "_audit_importances.csv")

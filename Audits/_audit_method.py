@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import importlib.util
 
-HERE = r"c:\Users\gdsak\OneDrive\Desktop\Glicko-2, Etc"
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (parent of Audits/)
 CACHE = os.path.join(HERE, ".ufc_model_cache")
 
 # import the module so pickled estimators + _feature_allowed are available

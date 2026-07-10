@@ -68,7 +68,7 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import log_loss, accuracy_score, brier_score_loss
 
 # ============================== KNOBS ==============================
-HERE = r"c:\Users\gdsak\OneDrive\Desktop\Glicko-2, Etc"
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (parent of Audits/)
 BUNDLE_PATH = os.path.join(HERE, "_audit_stage2_bundle_v2.pkl")
 OUT_ROWS_CSV = os.path.join(HERE, "_audit_walkforward_rows.csv")
 OUT_SUMMARY_CSV = os.path.join(HERE, "_audit_walkforward_summary.csv")

@@ -19,7 +19,7 @@ from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifie
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import log_loss, accuracy_score
 
-HERE = r"c:\Users\gdsak\OneDrive\Desktop\Glicko-2, Etc"
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (parent of Audits/)
 BUNDLE_PATH = os.path.join(HERE, "_audit_stage2_bundle_v2.pkl")
 BOOST_WEIGHT = 0.8
 SEEDS = [0, 1, 2]

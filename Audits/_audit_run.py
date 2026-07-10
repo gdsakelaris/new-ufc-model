@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import importlib.util
 
-HERE = r"c:\Users\gdsak\OneDrive\Desktop\Glicko-2, Etc"
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (parent of Audits/)
 P = os.path.join(HERE, "UFC_Model.py")
 spec = importlib.util.spec_from_file_location("ufc_model", P)
 ufc = importlib.util.module_from_spec(spec)

@@ -611,7 +611,7 @@ def _replay_winner_cache_logs(pl, W, winner_cache_key):
     pl._stat("Validation threshold", W.get("val_thr_str", ""))
     pl._section("Calibration")
     pl._stat("Selected method", W.get("cal_name", ""))
-    pl._stat("Validation log-loss", W.get("cal_ll_str", ""))
+    pl._stat("Selection-slice log-loss (late ~45% of val)", W.get("cal_ll_str", ""))
     pl._stat("Strict future mode", "ON" if STRICT_FUTURE_MODE else "OFF")
     if not STRICT_FUTURE_MODE:
         pl._stat("Holdout-selected combiner", W.get("best_holdout_label", ""))
@@ -620,7 +620,7 @@ def _replay_winner_cache_logs(pl, W, winner_cache_key):
         pl._stat("Holdout combiner threshold", W.get("best_holdout_thr_str", ""))
     pl._stat("Calibration used for picks", W.get("cal_used_str", ""))
     pl._stat("Validation accuracy (picked)", W.get("val_acc_picked_str", ""))
-    pl._stat("Validation tuned threshold", W.get("val_tuned_thr_str", ""))
+    pl._stat("Dev-OOF tuned threshold", W.get("val_tuned_thr_str", ""))
     pl._stat("Decision threshold", W.get("decision_thr_str", ""))
     _corner_rows = W.get("corner_rows", [])
     if _corner_rows:
@@ -4236,6 +4236,70 @@ def _fit_corner_intercept(p_red, y_red, weights=None):
     return float(np.clip(b, -CORNER_SHIFT_CAP, CORNER_SHIFT_CAP))
 
 
+def _fit_value_sharpen(y_true, p_cal, n_folds=5, n_repeats=5, n_boot=2000,
+                       seed=RANDOM_SEED):
+    """Cross-fitted global sharpening factor s for the VALUE probability
+    (p -> sigmoid(s * logit(p))), fitted on the winner holdout at train time.
+
+    Mirrors Audits/_audit_recalibration.py: s is chosen by log-loss on K-1
+    folds, scored out-of-fold, repeated with reshuffles; the per-fight OOF
+    log-loss delta (sharpened - baseline) is bootstrapped and the fit only
+    DEPLOYS when the 95% CI sits below 0. Otherwise returns None and the
+    static VALUE_SHARPEN fallback stays live. Slope-only by design:
+    predict_proba_single averages the forward and corner-swapped passes, so
+    inference probabilities are corner-symmetric and an intercept term would
+    push on whichever fighter was entered first, not on a real corner.
+
+    Used only by the betting-value calc — pick probabilities are untouched.
+    Returns (s_or_None, one-line summary for the training log).
+    """
+    eps = 1e-6
+    y = np.asarray(y_true, dtype=float).reshape(-1)
+    p = np.clip(np.asarray(p_cal, dtype=float).reshape(-1), eps, 1.0 - eps)
+    n = len(y)
+    if n < 200 or len(np.unique(y.astype(int))) < 2:
+        return None, f"skipped (holdout n={n} too small) -> fallback {VALUE_SHARPEN}"
+    z = np.log(p / (1.0 - p))
+    grid = np.linspace(0.5, 2.5, 201)
+
+    def _ll_vec(yy, pp):
+        pp = np.clip(pp, eps, 1.0 - eps)
+        return -(yy * np.log(pp) + (1.0 - yy) * np.log(1.0 - pp))
+
+    def _best_s(idx):
+        lls = [float(np.mean(_ll_vec(y[idx], 1.0 / (1.0 + np.exp(-s * z[idx])))))
+               for s in grid]
+        return float(grid[int(np.argmin(lls))])
+
+    base_pp = _ll_vec(y, p)
+    all_s = []
+    canonical_oof = None
+    for r in range(n_repeats):
+        rng = np.random.default_rng(seed + r)
+        order = rng.permutation(n)
+        folds = np.array_split(order, n_folds)
+        oof = np.empty(n)
+        for f in range(n_folds):
+            te = folds[f]
+            tr = np.concatenate([folds[g] for g in range(n_folds) if g != f])
+            s = _best_s(tr)
+            all_s.append(s)
+            oof[te] = 1.0 / (1.0 + np.exp(-s * z[te]))
+        if r == 0:
+            canonical_oof = oof
+    delta = _ll_vec(y, canonical_oof) - base_pp
+    rng = np.random.default_rng(seed)
+    boots = np.array([float(delta[rng.integers(0, n, n)].mean())
+                      for _ in range(n_boot)])
+    lo, hi = np.percentile(boots, [2.5, 97.5])
+    s_hat = float(np.mean(all_s))
+    if hi < 0.0:
+        return s_hat, (f"{s_hat:.2f} fitted (OOF log-loss delta {float(delta.mean()):+.4f}, "
+                       f"95% CI [{lo:+.4f}, {hi:+.4f}]) -> ACTIVE for value calc")
+    return None, (f"not deployed (OOF delta CI [{lo:+.4f}, {hi:+.4f}] spans 0; "
+                  f"cross-fitted s~{s_hat:.2f}) -> fallback {VALUE_SHARPEN}")
+
+
 def _apply_corner_correction(p_red, b):
     """Shift symmetric p_red by the fitted corner intercept b (logit space)."""
     p = _clip_probs(np.asarray(p_red, dtype=float))
@@ -5347,6 +5411,9 @@ class UFCSuperModelPipeline:
         self.log = logger or (lambda s: None)
         self.progress_cb = progress_cb
         self.model = None
+        # Cross-fitted VALUE sharpening factor (None until train() fits one that
+        # passes its bootstrap gate; the static VALUE_SHARPEN is the fallback).
+        self.value_sharpen_fitted = None
         self.fighter_history = None
         self.glicko_ratings = None
         self.opp_glicko_list = None
@@ -5940,7 +6007,10 @@ class UFCSuperModelPipeline:
             cal_ll_val_fitted = float(cal_ll)
             self._section("Calibration")
             self._stat("Selected method", cal_name)
-            self._stat("Validation log-loss", f"{cal_ll:.4f}")
+            # cal_ll is scored on the LATE ~45% of validation only (the slice
+            # _fit_best_calibrator selects on), so it won't match the Combiner
+            # section's full-window validation log-loss.
+            self._stat("Selection-slice log-loss (late ~45% of val)", f"{cal_ll:.4f}")
             self._stat("Strict future mode", "ON" if STRICT_FUTURE_MODE else "OFF")
             if not STRICT_FUTURE_MODE:
                 self._stat("Holdout-selected combiner", best_holdout_label)
@@ -6008,7 +6078,13 @@ class UFCSuperModelPipeline:
 
             self._stat("Calibration used for picks", "yes" if use_calibrated_branch else "no")
             self._stat("Validation accuracy (picked)", f"{val_acc_for_log:.1%}")
-            self._stat("Validation tuned threshold", f"{tuned_thr:.3f} (acc={tuned_acc:.1%})")
+            # tuned_thr/tuned_acc come from _tune_threshold_robust on OOF probs over
+            # the train+val dev set (block-mean accuracy), NOT the validation window.
+            tuned_thr_str = f"{tuned_thr:.3f} (dev-OOF block-robust acc={tuned_acc:.1%})"
+            if abs(decision_threshold - tuned_thr) > 1e-9:
+                tuned_thr_str = (f"{tuned_thr:.3f} (dev-OOF block-robust acc="
+                                 f"{tuned_acc:.1%}, clamped to {decision_threshold:.3f})")
+            self._stat("Dev-OOF tuned threshold", tuned_thr_str)
             self._stat("Decision threshold", f"{decision_threshold:.3f}")
 
             if calibrator is None:
@@ -6195,7 +6271,7 @@ class UFCSuperModelPipeline:
                 "best_holdout_thr_str": f"{float(best_holdout_thr):.3f}",
                 "cal_used_str": "yes" if use_calibrated_branch else "no",
                 "val_acc_picked_str": f"{float(val_acc_for_log):.1%}",
-                "val_tuned_thr_str": f"{float(tuned_thr):.3f} (acc={float(tuned_acc):.1%})",
+                "val_tuned_thr_str": tuned_thr_str,
                 "decision_thr_str": f"{float(decision_threshold):.3f}",
                 "holdout_eval": [
                     ("Raw log-loss", f"{float(raw_ll):.4f}"),
@@ -6273,6 +6349,14 @@ class UFCSuperModelPipeline:
         self.holdout_min_fights = _hcol("min_num_fights")
         self.holdout_max_fights = _hcol("max_num_fights")
         self.holdout_avg_glicko_conf = _hcol("avg_glicko_confidence")
+
+        # Cross-fitted VALUE sharpening (slope-only; see _fit_value_sharpen).
+        # Refit on every train() from the holdout arrays above — cheap, and
+        # cache-safe because it runs on the cache-hit path too.
+        self.value_sharpen_fitted, _vs_msg = _fit_value_sharpen(
+            y_true_red, self.holdout_prob_cal
+        )
+        self._stat("Value sharpen", _vs_msg)
 
         if winner_only:
             # Winner-only callers (e.g. the calibration audit) need just the
@@ -6355,11 +6439,13 @@ class UFCSuperModelPipeline:
                 # candidate era and score its macro-F1 on a COMMON recent validation
                 # window (identical fights across eras), CONDITIONED on winner-pick-
                 # correct fights to mirror the real headline metric. Among eras within
-                # METHOD_ERA_F1_TOL of the best, prefer the MOST RECENT window —
-                # finish-type patterns are non-stationary, so (unlike the winner
-                # stage) recency beats raw data volume here. The old criterion
-                # MAXIMIZED class imbalance (majority-class fraction) on each era's own
-                # slice — which measures no model skill and starved it to ~766 rows.
+                # METHOD_ERA_F1_TOL of the best, prefer the MOST TRAINING ROWS
+                # (earliest start as tiebreak) — recency weighting during method
+                # training already absorbs finish-type non-stationarity, and more
+                # examples help the rare Submission class most (rationale at the
+                # METHOD_ERA_F1_TOL definition). The old criterion MAXIMIZED class
+                # imbalance (majority-class fraction) on each era's own slice —
+                # which measures no model skill and starved it to ~766 rows.
                 best_method_year = 1993
                 _n_dev_all = len(X_dev_oriented)
                 if METHOD_AUTO_ERA and _n_dev_all > METHOD_VAL_FIGHTS + 500:
@@ -6423,6 +6509,14 @@ class UFCSuperModelPipeline:
                                 f"  method start {yr}",
                                 f"macro-F1 {f1:.4f} | {rows} train rows"
                                 + ("   <= selected" if yr == best_method_year else ""),
+                            )
+                        _bf1_yr = max(_cands_e, key=lambda c: c[1])[0]
+                        if best_method_year != _bf1_yr:
+                            self._stat(
+                                "Method era rule",
+                                f"{_bf1_yr} has the best macro-F1 ({_bf1:.4f}) but "
+                                f"{best_method_year} selected: among eras within "
+                                f"{METHOD_ERA_F1_TOL:g} of the best, most train rows wins",
                             )
                 if METHOD_AUTO_ERA and best_method_year > 1993:
                     keep = row_dates_dev_valid >= pd.Timestamp(f"{best_method_year}-01-01")
@@ -7911,8 +8005,17 @@ class UFCSuperModelPipeline:
 
         # Betting value on the RAW model prob (independent of the odds-blended pick
         # above). All None when odds are missing/unparseable for this matchup.
+        # Sparse pairs (both fighters under SPARSE_FIGHTS prior bouts) face the
+        # stricter EV floor — their probabilities audit far worse (ECE ~0.175).
+        _hist = self.fighter_history or {}
+        _both_sparse = (
+            len(_hist.get(a_key) or ()) < SPARSE_FIGHTS
+            and len(_hist.get(b_key) or ()) < SPARSE_FIGHTS
+        )
         value_side, value_ev, value_stake = _value_metrics(
-            p_a_model, a_key, b_key, red_odds, blue_odds
+            p_a_model, a_key, b_key, red_odds, blue_odds,
+            sharpen=(self.value_sharpen_fitted or VALUE_SHARPEN),
+            min_ev=(MIN_EV_TO_FLAG_SPARSE if _both_sparse else MIN_EV_TO_FLAG),
         )
 
         return {
@@ -7994,13 +8097,38 @@ ODDS_BLEND_WEIGHT = 0.50  # weight on the MODEL vs the market in [0,1]; 0.50 = e
 # above: edge is measured vs the de-vigged (fair) market, while EV/Kelly use the
 # actual offered (vigged) odds. So a fight can show one Blended Model pick and a
 # different Value Pick — that is intended, not a bug.
-KELLY_FRACTION = 0.25     # fraction of full Kelly to stake; the one conservatism dial
-MIN_EV_TO_FLAG = 0.02     # below +2% EV → "No bet" (filters vig-noise)
-MAX_STAKE_CAP  = 0.05     # hard ceiling on recommended bankroll fraction
-VALUE_SHARPEN  = 1.25     # >1 sharpens the prob used for VALUE ONLY (not the pick):
-                          # corrects the model's stable ~1.26x under-confidence (see
-                          # _audit_recalibration.py) so underdog edges aren't
-                          # systematically overstated. 1.0 = off.
+KELLY_FRACTION = 0.50     # fraction of full Kelly to stake; the one conservatism dial
+                          # (0.25 → 0.50 on 2026-07-04: user budgets a fixed ~$100
+                          # per event, so aggressive sizing is intentional)
+MIN_EV_TO_FLAG = 0.03     # below +3% EV → "No bet". Raised from 0.02: with holdout
+                          # ECE ~0.06 a 2-point edge is indistinguishable from
+                          # calibration noise.
+MIN_EV_TO_FLAG_SPARSE = 0.06  # stricter EV floor when BOTH fighters are sparse —
+                          # the both-sparse bucket shows ECE ~0.175
+                          # (_audit_calibration.py §3), so its probabilities are
+                          # too unreliable to act on thin edges.
+SPARSE_FIGHTS  = 4        # "sparse" = fewer than this many recorded prior fights
+                          # (same cutoff as the calibration audit's buckets)
+MAX_STAKE_CAP  = 0.10     # hard ceiling on recommended bankroll fraction
+                          # (→0.10 on 2026-07-04 alongside the half-Kelly bump:
+                          # binds at full Kelly ≥ 20%, the same extreme-disagreement
+                          # threshold the original 0.05/quarter-Kelly pairing had)
+STAKE_MODEL_WEIGHT = 1.00 # Kelly stakes are SIZED off logit-blend(model, de-vigged
+                          # market) with this weight on the model (edge DETECTION
+                          # always uses the pure model prob). At 1.0 (current
+                          # setting — stakes as large as reasonably possible) the
+                          # blend is a no-op and stakes trust the model prob
+                          # outright; MAX_STAKE_CAP is then the only guard on big
+                          # model–market disagreements. Lower toward ~0.6 to damp
+                          # stakes continuously as disagreement grows
+                          # (estimation-error shrinkage).
+VALUE_SHARPEN  = 1.25     # FALLBACK sharpening of the prob used for VALUE ONLY (not
+                          # the pick) — corrects the model's under-confidence so
+                          # underdog edges aren't systematically overstated. Used
+                          # only when train() couldn't deploy a cross-fitted factor
+                          # (see _fit_value_sharpen); 1.25 = the 2026-06-29
+                          # cross-fitted estimate from _audit_recalibration.py.
+                          # 1.0 = off.
 
 
 def _looks_like_odds(tok):
@@ -8075,20 +8203,30 @@ def _sharpen_prob(p, s):
     return float(1.0 / (1.0 + np.exp(-s * np.log(pc / (1.0 - pc)))))
 
 
-def _value_metrics(p_model_a, name_a, name_b, red_odds, blue_odds):
+def _value_metrics(p_model_a, name_a, name_b, red_odds, blue_odds,
+                   sharpen=None, min_ev=None):
     """Betting value for a two-way moneyline, computed on the RAW model prob.
 
     Returns (value_side, value_ev, value_stake) for the +EV bet, or (None, None,
-    None) when no side clears MIN_EV_TO_FLAG or the odds are unparseable.
+    None) when no side clears the EV floor or the odds are unparseable.
 
-    The prob is first sharpened by VALUE_SHARPEN to undo the model's mild
-    under-confidence (VALUE only — the displayed pick is untouched). Edge is
-    measured against the de-vigged (fair) market; EV and Kelly use the actual
-    offered (vigged) decimal odds. Stake is KELLY_FRACTION of full Kelly, clipped
-    at 0 and capped at MAX_STAKE_CAP. In a two-way market at most one side has a
-    positive edge, and EV>0 implies edge>0, so the +edge side is the only bet
-    candidate.
+    `sharpen` is the under-confidence correction applied to the VALUE prob only
+    (the displayed pick is untouched): the train-time cross-fitted factor when
+    one deployed, else the static VALUE_SHARPEN. `min_ev` is the EV floor —
+    MIN_EV_TO_FLAG normally, MIN_EV_TO_FLAG_SPARSE when both fighters are
+    data-sparse. Edge is measured against the de-vigged (fair) market; EV uses
+    the actual offered (vigged) decimal odds. The STAKE is sized off a
+    market-shrunk prob (logit blend with the fair market, STAKE_MODEL_WEIGHT on
+    the model) so big model–market disagreements are damped instead of trusted
+    at face value; it is KELLY_FRACTION of full Kelly on that shrunk prob,
+    clipped at 0 and capped at MAX_STAKE_CAP. In a two-way market at most one
+    side has a positive edge, and EV>0 implies edge>0, so the +edge side is the
+    only bet candidate.
     """
+    if sharpen is None:
+        sharpen = VALUE_SHARPEN
+    if min_ev is None:
+        min_ev = MIN_EV_TO_FLAG
     market = _devig_two_way(red_odds, blue_odds)
     d_a = _american_to_decimal(red_odds)
     d_b = _american_to_decimal(blue_odds)
@@ -8097,16 +8235,20 @@ def _value_metrics(p_model_a, name_a, name_b, red_odds, blue_odds):
     # De-bias under-confidence for the value calc only. Sharpening is symmetric, so
     # sharpening p_a also correctly sharpens side B (1 - p_a) — pulling underdog
     # probs down (smaller, truer edges) and favorite probs up.
-    p_model_a = _sharpen_prob(p_model_a, VALUE_SHARPEN)
+    p_model_a = _sharpen_prob(p_model_a, sharpen)
     q_a, q_b = market
     for name, p, q, d in ((name_a, p_model_a, q_a, d_a),
                           (name_b, 1.0 - p_model_a, q_b, d_b)):
         if p - q <= 0:
             continue  # never the value side; its mirror holds any positive edge
         ev = p * d - 1.0
-        if ev < MIN_EV_TO_FLAG:
+        if ev < min_ev:
             return None, None, None  # +edge but EV doesn't clear the bar
-        kelly = max(0.0, (p * d - 1.0) / (d - 1.0))
+        # Size the stake off the market-shrunk prob. Can be 0.0 when the shrunk
+        # prob no longer clears the vig — the flag then reads "edge per the
+        # model, but too thin to stake once the market gets its say".
+        p_stake = _logit_blend(p, q, STAKE_MODEL_WEIGHT)
+        kelly = max(0.0, (p_stake * d - 1.0) / (d - 1.0))
         stake = min(MAX_STAKE_CAP, KELLY_FRACTION * kelly)
         return name, ev, stake
     return None, None, None

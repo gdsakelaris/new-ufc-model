@@ -1,3 +1,4 @@
+
 ========================================================================
 Data Build
 ========================================================================
@@ -88,7 +89,7 @@ OOF fold: 5/5
 Combiner Selection
 ========================================================================
 Selected combiner: weighted
-Combiner weights: XGBoost_Tuned=0.25, CatBoost_Tuned=0.24, CatBoost=0.22, LightGBM_Tuned=0.17, ExtraTrees=0.09, ExtraTrees_Deep=0.03 | ~0: XGBoost, HistGBM_Wide, LightGBM, HistGBM, RandForest, RandForest_Deep
+Combiner weights: XGBoost_Tuned=0.25, CatBoost_Tuned=0.24, CatBoost=0.22, LightGBM_Tuned=0.17, ExtraTrees=0.09, ExtraTrees_Deep=0.03 | ~0: RandForest, RandForest_Deep, LightGBM, HistGBM, XGBoost, HistGBM_Wide
 Validation log-loss: 0.6049
 Validation accuracy: 70.5%
 Validation threshold: 0.504
@@ -97,11 +98,11 @@ Validation threshold: 0.504
 Calibration
 ========================================================================
 Selected method: none
-Validation log-loss: 0.6114
+Selection-slice log-loss (late ~45% of val): 0.6114
 Strict future mode: ON
 Calibration used for picks: no
 Validation accuracy (picked): 70.0%
-Validation tuned threshold: 0.503 (acc=64.0%)
+Dev-OOF tuned threshold: 0.503 (dev-OOF block-robust acc=64.0%, clamped to 0.500)
 Decision threshold: 0.500
 
 ========================================================================
@@ -143,7 +144,7 @@ Accuracy by Gender
 Men (n=437): 68.2%
 Women (n=63): 74.6%
 Winner cache: SAVED (v22) key=a2cbe9e33d37 file=winner_stage_a2cbe9e33d3779dbfafe.pkl
-Method cache: MISS (v39) — training method stage
+Value sharpen: not deployed (OOF delta CI [-0.0094, +0.0074] spans 0; cross-fitted s~1.30) -> fallback 1.25Method cache: MISS (v39) — training method stage
 
 ========================================================================
 Method Model
