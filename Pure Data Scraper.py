@@ -775,9 +775,8 @@ Find URLs at: http://ufcstats.com/statistics/events/completed"""
         # Reorder columns to match original scraper
         column_order = [
             'event_date', 'event_name', 'event_url', 'fight_url', 'event_location',
-            'event_altitude', 'r_trains_at', 'b_trains_at',
-            'r_training_altitude_ft', 'b_training_altitude_ft',
-            'r_fighter', 'b_fighter',
+            'event_altitude', 'r_fighter', 'r_trains_at', 'r_training_altitude_ft',
+            'b_fighter', 'b_trains_at', 'b_training_altitude_ft',
             'weight_class', 'gender', 'total_rounds', 'is_title_bout', 'referee',
             'winner', 'method', 'finish_round', 'time_sec', 'total_fight_time_sec',
             'r_height', 'b_height', 'height_diff',

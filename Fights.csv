@@ -1,288 +1,4 @@
-red_fighter,blue_fighter,weight_class,gender,rounds
-
-Justin Gaethje,Paddy Pimblett,Lightweight,Men,5
-Sean O'Malley,Song Yadong,Bantamweight,Men,3
-Waldo Cortes Acosta,Derrick Lewis,Heavyweight,Men,3
-Arnold Allen,Jean Silva,Featherweight,Men,3
-Natalia Silva,Rose Namajunas,Women's Flyweight,Women,3
-Umar Nurmagomedov,Deiveson Figueiredo,Bantamweight,Men,3
-Ateba Gautier,Andrey Pulyaev,Middleweight,Men,3
-Nikita Krylov,Modestas Bukauskas,Light Heavyweight,Men,3
-Alex Perez,Charles Johnson,Flyweight,Men,3
-Michael Johnson,Alexander Hernandez,Lightweight,Men,3
-Josh Hokit,Denzel Freeman,Heavyweight,Men,3
-Ricky Turcios,Cameron Smotherman,Bantamweight,Men,3
-Adam Fugitt,Ty Miller,Welterweight,Men,3
-
-Alexander Volkanovski,Diego Lopes,Featherweight,Men,5
-Dan Hooker,Benoit Saint Denis,Lightweight,Men,3
-Rafael Fiziev,Mauricio Ruffy,Lightweight,Men,3
-Tai Tuivasa,Tallison Teixeira,Heavyweight,Men,3
-Quillan Salkilld,Jamie Mullarkey,Lightweight,Men,3
-Junior Tafa,Billy Elekana,Light Heavyweight,Men,3
-Cam Rowston,Cody Brundage,Middleweight,Men,3
-Jacob Malkoun,Torrez Finney,Middleweight,Men,3
-Jonathan Micallef,Oban Elliott,Welterweight,Men,3
-Kaan Ofli,Yizha,Featherweight,Men,3
-Sangwook Kim,Dom Mar Fan,Lightweight,Men,3
-Keiichiro Nakamura,Sebastian Szalay,Featherweight,Men,3
-Sulangrangbo,Lawrence Lui,Bantamweight,Men,3
-
-Mario Bautista,Vinicius Oliveira,Bantamweight,Men,5
-Amir Albazi,Kyoji Horiguchi,Flyweight,Men,3
-Jailton Almeida,Rizvan Kuniev,Heavyweight,Men,3
-Michal Oleksiejczuk,Marc-Andre Barriault,Middleweight,Men,3
-Jean Matsumoto,Farid Basharat,Bantamweight,Men,3
-Dustin Jacoby,Julius Walker,Light Heavyweight,Men,3
-Alex Morono,Daniil Donchenko,Welterweight,Men,3
-Nikolay Veretennikov,Niko Price,Welterweight,Men,3
-Bruna Brasil,Ketlen Souza,Women's Strawweight,Women,3
-Javid Basharat,Gianni Vazquez,Bantamweight,Men,3
-Wang Cong,Eduarda Moura,Catch Weight,Men,3
-Muin Gafurov,Jakub Wiklacz,Bantamweight,Men,3
-Klaudia Sygula,Priscila Cachoeira,Bantamweight,Women,3
-
-Sean Strickland,Anthony Hernandez,Middleweight,Men,5
-Geoff Neal,Uros Medic,Welterweight,Men,3
-Dan Ige,Melquizael Costa,Featherweight,Men,3
-Serghei Spivac,Ante Delija,Heavyweight,Men,3
-Jacobe Smith,Josiah Harrell,Welterweight,Men,3
-Zach Reese,Michel Pereira,Middleweight,Men,3
-Chidi Njokuani,Carlos Leal,Welterweight,Men,3
-Ode Osbourne,Alibi Idiris,Flyweight,Men,3
-Alden Coria,Luis Gurule,Flyweight,Men,3
-Nora Cornolle,Joselyne Edwards,Bantamweight,Women,3
-Ramiz Brahimaj,Punahele Soriano,Welterweight,Men,3
-Phil Rowe,Jean-Paul Lebosnoyani,Welterweight,Men,3
-Jordan Leavitt,Yadier del Valle,Featherweight,Men,3
-Juliana Miller,Carli Judice,Flyweight,Women,3
-
-Brandon Moreno,Lone'er Kavanagh,Flyweight,Men,5
-Marlon Vera,David Martinez,Bantamweight,Men,3
-Daniel Zellhuber,King Green,Lightweight,Men,3
-Edgar Chairez,Felipe Bunes,Flyweight,Men,3
-Imanol Rodriguez,Kevin Borjas,Flyweight,Men,3
-Santiago Luna,Angel Pacheco,Bantamweight,Men,3
-Ryan Gandra,Jose Daniel Medina,Middleweight,Men,3
-Ailin Perez,Macy Chiasson,Bantamweight,Women,3
-Cristian Quinonez,Kris Moutinho,Bantamweight,Men,3
-Douglas Silva de Andrade,Javier Reyes,Featherweight,Men,3
-Regina Tarin,Ernesta Kareckaite,Catch Weight,Men,3
-Erik Silva,Francis Marshall,Featherweight,Men,3
-Damian Pinas,Wes Schultz,Middleweight,Men,3
-
-Max Holloway,Charles Oliveira,Lightweight,Men,5
-Caio Borralho,Reinier de Ridder,Middleweight,Men,3
-Rob Font,Raul Rosas Jr.,Bantamweight,Men,3
-Drew Dober,Michael Johnson,Lightweight,Men,3
-Gregory Rodrigues,Brunno Ferreira,Middleweight,Men,3
-Cody Garbrandt,Xiao Long,Bantamweight,Men,3
-Donte Johnson,Cody Brundage,Middleweight,Men,3
-Ricky Turcios,Alberto Montes,Featherweight,Men,3
-Cody Durden,Nyamjargal Tumendemberel,Flyweight,Men,3
-Sumudaerji,Jesus Aguilar,Flyweight,Men,3
-Rafael Tobias,Diyar Nurgozhay,Light Heavyweight,Men,3
-Luke Fernandez,Rodolfo Bellato,Light Heavyweight,Men,3
-
-Josh Emmett,Kevin Vallejos,Featherweight,Men,5
-Amanda Lemos,Gillian Robertson,Women's Strawweight,Women,3
-Andre Fili,Jose Delgado,Featherweight,Men,3
-Marwan Rahiki,Harry Hardwick,Featherweight,Men,3
-Ion Cutelaba,Oumar Sy,Light Heavyweight,Men,3
-Charles Johnson,Bruno Silva_125,Flyweight,Men,3
-Chris Curtis,Myktybek Orolbai,Welterweight,Men,3
-Vitor Petrino,Steven Asplund,Heavyweight,Men,3
-Elijah Smith,SuYoung You,Bantamweight,Men,3
-Bolaji Oki,Manoel Sousa,Lightweight,Men,3
-Brad Tavares,Eryk Anders,Middleweight,Men,3
-Bia Mesquita,Montse Rendon,Women's Bantamweight,Women,3
-Luan Lacerda,Hecher Sosa,Bantamweight,Men,3
-Piera Rodriguez,Sam Hughes,Women's Strawweight,Women,3
-
-Movsar Evloev,Lerone Murphy,Featherweight,Men,5
-Luke Riley,Michael Aswell Jr.,Featherweight,Men,3
-Michael Page,Sam Patterson,Welterweight,Men,3
-Iwo Baraniewski,Austen Lane,Light Heavyweight,Men,3
-Roman Dolidze,Christian Leroy Duncan,Middleweight,Men,3
-Kurtis Campbell,Danny Silva,Featherweight,Men,3
-Mason Jones,Axel Sola,Lightweight,Men,3
-Nathaniel Wood,Losene Keita,Featherweight,Men,3
-Mario Pinto,Felipe Franco,Heavyweight,Men,3
-Mantas Kondratavicius,Antonio Trocoli,Middleweight,Men,3
-Louie Sutherland,Brando Pericic,Heavyweight,Men,3
-Shem Rock,Abdul-Kareem Al-Selwady,Lightweight,Men,3
-Shanelle Dyer,Ravena Oliveira,Women's Strawweight,Women,3
-Melissa Mullins,Luana Carolina,Women's Bantamweight,Women,3
-
-Israel Adesanya,Joe Pyfer,Middleweight,Men,5
-Alexa Grasso,Maycee Barber,Women's Flyweight,Women,3
-Michael Chiesa,Niko Price,Welterweight,Men,3
-Julian Erosa,Lerryan Douglas,Featherweight,Men,3
-Mansur Abdul-Malik,Yousri Belgaroui,Middleweight,Men,3
-Terrance McKinney,Kyle Nelson,Lightweight,Men,3
-Ignacio Bahamondes,Tofiq Musayev,Lightweight,Men,3
-Chase Hooper,Lance Gibson Jr.,Lightweight,Men,3
-Marcin Tybura,Tyrell Fortune,Heavyweight,Men,3
-Casey O'Neill,Gabriella Fernandes,Women's Flyweight,Women,3
-Navajo Stirling,Bruno Lopes,Light Heavyweight,Men,3
-Ricky Simon,Adrian Yanez,Bantamweight,Men,3
-Alexia Thainara,Bruna Brasil,Women's Strawweight,Women,3
-
-Renato Moicano,Chris Duncan,Lightweight,Men,5
-Virna Jandiroba,Tabatha Ricci,Women's Strawweight,Women,3
-Abdul Rakhman Yakhyaev,Brendson Ribeiro,Light Heavyweight,Men,3
-Ethyn Ewing,Rafael Estevam,Bantamweight,Men,3
-Tommy McMillen,Manolo Zecchini,Featherweight,Men,3
-Guilherme Pat,Thomas Petersen,Heavyweight,Men,3
-Jose Delano,Robert Ruchala,Featherweight,Men,3
-Alessandro Costa,Stewart Nicoll,Flyweight,Men,3
-Lando Vannata,Darrius Flowers,Lightweight,Men,3
-Alice Pereira,Hailey Cowan,Women's Bantamweight,Women,3
-Azamat Bekoev,Tresean Gore,Middleweight,Men,3
-Dione Barbosa,Melissa Gatto,Women's Flyweight,Women,3
-
-Jiri Prochazka,Carlos Ulberg,Light Heavyweight,Men,5
-Azamat Murzakanov,Paulo Costa,Light Heavyweight,Men,3
-Curtis Blaydes,Josh Hokit,Heavyweight,Men,3
-Dominick Reyes,Johnny Walker,Light Heavyweight,Men,3
-Cub Swanson,Nate Landwehr,Featherweight,Men,3
-Patricio Freire,Aaron Pico,Featherweight,Men,3
-Kevin Holland,Randy Brown,Welterweight,Men,3
-Mateusz Gamrot,Esteban Ribovics,Lightweight,Men,3
-Tatiana Suarez,Loopy Godinez,Women's Strawweight,Women,3
-Chris Padilla,MarQuel Mederos,Lightweight,Men,3
-Kelvin Gastelum,Vicente Luque,Middleweight,Men,3
-Charles Radtke,Francisco Prado,Welterweight,Men,3
-
-Gilbert Burns,Mike Malott,Welterweight,Men,5
-Kyler Phillips,Charles Jourdain,Bantamweight,Men,3
-Mandel Nallo,Jai Herbert,Lightweight,Men,3
-Jasmine Jasudavicius,Karine Silva,Women's Flyweight,Women,3
-Thiago Moises,Gauge Young,Lightweight,Men,3
-Dennis Buzukja,Marcio Barbosa,Featherweight,Men,3
-Julien Leblanc,Robert Valentin,Middleweight,Men,3
-Tanner Boser,Gokhan Saricam,Heavyweight,Men,3
-Melissa Croden,Daria Zhelezniakova,Women's Bantamweight,Women,3
-JJ Aldrich,Jamey-Lyn Horth,Women's Flyweight,Women,3
-John Castaneda,Mark Vologdin,Bantamweight,Men,3
-Jamie Siraj,John Yannis,Bantamweight,Men,3
-
-Aljamain Sterling,Youssef Zalal,Featherweight,Men,5
-Norma Dumont,Joselyne Edwards,Women's Bantamweight,Women,3
-Rafa Garcia,Alexander Hernandez,Lightweight,Men,3
-Davey Grant,Adrian Luna Martinetti,Bantamweight,Men,3
-Montel Jackson,Raoni Barcelos,Bantamweight,Men,3
-Marcus Buchecha,Ryan Spann,Heavyweight,Men,3
-Rodolfo Vieira,Eric McConico,Middleweight,Men,3
-Jackson McVey,Sedriques Dumas,Middleweight,Men,3
-Mayra Bueno Silva,Michelle Montague,Women's Bantamweight,Women,3
-Jafel Filho,Cody Durden,Flyweight,Men,3
-Francis Marshall,Lucas Brennan,Lightweight,Men,3
-Max Griffin,Victor Valenzuela,Welterweight,Men,3
-Talita Alencar,Julia Polastri,Women's Strawweight,Women,3
-
-Jack Della Maddalena,Carlos Prates,Welterweight,Men,5
-Beneil Dariush,Quillan Salkilld,Lightweight,Men,3
-Tim Elliott,Steve Erceg,Flyweight,Men,3
-Marwan Rahiki,Ollie Schmid,Featherweight,Men,3
-Shamil Gaziev,Brando Pericic,Heavyweight,Men,3
-Tai Tuivasa,Louie Sutherland,Heavyweight,Men,3
-Cam Rowston,Robert Bryczek,Middleweight,Men,3
-Junior Tafa,Kevin Christian,Light Heavyweight,Men,3
-Jacob Malkoun,Gerald Meerschaert,Middleweight,Men,3
-Colby Thicknesse,Vince Morales,Bantamweight,Men,3
-Ben Johnston,Wes Schultz,Middleweight,Men,3
-Jonathan Micallef,Themba Gorimbo,Welterweight,Men,3
-Dom Mar Fan,Kody Steele,Lightweight,Men,3
-
-Khamzat Chimaev,Sean Strickland,Middleweight,Men,5
-Joshua Van,Tatsuro Taira,Flyweight,Men,3
-Alexander Volkov,Waldo Cortes Acosta,Heavyweight,Men,3
-Sean Brady,Joaquin Buckley,Welterweight,Men,3
-King Green,Jeremy Stephens,Lightweight,Men,3
-Ateba Gautier,Ozzy Diaz,Middleweight,Men,3
-Joel Alvarez,Yaroslav Amosov,Welterweight,Men,3
-Grant Dawson,Mateusz Rebecki,Lightweight,Men,3
-Jim Miller,Jared Gordon,Lightweight,Men,3
-Roman Kopylov,Marco Tulio,Middleweight,Men,3
-Pat Sabatini,William Gomis,Featherweight,Men,3
-Baisangur Susurkaev,Djorden Santos,Middleweight,Men,3
-Clayton Carpenter,Jose Ochoa,Flyweight,Men,3
-
-Arnold Allen,Melquizael Costa,Featherweight,Men,5
-Dooho Choi,Daniel Santos,Featherweight,Men,3
-Malcolm Wellmaker,Juan Diaz,Bantamweight,Men,3
-Modestas Bukauskas,Christian Edwards,Catch Weight,Men,3
-Timmy Cuamba,Benardo Sopaj,Bantamweight,Men,3
-Nikolay Veretennikov,Khaos Williams,Welterweight,Men,3
-Tuco Tokkos,Ivan Erslan,Light Heavyweight,Men,3
-Tommy Gantt,Artur Minev,Lightweight,Men,3
-Ketlen Vieira,Jacqueline Cavalcanti,Women's Bantamweight,Women,3
-Cody Brundage,Andre Petroski,Middleweight,Men,3
-Alice Ardelean,Polyana Viana,Women's Strawweight,Women,3
-Daniel Barez,Luis Gurule,Flyweight,Men,3
-Shauna Bannon,Nicolle Caliari,Women's Strawweight,Women,3
-
-Song Yadong,Deiveson Figueiredo,Bantamweight,Men,5
-Zhang Mingyang,Alonzo Menifield,Light Heavyweight,Men,3
-Sergei Pavlovich,Tallison Teixeira,Heavyweight,Men,3
-Kai Asakura,Cameron Smotherman,Bantamweight,Men,3
-Jake Matthews,Carlston Harris,Welterweight,Men,3
-YiSak Lee,Luis Felipe Dias,Middleweight,Men,3
-Ding Meng,Jose Souza,Welterweight,Men,3
-Aoriqileng,Cody Haddon,Bantamweight,Men,3
-Rei Tsuruya,Luis Gurule,Bantamweight,Men,3
-Angela Hill,Xiong Jingnan,Women's Strawweight,Women,3
-Zhu Kangjie,Rodrigo Vera,Featherweight,Men,3
-Loma Lookboonmee,Jaqueline Amorim,Women's Strawweight,Women,3
-
-Belal Muhammad,Gabriel Bonfim,Welterweight,Men,5
-Brendan Allen,Edmen Shahbazyan,Middleweight,Men,3
-Fares Ziam,Tom Nolan,Lightweight,Men,3
-Bryce Mitchell,Santiago Luna,Bantamweight,Men,3
-Iwo Baraniewski,Junior Tafa,Light Heavyweight,Men,3
-Matt Schnell,Alessandro Costa,Catch Weight,Men,3
-Marcus McGhee,John Yannis,Bantamweight,Men,3
-Bruno Silva,Edgar Chairez,Flyweight,Men,3
-Priscila Cachoeira,Chelsea Chandler,Women's Bantamweight,Women,3
-Jordan Leavitt,Joanderson Brito,Featherweight,Men,3
-Jeisla Chaves,Yuneisy Duben,Women's Flyweight,Women,3
-Ketlen Souza,Ariane Carnelossi,Women's Strawweight,Women,3
-
-Ilia Topuria,Justin Gaethje,Lightweight,Men,5
-Alex Pereira,Ciryl Gane,Heavyweight,Men,5
-Sean O'Malley,Aiemann Zahabi,Bantamweight,Men,3
-Josh Hokit,Derrick Lewis,Heavyweight,Men,3
-Mauricio Ruffy,Michael Chandler,Lightweight,Men,3
-Bo Nickal,Kyle Daukaus,Middleweight,Men,3
-Diego Lopes,Steve Garcia,Featherweight,Men,3
-
-Manel Kape,Kyoji Horiguchi,Flyweight,Men,5
-Ion Cutelaba,Navajo Stirling,Light Heavyweight,Men,3
-Vinicius Oliveira,Andre Fili,Featherweight,Men,3
-Hyder Amil,Christian Rodriguez,Featherweight,Men,3
-Andre Lima,Kevin Borjas,Flyweight,Men,3
-Melsik Baghdasaryan,Murtazali Magomedov,Featherweight,Men,3
-Bia Mesquita,Melissa Mullins,Women's Bantamweight,Women,3
-Jhonata Diniz,Jose Montanha,Heavyweight,Men,3
-Allan Nascimento,Mitch Raposo,Flyweight,Men,3
-Gaston Bolanos,Michael Aswell Jr.,Featherweight,Men,3
-Karol Rosa,Luana Santos,Women's Bantamweight,Women,3
-Leon Shahbazyan,Levan Chokheli,Welterweight,Men,3
-Shane Collins,Otari Tanzilovi,Featherweight,Men,3
-
 red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
-
-Rafael Fiziev,-106,Manuel Torres,-108,Lightweight,Men,5,-92
-Shara Magomedov,-385,Michel Pereira,+317,Middleweight,Men,3,-92
-Nazim Sadykhov,-202,Matheus Camilo,+174,Lightweight,Men,3,-92
-Asu Almabayev,-261,Charles Johnson,+222,Flyweight,Men,3,-92
-Ikram Aliskerov,-304,Brunno Ferreira,+256,Middleweight,Men,3,-92
-Abus Magomedov,+101,Michal Oleksiejczuk,-115,Middleweight,Men,3,-92
-Abdul Rakhman Yakhyaev,-572,Julius Walker,+447,Light Heavyweight,Men,3,-92
-Nursulton Ruziboev,-214,Andrey Pulyaev,+184,Middleweight,Men,3,-92
-Kaan Ofli,+190,Javier Reyes,-222,Featherweight,Men,3,-92
-Bekzat Almakhan,+151,Jean Matsumoto,-174,Bantamweight,Men,3,-92
 
 Conor McGregor,+187,Max Holloway,-222,Welterweight,Men,5,2001
 Benoit Saint Denis,-153,Paddy Pimblett,+130,Lightweight,Men,3,2001
@@ -297,3 +13,117 @@ Tracy Cortez,-109,Wang Cong,-107,Women's Flyweight,Women,3,2001
 Damian Pinas,-251,Cesar Almeida,+209,Middleweight,Men,3,2001
 Ryan Gandra,-130,Zach Reese,+111,Middleweight,Men,3,2001
 Alessandro Costa,-243,Cody Durden,+203,Flyweight,Men,3,2001
+
+red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
+
+Dricus Du Plessis,-225,Kamaru Usman,+193,Middleweight,Men,5,1201
+Jared Cannonier,+323,Christian Leroy Duncan,-394,Middleweight,Men,3,1201
+Chase Hooper,-360,Mitch Ramirez,+298,Lightweight,Men,3,1201
+Tabatha Ricci,+368,Fatima Kline,-456,Women's Strawweight,Women,3,1201
+Tommy McMillen,-161,Alberto Montes,+140,Featherweight,Men,3,1201
+Austin Bashi,-110,Jose Delgado,-104,Featherweight,Men,3,1201
+Jean-Paul Lebosnoyani,+161,Seokhyeon Ko,-186,Welterweight,Men,3,1201
+Levi Rodrigues Jr.,-151,Felipe Franco,+131,Light Heavyweight,Men,3,1201
+Alden Coria,-1059,Stewart Nicoll,+733,Flyweight,Men,3,1201
+RJ Harris,+100,Alvin Hines,-115,Heavyweight,Men,3,1201
+Anna Melisano,+474,Dione Barbosa,-612,Women's Flyweight,Women,3,1201
+Ezra Elliott,+110,Damien Anderson,-126,Featherweight,Men,3,1201
+
+red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
+
+Magomed Ankalaev,-517,Bogdan Guskov,+399,Light Heavyweight,Men,5,89
+Steve Erceg,-107,Ramazan Temirov,-109,Flyweight,Men,3,89
+Islam Dulatov,-950,Wellington Turman,+648,Welterweight,Men,3,89
+Magomed Zaynukov,-295,Damian Rzepecki,+243,Lightweight,Men,3,89
+Rizvan Kuniev,-335,Tyrell Fortune,+273,Heavyweight,Men,3,89
+Abubakar Vagaev,-251,Saygid Izagakhmaev,+209,Welterweight,Men,3,89
+Valter Walker,-175,Thomas Petersen,+149,Heavyweight,Men,3,89
+Dustin Jacoby,-178,Muhammad Saidov,+151,Light Heavyweight,Men,3,89
+Santiago Ponzinibbio,+361,Sam Patterson,-460,Welterweight,Men,3,89
+Ismael Bonfim,+177,Axel Sola,-210,Lightweight,Men,3,89
+Magomed Tuchalov,-810,Brendson Ribeiro,+574,Light Heavyweight,Men,3,89
+Nurullo Aliev,-224,Mike Davis,+188,Lightweight,Men,3,89
+Cody Gibson,+415,Abdul Hussein,-542,Bantamweight,Men,3,89
+
+red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
+
+Uros Medic,-400,Daniel Rodriguez,+328,Welterweight,Men,5,256
+Jan Blachowicz,+270,Navajo Stirling,-323,Light Heavyweight,Men,3,256
+Aleksandar Rakic,-368,Marcin Tybura,+304,Heavyweight,Men,3,256
+Dusko Todorovic,+136,Robert Valentin,-156,Middleweight,Men,3,256
+Vlasto Cepo,-333,Gilbert Urbina,+278,Middleweight,Men,3,256
+Milos Janicic,-101,Noah Gugnon,-114,Lightweight,Men,3,256
+Ludovit Klein,-235,Tofiq Musayev,+201,Lightweight,Men,3,256
+Oban Elliott,+320,Michael Oliveira,-389,Welterweight,Men,3,256
+Borislav Nikolic,-184,Mark Vologdin,+159,Bantamweight,Men,3,256
+Dennis Buzukja,+171,Bogdan Grad,-198,Featherweight,Men,3,256
+Mateusz Rebecki,-680,Kyle Prepolec,+517,Lightweight,Men,3,256
+Nina Milosevic,-479,Hailey Cowan,+384,Women's Bantamweight,Women,3,256
+Jovan Leka,-266,Alexander Poppeck,+225,Heavyweight,Men,3,256
+Marina Spasic,+279,Stephanie Luciano,-335,Women's Strawweight,Women,3,256
+
+
+red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
+
+Mateusz Gamrot,+121,Quillan Salkilld,-142,Lightweight,Men,5,2380
+Diego Ferreira,-176,Billy Quarantillo,+150,Lightweight,Men,3,2380
+Darren Elkins,+596,Yadier del Valle,-850,Featherweight,Men,3,2380
+Amanda Lemos,+219,Alexia Thainara,-263,Women's Strawweight,Women,3,2380
+Billy Ray Goff,+332,Ty Miller,-406,Welterweight,Men,3,2380
+Steven Asplund,-294,Guilherme Pat,+247,Heavyweight,Men,3,2380
+Diyar Nurgozhay,-143,Bruno Lopes,+124,Light Heavyweight,Men,3,2380
+Louie Sutherland,-187,Jose Montanha,+162,Heavyweight,Men,3,2380
+Manoel Sousa,-296,Richie Miranda,+250,Lightweight,Men,3,2380
+Miles Johns,-160,Gianni Vazquez,+137,Featherweight,Men,3,2380
+Juliana Miller,-286,Ravena Oliveira,+242,Women's Flyweight,Women,3,2380
+Gigi Canuto,+211,Carol Foro,-254,Women's Strawweight,Women,3,2380
+
+
+red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
+
+Islam Makhachev,-278,Ian Machado Garry,+225,Welterweight,Men,5,20
+Mackenzie Dern,-142,Gillian Robertson,+120,Women's Strawweight,Women,5,20
+Jalin Turner,-260,Kaue Fernandes,+215,Lightweight,Men,3,20
+Dustin Stoltzfus,+350,Mansur Abdul-Malik,-450,Middleweight,Men,3,20
+Esteban Ribovics,+245,Edson Barboza,-300,Lightweight,Men,3,20
+Chidi Njokuani,+245,Joel Alvarez,-300,Welterweight,Men,3,20
+Charles Johnson,-150,Eduardo Chapolin,+130,Catch Weight,Men,3,20
+Donte Johnson,-350,Eric McConico,+280,Middleweight,Men,3,20
+Tresean Gore,+135,Vicente Luque,-155,Middleweight,Men,3,20
+Lucas Fernando,-180,Rafael Tobias,+157,Light Heavyweight,Men,3,20
+Neil Magny,-105,Ramiz Brahimaj,-115,Welterweight,Men,3,20
+Jeremiah Wells,+316,Myktybek Orolbai,-400,Welterweight,Men,3,20
+
+
+red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
+
+Anthony Hernandez,-174,Gregory Rodrigues,+148,Middleweight,Men,5,30 ... (26)
+Serghei Spivac,+132,Vitor Petrino,-155,Heavyweight,Men,3,30
+Reinier de Ridder,-395,Roman Dolidze,+316,Light Heavyweight,Men,3,30
+MarQuel Mederos,+228,Mason Jones,-275,Lightweight,Men,3,30
+Carli Judice,-559,Jeisla Chaves,+426,Women's Flyweight,Women,3,30
+Anthony Wint,-1000,Terrance Chatman,+673,Heavyweight,Men,3,30
+Jamall Emmers,+298,Lerryan Douglas,-370,Featherweight,Men,3,30
+Kennedy Nzechukwu,+107,Shamil Gaziev,-125,Heavyweight,Men,3,30
+Chris Padilla,+102,Nasrat Haqparast,-119,Lightweight,Men,3,30
+Marcio Barbosa,-925,Ryan Kuse,+635,Featherweight,Men,3,30
+Gauge Young,-126,Stan Dorsainvil,+108,Lightweight,Men,3,30
+Wes Schultz,+161,Jackson McVey,-190,Middleweight,Men,3,30
+Shanelle Dyer,-750,Elise Reed,+541,Women's Strawweight,Women,3,30
+
+
+red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
+
+Song Yadong,+482,Umar Nurmagomedov,-625,Bantamweight,Men,5,33
+Denise Gomes,+133,Yan Xiaonan,-153,Women's Strawweight,Women,3,33
+Kai Asakura,-455,Aoriqileng,+367,Bantamweight,Men,3,33
+Sumudaerji,-212,Alex Perez,+182,Flyweight,Men,3,33
+Liu Ce,-184,Levi Rodrigues Jr.,+159,Light Heavyweight,Men,3,33
+Bilal Hasan,-760,Nilson Rojas,+566,Flyweight,Men,3,33
+Andre Lima,-262,Namsrai Batbayar,+223,Flyweight,Men,3,33
+Rei Tsuruya,-816,Kevin Borjas,+599,Flyweight,Men,3,33
+Sean Woodson,-147,Jack Jenkins,+128,Featherweight,Men,3,33
+Francesco Nuzzi,+146,Xiao Long,-169,Bantamweight,Men,3,33
+Hector Santiago,+240,Lawrence Lui,-284,Bantamweight,Men,3,33
+Julia Polastri,-231,Xiong Jingnan,+202,Women's Strawweight,Women,3,33
+Cam Nelson,+137,Ding Meng,-155,Welterweight,Men,3,33
