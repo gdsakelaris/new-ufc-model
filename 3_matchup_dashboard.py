@@ -1,3 +1,4 @@
+import csv
 import os
 from collections import defaultdict
 from datetime import datetime
@@ -28,28 +29,43 @@ def _looks_like_odds(tok):
 _HEADER_FIRST_FIELDS = {"red_fighter", "red corner", "fighter a", "fighter_a", "red"}
 
 
-def parse_fight_line(parts):
-    """Extract (red_name, blue_name) from a comma-split line, keeping ONLY the two
-    fighters. Supports the odds format
+def parse_fight_line(line):
+    """Extract (red_name, blue_name) from one matchup line, reading it exactly the way
+    1_ufc_model.py does so the same card can be pasted into any of the three programs:
 
-        red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
+        red_fighter,[red_odds],blue_fighter,[blue_odds],weight_class,gender,rounds,elevation
 
-    (fighters in fields 0 and 2, odds between them) and the legacy
-    'Fighter A,Fighter B[,...]' forms. Returns None for a header or malformed line.
+    Everything after the red fighter is optional and odds are auto-detected, so
+    'A,B', 'A,B,Lightweight,Men,3', the full odds line, odds on one side only, blank
+    fields ('A,,B,,Lightweight,Men,3,') and a trailing quoted or unquoted location all
+    work. Only the two names are used here. `line` is the raw text, or a row already
+    split by csv.reader. Returns None for a header, separator or nameless line.
     """
-    parts = [p.strip() for p in parts]
-    if not parts or parts[0].lower() in _HEADER_FIRST_FIELDS:
+    if isinstance(line, str):
+        # csv.reader respects quotes, so a quoted name or "Baku, Azerbaijan" is one field.
+        try:
+            line = next(csv.reader([line]))
+        except Exception:
+            line = line.split(",")
+    # Blank fields are dropped, not kept as placeholders: 'A,,B,,...' is A vs B.
+    parts = [p.strip() for p in line if p.strip()]
+    if len(parts) < 2 or parts[0].lower() in _HEADER_FIRST_FIELDS:
         return None
-    odds_layout = len(parts) >= 3 and (
-        _looks_like_odds(parts[1]) or (len(parts) >= 4 and _looks_like_odds(parts[3]))
-    )
-    if odds_layout:
-        red, blue = parts[0], parts[2]
-    elif len(parts) >= 2:
-        red, blue = parts[0], parts[1]
-    else:
-        return None
-    return (red, blue) if red and blue else None
+    i = 2 if _looks_like_odds(parts[1]) else 1  # step over the red fighter's odds, if given
+    return (parts[0], parts[i]) if i < len(parts) else None
+
+
+def fuzzy_find(name, fighters):
+    """Resolve a typed name the way the model does: exact, then case-insensitive, then
+    a substring match if it is unique. None when the fighter is unknown or ambiguous."""
+    if name in fighters:
+        return name
+    lower = name.lower()
+    for key in fighters:
+        if key.lower() == lower:
+            return key
+    matches = [k for k in fighters if lower in k.lower()]
+    return matches[0] if len(matches) == 1 else None
 
 
 class MatchupDashboard:
@@ -309,7 +325,7 @@ class MatchupDashboard:
         right = tk.Frame(mid, bg=self.BG_CARD, highlightthickness=1, highlightbackground=self.CYAN)
         right.pack(side="left", fill="both", expand=True, padx=(8, 0))
         tk.Label(right, text="Batch Input", bg=self.BG_CARD, fg=self.CYAN, font=("Helvetica", 11, "bold")).pack(anchor="w", padx=10, pady=(8, 4))
-        tk.Label(right, text="One per line (only names used): red,odds,blue,odds,wc,gender,rounds,elev  or  Fighter A,Fighter B", bg=self.BG_CARD, fg=self.MUTED, font=("Helvetica", 9)).pack(anchor="w", padx=10)
+        tk.Label(right, text="One per line, same formats as the model (only names used):  red,blue,…  or  red,odds,blue,odds,…", bg=self.BG_CARD, fg=self.MUTED, font=("Helvetica", 9)).pack(anchor="w", padx=10)
         self.bulk_text = tk.Text(right, bg=self.BG_INPUT, fg=self.FG, insertbackground=self.FG, font=("Consolas", 10), relief="flat")
         self.bulk_text.pack(fill="both", expand=True, padx=10, pady=(8, 8))
         bar = tk.Frame(right, bg=self.BG_CARD)
@@ -334,11 +350,12 @@ class MatchupDashboard:
         if not red or not blue:
             messagebox.showwarning("Missing Fighters", "Select both fighters.")
             return
+        red, blue = fuzzy_find(red, self.fighter_logs), fuzzy_find(blue, self.fighter_logs)
+        if not red or not blue:
+            messagebox.showwarning("Unknown Fighter", "One or both fighters are not in the dataset (or the name is ambiguous).")
+            return
         if red == blue:
             messagebox.showwarning("Invalid Matchup", "A fighter cannot fight themselves.")
-            return
-        if red not in self.fighter_logs or blue not in self.fighter_logs:
-            messagebox.showwarning("Unknown Fighter", "One or both fighters are not in the dataset.")
             return
         self.matchups.append({"red": red, "blue": blue})
         self._refresh_queue()
@@ -364,20 +381,23 @@ class MatchupDashboard:
         txt = self.bulk_text.get("1.0", tk.END).strip()
         if not txt:
             return
-        added, skipped = 0, 0
+        added, unknown = 0, []
         for line in [ln.strip() for ln in txt.splitlines() if ln.strip()]:
-            parsed = parse_fight_line(line.split(","))
+            parsed = parse_fight_line(line)
             if not parsed:
-                skipped += 1
-                continue
-            red, blue = parsed
-            if red == blue or red not in self.fighter_logs or blue not in self.fighter_logs:
-                skipped += 1
+                continue  # header / separator / note line: not a matchup, nothing to report
+            red, blue = (fuzzy_find(n, self.fighter_logs) for n in parsed)
+            if not red or not blue or red == blue:
+                unknown.extend(n for n, key in zip(parsed, (red, blue)) if not key)
                 continue
             self.matchups.append({"red": red, "blue": blue})
             added += 1
         self._refresh_queue()
-        self.status_var.set(f"Bulk import complete: added={added}, skipped={skipped}, queue={len(self.matchups)}")
+        msg = f"Bulk import complete: added={added}, queue={len(self.matchups)}"
+        if unknown:
+            more = f" (+{len(unknown) - 3} more)" if len(unknown) > 3 else ""
+            msg += f" | not in dataset: {', '.join(unknown[:3])}{more}"
+        self.status_var.set(msg)
         if added:
             self.bulk_text.delete("1.0", tk.END)
 
@@ -714,8 +734,11 @@ class MatchupDashboard:
             ws.column_dimensions[col].width = adjusted_width
 
     def _get_fighter_data(self, fighter_name):
-        red_fights = self.df[self.df["r_fighter"].str.contains(fighter_name, case=False, na=False)]
-        blue_fights = self.df[self.df["b_fighter"].str.contains(fighter_name, case=False, na=False)]
+        # Exact match: queued names are always exact dataset names (see fuzzy_find). A
+        # substring match would fold "Bruno Silva_125" into "Bruno Silva", "Lance Gibson
+        # Jr." into "Lance Gibson", and would treat the "." in "Jr." as a regex wildcard.
+        red_fights = self.df[self.df["r_fighter"] == fighter_name]
+        blue_fights = self.df[self.df["b_fighter"] == fighter_name]
         if red_fights.empty and blue_fights.empty:
             return None
 

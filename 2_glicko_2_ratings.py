@@ -6,10 +6,12 @@ ufc_fight_data.csv chronologically, then predicts
 win probabilities for new matchups via a tkinter GUI. Exports predictions and
 per-weight-class top 25 rankings to Excel.
 
-Matchup input formats (one per line; only the two fighter names are used):
+Matchup input (one per line) is read the same way 1_ufc_model.py reads it, so one
+card can be pasted into either program; only the two fighter names are used here:
   red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
-  Fighter A,Fighter B,Weight Class,Gender,Rounds
+  red_fighter,blue_fighter,weight_class,gender,rounds
   Fighter A,Fighter B
+Odds are auto-detected and every field after the red fighter is optional.
 """
 
 import csv
@@ -332,28 +334,30 @@ def _looks_like_odds(tok):
 _HEADER_FIRST_FIELDS = {"red_fighter", "red corner", "fighter a", "fighter_a", "red"}
 
 
-def parse_fight_line(parts):
-    """Extract (red_name, blue_name) from a comma-split line, keeping ONLY the two
-    fighters. Supports the odds format
+def parse_fight_line(line):
+    """Extract (red_name, blue_name) from one matchup line, reading it exactly the way
+    1_ufc_model.py does so the same card can be pasted into any of the three programs:
 
-        red_fighter,red_odds,blue_fighter,blue_odds,weight_class,gender,rounds,elevation
+        red_fighter,[red_odds],blue_fighter,[blue_odds],weight_class,gender,rounds,elevation
 
-    (fighters in fields 0 and 2, odds between them) and the legacy
-    'Fighter A,Fighter B[,...]' forms. Returns None for a header or malformed line.
+    Everything after the red fighter is optional and odds are auto-detected, so
+    'A,B', 'A,B,Lightweight,Men,3', the full odds line, odds on one side only, blank
+    fields ('A,,B,,Lightweight,Men,3,') and a trailing quoted or unquoted location all
+    work. Only the two names are used here. `line` is the raw text, or a row already
+    split by csv.reader. Returns None for a header, separator or nameless line.
     """
-    parts = [p.strip() for p in parts]
-    if not parts or parts[0].lower() in _HEADER_FIRST_FIELDS:
+    if isinstance(line, str):
+        # csv.reader respects quotes, so a quoted name or "Baku, Azerbaijan" is one field.
+        try:
+            line = next(csv.reader([line]))
+        except Exception:
+            line = line.split(",")
+    # Blank fields are dropped, not kept as placeholders: 'A,,B,,...' is A vs B.
+    parts = [p.strip() for p in line if p.strip()]
+    if len(parts) < 2 or parts[0].lower() in _HEADER_FIRST_FIELDS:
         return None
-    odds_layout = len(parts) >= 3 and (
-        _looks_like_odds(parts[1]) or (len(parts) >= 4 and _looks_like_odds(parts[3]))
-    )
-    if odds_layout:
-        red, blue = parts[0], parts[2]
-    elif len(parts) >= 2:
-        red, blue = parts[0], parts[1]
-    else:
-        return None
-    return (red, blue) if red and blue else None
+    i = 2 if _looks_like_odds(parts[1]) else 1  # step over the red fighter's odds, if given
+    return (parts[0], parts[i]) if i < len(parts) else None
 
 
 # ─── Excel export ────────────────────────────────────────────────────────────
@@ -561,8 +565,8 @@ class Glicko2GUI:
         # Input label
         tk.Label(
             main,
-            text="Enter fights — one per line, only names used (odds format ok):  "
-                 "RedFighter,odds,BlueFighter,…  or  Fighter A,Fighter B",
+            text="Enter fights — one per line, same formats as the model (only names used):  "
+                 "Red,Blue,…  or  Red,odds,Blue,odds,…",
             bg=BG,
             fg=MUTED,
             font=("Helvetica", 9, "italic"),
@@ -703,7 +707,7 @@ class Glicko2GUI:
         predictions = []
 
         for line in lines:
-            parsed = parse_fight_line(line.split(","))
+            parsed = parse_fight_line(line)
             if not parsed:
                 continue
             a_name, b_name = parsed
