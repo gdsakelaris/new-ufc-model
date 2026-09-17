@@ -2,7 +2,7 @@
 Standalone Glicko-2 rating system for UFC fighters.
 
 Processes all historical fights from
-pure_fight_data_with_event_and_camp_altitudes.csv chronologically, then predicts
+ufc_fight_data.csv chronologically, then predicts
 win probabilities for new matchups via a tkinter GUI. Exports predictions and
 per-weight-class top 25 rankings to Excel.
 
@@ -240,8 +240,8 @@ def build_ratings(csv_path):
         last_fight_date[r_name] = event_date
         last_fight_date[b_name] = event_date
 
-        if weight_class not in ("Catch Weight", "Open Weight"):
-            division = _division_key(weight_class, gender)
+        division = _division_key(weight_class, gender)
+        if division not in ("Catch Weight", "Women's Catch Weight", "Open Weight"):
             fighter_division[r_name] = division
             fighter_division[b_name] = division
 
@@ -653,7 +653,7 @@ class Glicko2GUI:
 
     def _load_ratings(self):
         def _do():
-            data_path = os.path.join(SCRIPT_DIR, "pure_fight_data_with_event_and_camp_altitudes.csv")
+            data_path = os.path.join(SCRIPT_DIR, "ufc_fight_data.csv")
             if not os.path.exists(data_path):
                 self.status_var.set(f"Error: {data_path} not found")
                 return

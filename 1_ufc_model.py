@@ -89,7 +89,7 @@ if optuna is not None:
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(SCRIPT_DIR, "pure_fight_data_with_event_and_camp_altitudes.csv")
+DATA_PATH = os.path.join(SCRIPT_DIR, "ufc_fight_data.csv")
 PREDICTIONS_XLSX = os.path.join(SCRIPT_DIR, "UFC_Predictions.xlsx")
 CACHE_DIR = os.path.join(SCRIPT_DIR, ".ufc_model_cache")
 METHOD_CHAMPION_PATH = os.path.join(SCRIPT_DIR, ".ufc_model_cache", "method_champion_cfg.json")
@@ -1165,8 +1165,10 @@ WEIGHT_CLASS_ORDINAL = {
     "Women's Featherweight": 4, "Flyweight": 5, "Bantamweight": 6,
     "Featherweight": 7, "Lightweight": 8, "Welterweight": 9,
     "Middleweight": 10, "Light Heavyweight": 11, "Heavyweight": 12,
-    "Catch Weight": 13, "Open Weight": 14,
+    "Catch Weight": 13, "Open Weight": 14, "Women's Catch Weight": 15,
 }
+# Real fights, but they don't place a fighter in a division (rankings ignore them).
+NON_DIVISION_CLASSES = ("Catch Weight", "Women's Catch Weight", "Open Weight")
 
 ACTIVE_ENSEMBLE_MODELS = {
     "LightGBM", "XGBoost", "CatBoost",
@@ -3415,6 +3417,13 @@ def build_training_data(csv_path, progress_cb=None):
     df = pd.read_csv(csv_path)
     df["event_date"] = pd.to_datetime(df["event_date"], format="%m/%d/%Y")
     df = df.sort_values("event_date").reset_index(drop=True)
+    # gender_flag, weight_class_ord and the wc_* one-hots are all derived from the
+    # weight_class string alone, so a Women's fight must carry the "Women's " prefix
+    # regardless of how the CSV row was written.
+    if "weight_class" in df.columns and "gender" in df.columns:
+        df["weight_class"] = [
+            _normalize_division(wc, g) for wc, g in zip(df["weight_class"], df["gender"])
+        ]
     _ensure_fighter_feature_keys(df["event_date"].iloc[0] if len(df) else None)
     mov_scales = _compute_mov_scales(df) if MOV_RATINGS_ENABLED else None
 
@@ -5511,6 +5520,11 @@ class UFCSuperModelPipeline:
                 g = str(row.get("gender", "")).strip()
                 if g.lower() == "women" and wc and not wc.startswith("Women's"):
                     wc = f"Women's {wc}"
+                # A catch/open-weight bout doesn't move a fighter out of their division:
+                # keep the last real one, or they'd vanish from the rankings until they
+                # next fight at a standard weight.
+                if wc in NON_DIVISION_CLASSES:
+                    wc = meta.get(nm, {}).get("division", wc)
                 meta[nm] = {
                     "division": wc,
                     "gender": g,
@@ -6196,6 +6210,7 @@ class UFCSuperModelPipeline:
                 "Middleweight",
                 "Light Heavyweight",
                 "Heavyweight",
+                "Women's Catch Weight",
                 "Catch Weight",
                 "Open Weight",
             ]
@@ -7917,6 +7932,16 @@ class UFCSuperModelPipeline:
         else:
             b_feats = compute_fighter_features([], (MU_0, PHI_0, SIGMA_0), [], today)
 
+        # ufcstats titles women's catch-weight bouts plain "Catch Weight Bout", so card
+        # lines copied from it arrive as "Catch Weight,Men". Both fighters' own records
+        # are the better witness (training rows are labeled "Women's Catch Weight").
+        if (str(weight_class).strip() == "Catch Weight"
+                and self.fighter_meta.get(a_key, {}).get("gender") == "Women"
+                and self.fighter_meta.get(b_key, {}).get("gender") == "Women"):
+            gender = "Women"
+        # Same invariant as training: "Flyweight,Women" must become "Women's Flyweight"
+        # before the weight-class/gender features are derived from the string.
+        weight_class = _normalize_division(weight_class, gender)
         matchup = compute_matchup_features(
             a_feats, b_feats, is_title=0, total_rounds=rounds, weight_class=weight_class
         )
@@ -7924,7 +7949,7 @@ class UFCSuperModelPipeline:
         b_elo = float(self.elo_ratings.get(b_key, ELO_BASE))
         d_elo = a_elo - b_elo
         elo_p = 1.0 / (1.0 + 10.0 ** (-(d_elo / 400.0)))
-        division = _normalize_division(weight_class, gender)
+        division = weight_class
         a_div_elo = float(self.div_elo_ratings.get((a_key, division), ELO_BASE))
         b_div_elo = float(self.div_elo_ratings.get((b_key, division), ELO_BASE))
         d_div_elo = a_div_elo - b_div_elo
@@ -8063,7 +8088,7 @@ class UFCSuperModelPipeline:
                 continue
             meta = self.fighter_meta.get(fighter, {})
             division = meta.get("division", "")
-            if not division or division in ("Catch Weight", "Open Weight"):
+            if not division or division in NON_DIVISION_CLASSES:
                 continue
             mu = self.glicko_ratings.get(fighter, (MU_0, PHI_0, SIGMA_0))[0]
             wins = sum(1 for h in hist if h.get("result") == "W")

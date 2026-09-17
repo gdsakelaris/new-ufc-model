@@ -70,7 +70,7 @@ class MatchupDashboard:
         self.root.configure(bg=self.BG)
 
         if data_file is None:
-            data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pure_fight_data_with_event_and_camp_altitudes.csv")
+            data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ufc_fight_data.csv")
 
         self.df = self._load_data(data_file)
         self.fighter_logs = self._build_fighter_logs(self.df)
@@ -272,7 +272,7 @@ class MatchupDashboard:
         header.pack(fill="x")
         tk.Label(header, text="UFC", font=("Helvetica", 34, "bold"), bg=self.BG_HEADER, fg=self.ACCENT).pack()
         tk.Label(header, text="MATCHUP DASHBOARD", font=("Helvetica", 11, "bold"), bg=self.BG_HEADER, fg=self.FG).pack()
-        tk.Label(header, text="Leak-safe manual stat reconstruction from pure_fight_data_with_event_and_camp_altitudes.csv", font=("Helvetica", 9, "italic"), bg=self.BG_HEADER, fg=self.MUTED).pack(pady=(2, 0))
+        tk.Label(header, text="Leak-safe manual stat reconstruction from ufc_fight_data.csv", font=("Helvetica", 9, "italic"), bg=self.BG_HEADER, fg=self.MUTED).pack(pady=(2, 0))
 
         main = tk.Frame(self.root, bg=self.BG, padx=18, pady=12)
         main.pack(fill="both", expand=True)

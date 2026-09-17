@@ -1,7 +1,8 @@
-.model_cache
-/Old Model/.model_cache
-.ufc_model_cache
-catboost_info
-__pycache__
 .claude
+
+__pycache__
+.model_cache
+.ufc_model_cache
+
 Audits
+catboost_info

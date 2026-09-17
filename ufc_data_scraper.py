@@ -5,12 +5,17 @@ import pandas as pd
 import numpy as np
 from bs4 import BeautifulSoup
 from datetime import datetime
+import os
 import re
 import hashlib
 import threading
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+# The dataset the model trains on. Read-only here: it tells us which fighters are
+# already known to compete in women's divisions (see fix_womens_catch_weight).
+MASTER_DATASET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ufc_fight_data.csv")
 
 class UFCScraperApp:
     def __init__(self, root):
@@ -238,15 +243,60 @@ Find URLs at: http://ufcstats.com/statistics/events/completed"""
                        "Welterweight", "Middleweight", "Light Heavyweight", "Heavyweight", "Catch Weight"]
         female_weights = ["Women's Strawweight", "Women's Flyweight", "Women's Bantamweight", 
                          "Women's Featherweight", "Women's Catch Weight"]
-        all_weights = male_weights + female_weights
-        
+        # Women's classes MUST be checked first: r"\bflyweight\b" also matches inside
+        # "women's flyweight", so male-first silently strips the "Women's " prefix.
+        all_weights = female_weights + male_weights
+
         cleaned_input = str(weight_class).lower()
         for weight in all_weights:
             pattern = r"\b" + re.escape(weight.lower()) + r"\b"
             if re.search(pattern, cleaned_input):
                 return weight
         return weight_class.strip()
-        
+
+    def fix_womens_catch_weight(self, df):
+        """ufcstats titles every catch-weight fight plain "Catch Weight Bout" -- never
+        "Women's" -- so a women's catch-weight bout scrapes as gender 'Men'. The page
+        gives nothing to key on, so go by the fighters instead: anyone who has fought
+        in a women's division (in this scrape or in the master dataset) is a woman,
+        and so is her opponent."""
+        name_cols = ('r_fighter', 'b_fighter', 'r_name', 'b_name')
+        women, men = set(), set()
+
+        def people(frame, mask):
+            cols = [c for c in name_cols if c in frame.columns]
+            return {str(v).strip() for v in frame.loc[mask, cols].values.ravel()
+                    if pd.notna(v) and str(v).strip()}
+
+        def learn(frame):
+            women.update(people(frame, frame['gender'] == 'Women'))
+            # Catch-weight rows are the ones in doubt, so they can't vouch for anyone.
+            men.update(people(frame, (frame['gender'] == 'Men') & (frame['weight_class'] != 'Catch Weight')))
+
+        learn(df)
+        if os.path.exists(MASTER_DATASET):
+            try:
+                learn(pd.read_csv(MASTER_DATASET, usecols=lambda c: c in name_cols + ('weight_class', 'gender')))
+            except Exception as e:
+                self.log_progress(f"  Could not read {os.path.basename(MASTER_DATASET)} for the catch-weight gender check: {e}")
+
+        for idx in df.index[(df['weight_class'] == 'Catch Weight') & (df['gender'] == 'Men')]:
+            bout = people(df, df.index == idx)
+            label = f"{df.at[idx, 'r_fighter']} vs {df.at[idx, 'b_fighter']}"
+            if bout & women and not bout & men:
+                df.at[idx, 'weight_class'] = "Women's Catch Weight"
+                df.at[idx, 'gender'] = 'Women'
+                self.log_progress(f"  Catch Weight: {label} -> Women's Catch Weight")
+            elif bout & women:
+                self.log_progress(f"  ⚠ Catch Weight: {label} matches both a men's and a women's fighter -- left as Men, check manually")
+            elif not bout & men:
+                # Two fighters with no divisional fight on record. 145 lb is the heaviest
+                # women's class, so anything above that can only be a men's bout.
+                lbs = pd.to_numeric(pd.Series([df.at[idx, c] for c in ('r_weight', 'b_weight') if c in df.columns]), errors='coerce')
+                if not (lbs > 145).any():
+                    self.log_progress(f"  ⚠ Catch Weight: {label} -- gender unverified (neither fighter has a divisional fight on record), left as Men")
+        return df
+
     def _fetch(self, url, timeout=20):
         """GET a page, transparently solving ufcstats.com's JavaScript
         proof-of-work anti-bot challenge if it is served instead of content.
@@ -432,6 +482,9 @@ Find URLs at: http://ufcstats.com/statistics/events/completed"""
             
             is_title_bout = 1 if 'Title' in fight_title else 0
             gender = 'Women' if "Women's" in fight_title else 'Men'
+            # Invariant: a Women's fight always carries the "Women's " prefix.
+            if gender == 'Women' and weight_class and not weight_class.startswith("Women's"):
+                weight_class = f"Women's {weight_class}"
             total_rounds = int(re.search(r'(\d+)', gen_stats[2].replace('Time format:', '')).group(1)) if len(gen_stats) > 2 and re.search(r'(\d+)', gen_stats[2].replace('Time format:', '')) else 3
             finish_round = int(gen_stats[0].replace('Round:', '')) if len(gen_stats) > 0 else 1
             
@@ -713,7 +766,8 @@ Find URLs at: http://ufcstats.com/statistics/events/completed"""
             return None
             
         df = pd.DataFrame(all_fights)
-        
+        df = self.fix_womens_catch_weight(df)
+
         # Calculate accuracy percentages
         df['r_sig_str_acc'] = df.apply(lambda r: round(r['r_sig_str'] / r['r_sig_str_att'], 2) if r['r_sig_str_att'] > 0 else 0, axis=1)
         df['b_sig_str_acc'] = df.apply(lambda r: round(r['b_sig_str'] / r['b_sig_str_att'], 2) if r['b_sig_str_att'] > 0 else 0, axis=1)
